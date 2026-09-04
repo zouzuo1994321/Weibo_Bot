@@ -1,0 +1,26 @@
+# 运行时数据（含账户 Cookie、日志、数据库、图片）不纳入版本库
+/data/
+
+# 旧版本 exe 留档（仅保留目录结构）
+/history/*.exe
+/history/*.zip
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 打包产物
+/build/
+/dist/
+*.spec
+
+# 本地密钥（账户加密密钥，切勿提交）
+*.acc_key
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,47 @@
+微博bot小助手 开源许可协议（非商业用途）
+================================================
+
+Copyright  2026 肆月Aperture
+Copyright  2026 Siyue Aperture
+
+一、版权声明
+------------
+本软件（包括但不限于源代码、可执行文件、文档、界面资源）的著作权归
+「肆月Aperture」所有。本软件为开源软件。
+
+二、授权范围
+------------
+在不违反本协议的条件下，您享有以下权利：
+1. 以源代码形式查看、学习本软件；
+2. 复制、修改本软件源代码，并制作衍生作品；
+3. 以非商业目的分发本软件（含源代码与可执行文件），包括通过网络免费提供下载。
+
+三、限制条款
+------------
+1. 未经著作权人书面授权，禁止将本软件用于任何商业用途
+   （包括但不限于：出售、出租、作为收费服务的一部分、用于营利的自动化运营等）。
+2. 您分发本软件（或修改版）时，必须保留本版权声明与许可协议全文，
+   并明确标注您所作的修改。
+3. 本软件名称「微博bot小助手」及相关标识的商标权归著作权人所有，
+   未经授权不得用于商业宣传。
+
+四、免责声明
+------------
+1. 本软件按「现状」提供，不提供任何明示或暗示的担保。
+2. 使用者须自行遵守微博平台的相关规则与所在地区的法律法规。
+   因使用本软件（包括但不限于账号封禁、数据泄露、法律纠纷等）产生的
+   一切后果，由使用者自行承担，著作权人不承担任何责任。
+3. 著作权人保留对本协议的最终解释权与随时修改本协议的权利。
+
+五、商业授权
+------------
+如确需将本软件用于商业用途，请通过以下方式联系著作权人获取书面授权：
+（联系方式见 README 或项目主页）
+
+---
+Open Source License (Non-Commercial) — Summary
+Copyright  2026 Siyue Aperture. This software is open source.
+You may use, copy, modify, and redistribute it for NON-COMMERCIAL purposes,
+provided this copyright notice and license text are retained.
+Commercial use is PROHIBITED without prior written authorization.
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.

@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微博bot小助手</title>
+<link rel="icon" type="image/png" href="logo.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="titlebar">
+  <div class="titlebar-drag">
+    <img src="logo.png" class="titlebar-logo" alt="">
+    <span class="titlebar-text">微博bot小助手</span>
+  </div>
+  <div class="window-controls">
+    <span class="wbtn wbtn-min" title="最小化" onclick="windowMinimize()"></span>
+    <span class="wbtn wbtn-max" title="最大化 / 还原" onclick="windowToggleMaximize()"></span>
+    <span class="wbtn wbtn-close" title="关闭" onclick="windowClose()"></span>
+  </div>
+</header>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand">
+      <img src="logo.png" class="brand-logo" alt="logo">
+      <div>微博bot小助手<small id="verLabel"></small></div>
+    </div>
+    <div class="nav-item active" data-view="overview">概览</div>
+    <div class="nav-item" data-view="accounts">账户管理</div>
+    <div class="nav-item" data-view="monitors">监控列表</div>
+    <div class="nav-item" data-view="forward">转发设置</div>
+    <div class="nav-item" data-view="ai">AI 人格</div>
+    <div class="nav-item" data-view="blacklist">关键词黑名单</div>
+    <div class="nav-item" data-view="schedule">工作时间</div>
+    <div class="nav-item" data-view="history">历史记录</div>
+    <div class="nav-item" data-view="license">软件授权</div>
+    <div class="nav-item" data-view="logs">运行日志</div>
+    <div class="nav-item" data-view="about">关于 / 版权</div>
+    <div class="foot" id="copyLabel"></div>
+  </aside>
+
+  <main id="main">
+
+    <!-- 概览 -->
+    <section class="view active" id="view-overview">
+      <h2>概览</h2>
+      <p class="sub">本软件运行总览与快捷操作。</p>
+      <div class="card">
+        <div class="stat-grid" id="statGrid"></div>
+      </div>
+      <div class="card">
+        <h3>调度状态</h3>
+        <div class="row" style="margin-bottom:10px;">
+          <span id="schedState" class="tag blue">未运行</span>
+          <span class="muted" id="schedInfo"></span>
+        </div>
+        <div class="row">
+          <button id="btnStart" onclick="startScheduler()">启动自动轮询</button>
+          <button class="ghost" id="btnStop" onclick="stopScheduler()">停止</button>
+          <button class="ghost" onclick="manualRun()">立即轮询一次</button>
+          <button class="ghost" onclick="refreshAll()">刷新数据</button>
+          <span id="licLine"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>最近一次轮询结果</h3>
+        <div id="lastResult" class="muted">尚未运行</div>
+      </div>
+    </section>
+
+    <!-- 账户管理 -->
+    <section class="view" id="view-accounts">
+      <h2>账户管理</h2>
+      <p class="sub">最多记录 5 个微博账户 Cookie。支持内置浏览器登录自动获取或系统浏览器手动粘贴。</p>
+      <div class="card">
+        <h3>添加账户</h3>
+        <div class="row">
+          <label class="field" style="flex:1; min-width:160px;">
+            账户备注
+            <input id="accName" placeholder="如：我的小号">
+          </label>
+          <label class="field" style="flex:3; min-width:300px;">
+            Cookie（内置登录后自动填入，或手动粘贴）
+            <textarea id="accCookie" placeholder="SUB=...; SUBP=...; 完整 Cookie 字符串"></textarea>
+          </label>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <button onclick="openBuiltinLogin()">内置浏览器登录</button>
+          <button class="ghost" onclick="openSystemLogin()">系统浏览器登录</button>
+          <button class="ghost" onclick="captureCookie()">从内置浏览器获取Cookie</button>
+          <button class="ghost" onclick="closeLogin()">关闭登录窗口</button>
+          <button onclick="addAccount()">添加账户</button>
+        </div>
+        <p class="help" id="loginHint">提示：点击「内置浏览器登录」后，在弹出窗口内完成微博登录，再点「获取Cookie」即可自动填入上方文本框。</p>
+      </div>
+      <div class="card">
+        <h3>已记录账户（<span id="accCount">0</span>/5）</h3>
+        <div class="row" style="margin-bottom:10px;">
+          <button class="ghost" onclick="checkAllAccounts()">检测全部账户</button>
+          <span class="muted" style="font-size:12px;">手动或自动（每 5 分钟）检测账户登录态与转发能力</span>
+        </div>
+        <table>
+          <thead><tr><th>昵称（备注）</th><th>添加时间</th><th>最近使用</th><th>状态</th><th>检测时间</th><th>操作</th></tr></thead>
+          <tbody id="accList"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 监控列表 -->
+    <section class="view" id="view-monitors">
+      <h2>监控列表</h2>
+      <p class="sub">填入微博 UID（如 https://weibo.com/u/5789387121 中的 5789387121）。监控数量无上限，添加后自动获取最新昵称并实时检测状态。</p>
+      <div class="card">
+        <div class="row" style="align-items:flex-end;">
+          <label class="field" style="flex:2; min-width:260px;">
+            微博 UID
+            <input id="monUid" placeholder="例如 5789387121">
+          </label>
+          <button onclick="addMonitor()">添加监控</button>
+          <button class="ghost" onclick="refreshMonitors()">刷新昵称/状态</button>
+        </div>
+      </div>
+
+      <div class="card mon-refresh-bar">
+        <div class="mon-refresh-inner">
+          <label class="switch"><input type="checkbox" id="monAutoRefresh"><span class="slider"></span></label>
+          <span class="mon-refresh-label">自动刷新昵称/状态</span>
+          <span class="muted mon-refresh-hint">停留本页时按间隔自动刷新</span>
+          <span style="flex:1;"></span>
+          <div class="mon-refresh-input">
+            <span class="mon-refresh-input-label">间隔</span>
+            <input id="monRefreshMin" type="number" min="1" value="10">
+            <span class="mon-refresh-input-unit">分钟</span>
+          </div>
+          <button class="ghost" onclick="saveMonAutoRefresh()">保存</button>
+          <span id="monAutoState" class="muted" style="font-size:12px;"></span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="mon-filter-bar">
+          <div class="hist-filter-group">
+            <label class="field hist-filter-keyword">关键词（昵称/UID）
+              <input id="monKeyword" placeholder="输入关键词" oninput="applyMonFilter()">
+            </label>
+            <label class="field hist-filter-date">状态
+              <select id="monStatus" onchange="applyMonFilter()">
+                <option value="all">全部</option>
+                <option value="online">在线</option>
+                <option value="error">异常</option>
+                <option value="unknown">未知</option>
+              </select>
+            </label>
+            <label class="field hist-filter-check">
+              <span class="hist-check-label">仅看置顶</span>
+              <span class="hist-check-box"><input type="checkbox" id="monPinnedOnly" onchange="applyMonFilter()"></span>
+            </label>
+            <button class="ghost hist-filter-clear" onclick="clearMonFilters()">清空筛选</button>
+          </div>
+        </div>
+        <h3 class="mon-count-title">监控对象（<span id="monCount">0</span>）</h3>
+        <div id="monList" class="monitor-list"></div>
+        <div id="monPagination" class="mon-pagination"></div>
+      </div>
+    </section>
+
+    <!-- 转发设置 -->
+    <section class="view" id="view-forward">
+      <h2>转发设置</h2>
+      <p class="sub">核心策略：每轮自动轮询会抓取所有监控对象的最新微博，若本轮存在新微博，则从中随机挑选一条进行转发。</p>
+      <div class="card">
+        <h3>轮询间隔</h3>
+        <div class="row align-end">
+          <label class="field" style="width:200px;">
+            间隔（分钟）
+            <input id="intervalMin" type="number" min="1" value="30">
+          </label>
+          <button onclick="saveInterval()">保存间隔</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>转发方式</h3>
+        <div class="row" style="gap:24px;">
+          <div class="row">
+            <label class="switch"><input type="checkbox" id="aiSwitch"><span class="slider"></span></label>
+            <div>
+              <b>AI 增强转发</b>
+              <div class="muted" style="font-size:12px;">开启后由内置轻量 AI 根据被转发内容生成转发文案</div>
+            </div>
+          </div>
+          <div>
+            <b>普通转发</b>
+            <div class="muted" style="font-size:12px;">关闭 AI 时执行纯转发（不带文案）</div>
+          </div>
+        </div>
+        <hr>
+        <button onclick="saveForwardMode()">保存转发设置</button>
+        <button class="ghost" onclick="forwardRandomNow()">立即转发（随机一条）</button>
+        <span class="muted" style="font-size:12px; margin-left:6px;">随机挑选一个监控对象，转发其最新非置顶微博</span>
+      </div>
+    </section>
+
+    <!-- AI 人格 -->
+    <section class="view" id="view-ai">
+      <h2>AI 转发人格</h2>
+      <p class="sub">内置轻量化内容生成引擎（离线可用，无需联网大模型）。选择人格后，AI 将据此生成符合人设的转发文案。</p>
+
+      <div class="card">
+        <h3>选择当前人格</h3>
+        <div id="personaList" class="persona-list"></div>
+        <div class="row" style="margin-top:14px;">
+          <button onclick="savePersona()">保存当前选择</button>
+          <span class="muted" style="font-size:12px;">当前已选：<b id="currentPersonaLabel">—</b></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>实时预览</h3>
+        <div class="row" style="align-items:stretch;">
+          <label class="field" style="flex:1; min-width:260px;">原微博内容
+            <textarea id="aiTest" placeholder="粘贴一段微博内容用于预览生成效果">今天开源了一个情感分析的小模型，效果意外地好，分享给大家～</textarea>
+          </label>
+          <div style="flex:1; min-width:260px; display:flex; flex-direction:column;">
+            <label class="field" style="flex:1;">AI 生成转发文案
+              <div id="aiPreview" class="ai-preview">点击「生成预览」查看效果</div>
+            </label>
+          </div>
+        </div>
+        <div class="row" style="margin-top:14px;">
+          <button onclick="previewAI()">生成预览</button>
+          <span class="muted" style="font-size:12px;">使用当前已选人格生成</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>自定义人格</h3>
+        <p class="help" style="margin:-8px 0 12px;">创建属于你自己的转发风格。每行一条模板，可用 <span class="kbd">{k1}</span> <span class="kbd">{k2}</span> <span class="kbd">{k3}</span> 表示从原文抽取的关键词。</p>
+        <div class="row align-end">
+          <label class="field" style="width:220px;">人格名称
+            <input id="custName" placeholder="如：毒舌点评 / 文艺青年">
+          </label>
+          <button class="ghost" onclick="saveCustom()">保存自定义人格</button>
+        </div>
+        <label class="field" style="margin-top:12px;">模板（每行一条，系统会随机挑选）
+          <textarea id="custTpl" placeholder="看到{k1}，我只想说{k2}又来了。&#10;{k1}这件事，{k3}就挺离谱的。&#10;关于{k1}，我的评价是：{k2}。"></textarea>
+        </label>
+      </div>
+    </section>
+
+    <!-- 黑名单 -->
+    <section class="view" id="view-blacklist">
+      <h2>关键词黑名单</h2>
+      <p class="sub">转发内容或原微博中出现以下任意关键词时，跳过该条微博不转发。</p>
+      <div class="card">
+        <div class="row">
+          <label class="field" style="flex:1;">
+            新增关键词
+            <input id="blInput" placeholder="输入关键词后回车或点击添加">
+          </label>
+          <button onclick="addBlacklist()">添加</button>
+        </div>
+        <div class="chips" id="blChips" style="margin-top:12px;"></div>
+        <button class="ghost" style="margin-top:12px;" onclick="saveBlacklist()">保存黑名单</button>
+      </div>
+    </section>
+
+    <!-- 工作时间 -->
+    <section class="view" id="view-schedule">
+      <h2>工作时间</h2>
+      <p class="sub">开启后，仅在设定时间段内执行轮询与转发，其余时间自动跳过。</p>
+      <div class="card">
+        <div class="row" style="justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap;">
+          <div class="row" style="gap:12px;">
+            <label class="switch"><input type="checkbox" id="whSwitch"><span class="slider"></span></label>
+            <b style="font-size:15px;">启用工作时间限制</b>
+          </div>
+          <span id="whNow" class="tag blue">当前：—</span>
+        </div>
+        <hr>
+        <div class="row" style="gap:20px; flex-wrap:wrap; align-items:flex-end;">
+          <label class="field" style="width:160px;">开始时间
+            <input id="whStart" type="time" value="09:00">
+          </label>
+          <span class="range-arrow">→</span>
+          <label class="field" style="width:160px;">结束时间
+            <input id="whEnd" type="time" value="23:00">
+          </label>
+          <button onclick="saveWorkingHours()">保存设置</button>
+        </div>
+        <div id="whBar" class="time-bar">
+          <div class="time-bar-fill" id="whFill"></div>
+          <div class="time-bar-now" id="whNowMark" title="当前时间"></div>
+        </div>
+        <p class="help" style="margin-top:12px;">支持跨天，例如 22:00 - 08:00 表示仅在夜间工作。保存后实时生效。</p>
+      </div>
+    </section>
+
+    <!-- 历史记录 -->
+    <section class="view" id="view-history">
+      <h2>历史记录</h2>
+      <p class="sub">被监控对象发过的微博（含文字与图片）、本软件转发记录均可查询、筛选、预览图片与导出。</p>
+      <div class="card">
+        <div class="row" style="margin-bottom:12px; border-bottom:1px solid var(--border); padding-bottom:12px;">
+          <button class="ghost" id="btnHistMon" onclick="switchHist('monitored')">被监控微博</button>
+          <button class="ghost" id="btnHistFwd" onclick="switchHist('forwards')">转发记录</button>
+          <span style="flex:1;"></span>
+          <button class="ghost" onclick="exportSelected()" id="btnExportSel" disabled>导出选中(<span id="selCount">0</span>)</button>
+          <button class="ghost" onclick="exportFiltered()">导出当前筛选</button>
+          <button class="ghost" onclick="exportAll()">导出全部(含图片)</button>
+        </div>
+        <div class="row" id="histFilters"></div>
+      </div>
+      <div class="card">
+        <div class="hist-toolbar">
+          <div class="hist-toolbar-left">
+            <h3 id="histTitle">被监控对象发过的微博</h3>
+            <label class="hist-select-all-inline">
+              <input type="checkbox" id="selAll" onchange="selectAllToggle(this.checked)">
+              <span>全选本页</span>
+            </label>
+          </div>
+          <div class="hist-toolbar-right" id="histPagination"></div>
+        </div>
+        <div id="histBody"></div>
+      </div>
+    </section>
+
+    <!-- 授权 -->
+    <section class="view" id="view-license">
+      <h2>软件授权</h2>
+      <p class="sub">默认 7 天免费试用；试用期结束后需激活授权方可使用转发功能。</p>
+
+      <div class="card lic-card" id="licStatusCard">
+        <div class="lic-status-big">
+          <div class="lic-icon" id="licIcon">🔒</div>
+          <div class="lic-info">
+            <div class="lic-title" id="licTitle">加载中…</div>
+            <div class="lic-desc" id="licDesc">请稍候</div>
+            <div class="lic-meta" id="licMeta"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" style="align-items:stretch; gap:16px; flex-wrap:wrap;">
+        <div class="card" style="flex:1; min-width:320px;">
+          <h3>获取授权</h3>
+          <p class="help" style="margin:-8px 0 14px;">将 48 位特征码发送给作者，作者用授权机生成密钥后回发给你。</p>
+          <label class="field" style="margin-bottom:12px;">本机特征码
+            <textarea id="featCode" readonly rows="2" style="font-family:monospace; word-break:break-all;"></textarea>
+          </label>
+          <div class="row" style="gap:10px;">
+            <button onclick="genFeatureCode()">重新生成</button>
+            <button class="ghost" onclick="copyFeatureCode()">复制特征码</button>
+          </div>
+          <div class="muted" style="font-size:12px; margin-top:10px;" id="featValid"></div>
+        </div>
+
+        <div class="card" style="flex:1; min-width:320px;">
+          <h3>激活授权</h3>
+          <p class="help" style="margin:-8px 0 14px;">粘贴作者提供的密钥，点击激活；密钥与当前机器绑定。</p>
+          <label class="field" style="margin-bottom:12px;">授权密钥
+            <input id="licKey" placeholder="0000-0000-0000-0000-0000" style="font-family:monospace;">
+          </label>
+          <div class="row" style="gap:10px;">
+            <button onclick="activateLicense()">激活</button>
+            <button class="ghost danger" onclick="deactivateLicense()">清除授权</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 图片预览浮层 -->
+    <div id="imgOverlay" class="overlay" style="display:none;" onclick="closeImgPreview()">
+      <div class="overlay-content" onclick="event.stopPropagation()">
+        <button class="ghost" onclick="closeImgPreview()" style="float:right;">关闭</button>
+        <div style="clear:both;"></div>
+        <div id="imgPreviewBox"></div>
+      </div>
+    </div>
+
+    <!-- 运行日志 -->
+    <section class="view" id="view-logs">
+      <h2>运行日志</h2>
+      <p class="sub">软件运行过程中的操作与错误记录。</p>
+      <div class="card">
+        <div class="row">
+          <button class="ghost" onclick="loadLogs()">刷新日志</button>
+          <button class="ghost" onclick="exportKind('logs')">导出日志</button>
+          <button class="ghost" onclick="clearLogView()">清空显示</button>
+        </div>
+        <div id="logView" class="log-box" style="margin-top:12px;"></div>
+      </div>
+    </section>
+
+    <!-- 关于 -->
+    <section class="view" id="view-about">
+      <h2>关于 / 版权</h2>
+      <p class="sub">软件信息、版权声明与使用须知。</p>
+      <div id="aboutCard"></div>
+    </section>
+
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>
