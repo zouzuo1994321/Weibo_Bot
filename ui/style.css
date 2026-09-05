@@ -20,6 +20,9 @@ html, body {
   background: var(--bg); color: var(--text);
   font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   font-size: 14px;
+  /* 默认整个页面不可被 OS 当作拖动区，确保主体区域的文字可自由选中复制；
+     窗口拖动改由 JS（window_move）在标题栏独占处理，避免 CSS app-region 不可靠导致的误拖动。 */
+  -webkit-app-region: no-drag; app-region: no-drag;
 }
 
 /* 滚动条 - 与暗色主题保持一致 */
@@ -31,18 +34,22 @@ html, body {
 body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 #app { display: flex; flex: 1; overflow: hidden; }
 
-/* 标题栏（无边框窗口） */
+/* 标题栏（无边框窗口）
+   说明：本软件窗口拖动不依赖 CSS app-region（edgechromium 后端支持不稳定，
+   会导致主体区域被误判为可拖动），而是完全由 JS 在标题栏 mousedown 监听里
+   调用后端 window_move 实现。此处仅保留 no-drag，确保标题栏空白处也不触发
+   OS 默认拖动，避免与 JS 拖动逻辑冲突。 */
 #titlebar {
   height: 38px; flex-shrink: 0;
   background: var(--bg-soft); border-bottom: 1px solid var(--border);
   display: flex; align-items: center; justify-content: space-between;
   padding: 0 12px 0 16px;
-  -webkit-app-region: drag; app-region: drag;
+  -webkit-app-region: no-drag; app-region: no-drag;
 }
 .titlebar-drag {
   display: flex; align-items: center; gap: 10px;
   color: var(--text); font-size: 13px; font-weight: 600;
-  -webkit-app-region: drag; app-region: drag;
+  -webkit-app-region: no-drag; app-region: no-drag;
   user-select: none;
 }
 .titlebar-logo { width: 20px; height: 20px; border-radius: 5px; pointer-events: none; }

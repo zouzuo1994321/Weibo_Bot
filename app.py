@@ -48,7 +48,7 @@ def main():
         height=760,
         min_size=(900, 600),
         text_select=True,
-        frameless=True,
+        frameless=False,
     )
     # 记录窗口引用，便于登录窗口等场景
     api.main_window = window

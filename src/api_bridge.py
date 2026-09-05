@@ -78,6 +78,37 @@ class Api:
                 return {"ok": False, "error": str(e)}
         return {"ok": False, "error": "窗口未就绪"}
 
+    def get_window_pos(self):
+        """读取当前窗口左上角坐标与尺寸（供前端标题栏拖动计算偏移）。"""
+        if not self.main_window:
+            return {"ok": False, "error": "窗口未就绪"}
+        try:
+            return {"ok": True,
+                    "x": int(self.main_window.x),
+                    "y": int(self.main_window.y),
+                    "width": int(self.main_window.width),
+                    "height": int(self.main_window.height)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def window_move(self, x, y):
+        """将窗口移动到指定屏幕坐标（标题栏拖动的核心实现，取代不可靠的 CSS app-region）。"""
+        if not self.main_window:
+            return {"ok": False, "error": "窗口未就绪"}
+        try:
+            # 若处于最大化状态，拖动时先还原，否则无法移动
+            if self._window_maximized:
+                self.main_window.restore()
+                self._window_maximized = False
+            self.main_window.move(int(round(x)), int(round(y)))
+            return {"ok": True,
+                    "x": int(self.main_window.x),
+                    "y": int(self.main_window.y),
+                    "width": int(self.main_window.width),
+                    "height": int(self.main_window.height)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     # ---------------- 状态 ----------------
     def get_state(self):
         # 触发节流式自动账户健康检测（后台线程，不阻塞）

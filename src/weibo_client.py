@@ -11,6 +11,7 @@ import re
 import time
 
 import requests
+from logger import warn
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -440,64 +441,76 @@ def diagnose_account(cookie: str) -> dict:
     return result
 
 
-def download_image(url: str, save_path: str, cookie: str = "", timeout: int = 25) -> bool:
-    """下载图片到本地（用于历史存档）。自动尝试多种 Referer / 尺寸变体 / UA。"""
+def download_image(url: str, save_path: str, cookie: str = "", timeout: int = 15) -> bool:
+    """下载图片到本地（用于历史存档）。
+
+    微博图床存在防盗链（带过期 Cookie 反而 403、无 Referer 也 403）与多尺寸变体，
+    单策略极易失败。这里做稳健重试：
+      - 多尺寸变体：原图 / large / mw2000 / bmiddle / orj360，优先取大图；
+      - 带 Cookie 与不带 Cookie 各试一遍（部分资源公开可访问，带失效 Cookie 反而被拒）；
+      - 多 Referer（网页端 / 移动端 / 用户主页）；
+      - 严格排除 text/html 登录墙/防盗链错误页，非图片类型按魔数兜底校验。
+    """
     url = _normalize_image_url(url)
     if not url:
         return False
 
-    # 候选 URL：优先原 URL，再尝试大尺寸变体
-    candidates = [url]
-    # 微博图床常见尺寸目录；把已有尺寸替换为 large / mw2000 / bmiddle / orj360
-    for repl in ("large", "mw2000", "bmiddle", "orj360", "mw1024", "thumbnail"):
-        u = re.sub(r"/(thumb[a-z]+|bmiddle|large|mw\d+|orj\d+)/",
-                   f"/{repl}/", url, count=1)
-        if u != url and u not in candidates:
-            candidates.append(u)
-
-    headers_base = {"User-Agent": UA}
-    if cookie:
-        headers_base["Cookie"] = cookie
-    # 微博图片防盗链通常要求 Referer 来自 *.weibo.com / *.sinaimg.cn / m.weibo.cn
-    referers = (
-        f"{WEB_BASE}/",
-        f"{M_BASE}/",
-        "https://weibo.com/u/",
-        "https://photo.weibo.com/",
-    )
-    uas = (
-        UA,
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-    )
-
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
+    # 候选尺寸：原图优先，再依次尝试更稳/更大的变体
+    sizes = ["", "large", "mw2000", "bmiddle", "orj360"]
+    candidates = []
+    for repl in sizes:
+        if not repl:
+            if url not in candidates:
+                candidates.append(url)
+        else:
+            u = re.sub(r"/(thumb[a-z]+|bmiddle|large|mw\d+|orj\d+)/", f"/{repl}/", url, count=1)
+            if u != url and u not in candidates:
+                candidates.append(u)
+
+    referers = (f"{WEB_BASE}/", f"{M_BASE}/", "https://weibo.com/u/")
+    # 微博图片有时需 Cookie，有时公开（带失效 Cookie 反而 403）→ 两种都试
+    cookie_variants = [cookie, ""] if cookie else [""]
+
+    last_err = ""
     for u in candidates:
-        for ref in referers:
-            for user_agent in uas:
+        for ck in cookie_variants:
+            for ref in referers:
                 try:
-                    headers = dict(headers_base)
-                    headers["User-Agent"] = user_agent
-                    headers["Referer"] = ref
-                    headers["Accept"] = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+                    headers = {
+                        "User-Agent": UA,
+                        "Referer": ref,
+                        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                    }
+                    if ck:
+                        headers["Cookie"] = ck
                     r = requests.get(u, headers=headers, timeout=timeout)
                     if r.status_code != 200:
+                        last_err = f"HTTP {r.status_code}"
                         continue
                     data = r.content
                     if len(data) < 200:
+                        last_err = "数据过小(<200B)"
                         continue
-                    # 防盗链常见返回 text/html 错误页，即使长度也较长，需校验 Content-Type
                     ctype = (r.headers.get("Content-Type") or "").lower()
-                    if ctype and not ("image" in ctype or ctype.startswith("application/octet-stream")):
-                        # 若没返回 Content-Type，再按魔数兜底判断
+                    # 防盗链/登录墙常返回 text/html 错误页，必须排除
+                    if "text/html" in ctype:
+                        last_err = "返回 HTML(疑似防盗链/登录墙)"
+                        continue
+                    # 非图片类型且非二进制流 → 按魔数兜底判断
+                    if not ("image" in ctype or ctype.startswith("application/octet-stream")):
                         if not _is_image_bytes(data):
+                            last_err = f"非图片类型({ctype})且魔数不匹配"
                             continue
                     with open(save_path, "wb") as f:
                         f.write(data)
                     return True
-                except Exception:
+                except Exception as e:
+                    last_err = str(e)
                     continue
+    if last_err:
+        warn(f"图片下载失败（已尝试多种变体）{os.path.basename(save_path)}：{last_err}")
     return False
 
 

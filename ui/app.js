@@ -33,6 +33,7 @@ async function init() {
   renderAbout();
   setInterval(updateWhBar, 30000);   // 工作时间条实时更新
   setInterval(monAutoTick, 15000);    // 监控列表定时刷新
+  setInterval(refreshOverviewLive, 1000);  // 概览界面每秒自动刷新
 }
 
 async function loadState() {
@@ -102,6 +103,18 @@ function renderOverview() {
   }
   document.getElementById("lastResult").textContent =
     sch.last_result ? JSON.stringify(sch.last_result, null, 2) : "尚未运行";
+}
+
+/* 概览界面每秒自动刷新：仅当概览页处于激活态时拉取最新状态并重渲染，
+   避免手动点击刷新；不影响其它页面（不会重置输入/滚动）。 */
+async function refreshOverviewLive() {
+  if (!API) return;
+  const ov = document.getElementById("view-overview");
+  if (!ov || !ov.classList.contains("active")) return;
+  try {
+    const st = await apiCall("get_state");
+    if (st) { STATE = st; renderOverview(); }
+  } catch (e) { /* 忽略瞬时错误，下一秒重试 */ }
 }
 
 /* ---------------- 账户 ---------------- */
@@ -1216,14 +1229,6 @@ async function deactivateLicense() {
   else toast(r.error || "失败", "err");
 }
 
-/* ---------------- 窗口控制（无边框） ---------------- */
-async function windowMinimize() { await apiCall("window_minimize"); }
-async function windowToggleMaximize() { await apiCall("window_toggle_maximize"); }
-async function windowClose() {
-  if (confirm("确定关闭微博bot小助手？")) {
-    await apiCall("window_close");
-  }
-}
 
 /* ---------------- 启动 ---------------- */
 if (window.pywebview) {
