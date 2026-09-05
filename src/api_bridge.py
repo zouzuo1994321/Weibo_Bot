@@ -220,6 +220,13 @@ class Api:
         webbrowser.open("https://weibo.com/login.php")
         return {"ok": True, "message": "已打开系统浏览器，请登录后复制 Cookie 粘贴到输入框"}
 
+    def open_external(self, url):
+        try:
+            webbrowser.open(url)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def open_login_browser(self):
         """内置浏览器登录：打开独立窗口加载微博登录页。"""
         import webview

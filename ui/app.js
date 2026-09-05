@@ -38,8 +38,10 @@ async function init() {
 
 async function loadState() {
   STATE = await apiCall("get_state");
-  document.getElementById("verLabel").textContent = STATE.version.display;
-  document.getElementById("copyLabel").textContent = STATE.copyright;
+  document.getElementById("verLabel").textContent = STATE.version.major;
+  const copyLabel = document.getElementById("copyLabel");
+  copyLabel.textContent = STATE.copyright;
+  copyLabel.onclick = () => apiCall("open_external", "https://github.com/zouzuo1994321/Weibo_Bot");
   renderOverview();
   renderAccounts();
   renderMonitors();
