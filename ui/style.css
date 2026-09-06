@@ -611,6 +611,50 @@ th.col-chk { text-align: center; }
   text-align: center;
   font-size: 12px;
 }
+.mon-pagination.mon-pagination-top {
+  margin-top: 0;
+  margin-bottom: 12px;
+  padding-top: 0;
+  padding-bottom: 12px;
+  border-top: none;
+  border-bottom: 1px solid var(--border);
+}
+
+/* 概览 - 最近一次轮询结果高度控制，避免撑出单屏 */
+.last-result-box { max-height: 220px; min-height: 90px; overflow-y: auto; }
+
+/* 数据总览 */
+.data-overview-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 18px; }
+.data-overview-grid .stat { text-align: center; }
+.data-overview-grid .stat .num { font-size: 26px; }
+.data-overview-grid .stat .lbl { font-size: 12px; }
+.data-overview-list { list-style: none; margin: 0; padding: 0; }
+.data-overview-list li {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px;
+}
+.data-overview-list li:last-child { border-bottom: none; }
+.data-overview-list .rank {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: var(--accent); color: #fff; font-size: 11px; margin-right: 10px;
+}
+.data-overview-list .count { color: var(--accent); font-weight: 700; }
+.chart-card { margin-bottom: 18px; }
+.chart-tabs {
+  display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;
+}
+.chart-tab {
+  background: transparent; border: 1px solid var(--border); color: var(--text-dim);
+  padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;
+}
+.chart-tab:hover { border-color: var(--accent); color: var(--text); }
+.chart-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.chart-wrap { width: 100%; overflow-x: auto; }
+.data-chart { width: 100%; height: 260px; min-width: 480px; }
+.chart-legend { display: flex; gap: 18px; margin-top: 10px; font-size: 12px; color: var(--text-dim); }
+.chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.chart-legend i { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
 
 /* 监控对象 - 置顶视觉 */
 .mon-item.mon-pinned {

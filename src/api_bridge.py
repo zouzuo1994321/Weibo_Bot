@@ -133,6 +133,44 @@ class Api:
             "license": get_status(),
         }
 
+    def get_data_overview(self):
+        """为「数据总览」页提供聚合统计与曲线序列。"""
+        try:
+            return {"ok": True, "data": get_history_db().data_overview()}
+        except Exception as e:
+            error(f"数据总览查询失败：{e}")
+            return {"ok": False, "error": str(e)}
+
+    def export_data_overview(self, fmt="json"):
+        """导出整理好的数据总览（JSON/CSV），方便用 AI 进一步分析。"""
+        import webview
+        try:
+            data = get_history_db().data_overview()
+            suffix = ".json" if fmt == "json" else ".csv"
+            paths = webview.create_file_dialog(
+                webview.SAVE_DIALOG,
+                file_types=(fmt.upper() + " files", "*" + suffix),
+                save_filename=f"data_overview{suffix}")
+            if not paths:
+                return {"ok": False, "error": "已取消保存"}
+            dest = paths if isinstance(paths, str) else paths[0]
+            if fmt == "json":
+                with open(dest, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            else:
+                rows = []
+                for scope, vals in data["summary"].items():
+                    rows.append({"范围": scope, "抓取": vals["monitored"], "转发": vals["forwarded"]})
+                with open(dest, "w", newline="", encoding="utf-8-sig") as f:
+                    import csv
+                    w = csv.DictWriter(f, fieldnames=["范围", "抓取", "转发"])
+                    w.writeheader()
+                    w.writerows(rows)
+            return {"ok": True, "path": dest}
+        except Exception as e:
+            error(f"导出数据总览失败：{e}")
+            return {"ok": False, "error": str(e)}
+
     def get_config(self):
         return get_config().to_dict()
 

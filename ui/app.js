@@ -30,6 +30,7 @@ async function init() {
   API = window.pywebview.api;
   await loadState();
   bindNav();
+  bindDataOverviewTabs();
   renderAbout();
   setInterval(updateWhBar, 30000);   // 工作时间条实时更新
   setInterval(monAutoTick, 15000);    // 监控列表定时刷新
@@ -64,6 +65,7 @@ function bindNav() {
       el.classList.add("active");
       document.getElementById("view-" + el.dataset.view).classList.add("active");
       if (el.dataset.view === "history") switchHist("monitored");
+      if (el.dataset.view === "dataoverview") loadDataOverview();
       if (el.dataset.view === "license") renderLicense();
       if (el.dataset.view === "logs") loadLogs();
       if (el.dataset.view === "schedule") updateWhBar();
@@ -79,7 +81,7 @@ function renderOverview() {
     ["监控对象", STATE.monitors.length],
     ["已记录账户", STATE.accounts.length + "/5"],
     ["本日抓取", s.monitored_posts_today || 0],
-    ["转发次数", s.forwards],
+    ["本日转发次数", s.forwards_today || 0],
   ].map(([l, n]) => `<div class="stat"><div class="num">${n}</div><div class="lbl">${l}</div></div>`).join("");
 
   const sch = STATE.scheduler;
@@ -103,8 +105,37 @@ function renderOverview() {
       licLine.innerHTML = `<span class="tag red">未授权 · 转发已禁用</span>`;
     }
   }
-  document.getElementById("lastResult").textContent =
-    sch.last_result ? JSON.stringify(sch.last_result, null, 2) : "尚未运行";
+  const box = document.getElementById("lastResult");
+  if (box) box.textContent = formatLastResult(sch.last_result, sch.last_run);
+}
+
+/* 将最近一次轮询结果格式化成运行日志样式，方便阅读 */
+function formatLastResult(res, ts) {
+  if (!res) return "尚未运行";
+  const t = ts || _fmtLogTs(new Date());
+  const lines = [];
+  if (!res.ok) {
+    lines.push(`[${t}][ERROR] 轮询失败：${res.error || "未知错误"}`);
+    return lines.join("\n");
+  }
+  const results = (res.results || []).slice();
+  const total = results.length;
+  const hasNew = results.reduce((s, r) => s + (r.new_count || 0), 0);
+  lines.push(`[${t}][INFO] 本轮轮询结束 · 监控 ${total} 个对象 · 共 ${hasNew} 条新微博 · 转发 ${res.forwarded || 0} 条`);
+  if (res.message) lines.push(`[${t}][INFO] ${res.message}`);
+  const order = { forwarded: 0, failed: 1, error: 2, skipped: 3, none: 4 };
+  results.sort((a, b) => (order[a.action] ?? 5) - (order[b.action] ?? 5));
+  for (const r of results) {
+    const lv = r.action === "forwarded" ? "INFO" : r.action === "failed" || r.action === "error" ? "ERROR" : "INFO";
+    const name = r.screen_name || r.uid;
+    lines.push(`[${t}][${lv}] @${name}(${r.uid}) · 新微博 ${r.new_count || 0} · ${r.detail || "-"}`);
+  }
+  return lines.join("\n");
+}
+
+function _fmtLogTs(d) {
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 /* 概览界面每秒自动刷新：仅当概览页处于激活态时拉取最新状态并重渲染，
@@ -280,7 +311,7 @@ function applyMonFilter() {
   const pin = document.getElementById("monPinnedOnly")?.checked || false;
   MON_FILTERS = { keyword: kw, status: st, pinnedOnly: pin };
   MON_PAGE = 1;
-  renderMonPage();
+  renderMonitors(); // 重新计算筛选/分页
 }
 
 function clearMonFilters() {
@@ -292,7 +323,7 @@ function clearMonFilters() {
   if (pin) pin.checked = false;
   MON_FILTERS = { keyword: "", status: "all", pinnedOnly: false };
   MON_PAGE = 1;
-  renderMonPage();
+  renderMonitors(); // 清空筛选后重新渲染全部列表
 }
 
 async function togglePin(uid) {
@@ -1063,6 +1094,135 @@ async function exportKind(kind) {
   if (!fmt) return;
   const r = await apiCall("export_data", kind, fmt);
   if (r.ok) toast("已导出：" + r.path, "ok"); else toast(r.error || "导出失败", "err");
+}
+
+/* ---------------- 数据总览 ---------------- */
+let DATA_OVERVIEW = null;
+let DATA_OVERVIEW_SERIES = "today_hourly";
+
+async function loadDataOverview() {
+  try {
+    const r = await apiCall("get_data_overview");
+    if (!r || !r.ok) { toast(r.error || "数据总览加载失败", "err"); return; }
+    DATA_OVERVIEW = r.data;
+    renderDataOverview();
+  } catch (e) { toast("数据总览加载异常", "err"); }
+}
+
+function renderDataOverview() {
+  if (!DATA_OVERVIEW) return;
+  const summary = DATA_OVERVIEW.summary || {};
+  const top = DATA_OVERVIEW.top_forwarded || [];
+  const today = summary.today || {};
+  const month = summary.month || {};
+
+  // 核心指标：今日抓取 / 今日转发 / 本月抓取 / 本月转发 / 高频被转发
+  const topName = top.length ? top[0].screen_name : "—";
+  document.getElementById("dataOverviewSummary").innerHTML = [
+    ["本日抓取", today.monitored || 0],
+    ["本日转发", today.forwarded || 0],
+    ["本月抓取", month.monitored || 0],
+    ["本月转发", month.forwarded || 0],
+    ["高频被转发", topName],
+  ].map(([l, n]) => `<div class="stat"><div class="num">${n}</div><div class="lbl">${l}</div></div>`).join("");
+
+  // 高频被转发对象 TOP10
+  const topBox = document.getElementById("dataOverviewTop");
+  if (!top.length) {
+    topBox.innerHTML = `<li class="muted">暂无转发数据</li>`;
+  } else {
+    topBox.innerHTML = top.map((t, i) => `
+      <li>
+        <span><span class="rank">${i + 1}</span>${esc(t.screen_name || t.uid || "未知")}</span>
+        <span class="count">${t.count} 次</span>
+      </li>`).join("");
+  }
+
+  // 趋势图
+  renderDataOverviewChart();
+}
+
+function renderDataOverviewChart() {
+  if (!DATA_OVERVIEW) return;
+  const series = (DATA_OVERVIEW.series || {})[DATA_OVERVIEW_SERIES] || [];
+  const wrap = document.getElementById("dataOverviewChartWrap");
+  const svg = document.getElementById("dataOverviewChart");
+  if (!series.length) {
+    wrap.innerHTML = `<div class="empty" style="height:200px;">暂无该区间数据</div>`;
+    return;
+  }
+  // 恢复 svg（之前 empty 可能替换掉了）
+  if (!svg || svg.tagName !== "svg") {
+    wrap.innerHTML = `<svg id="dataOverviewChart" class="data-chart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>`;
+  }
+  drawLineChart("dataOverviewChart", series, "monitored", "forwarded", "label");
+}
+
+function drawLineChart(svgId, data, keyA, keyB, labelKey) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+  const W = 800, H = 260, pad = { top: 20, right: 20, bottom: 36, left: 44 };
+  const labels = data.map(d => d[labelKey]);
+  const maxV = Math.max(1, ...data.map(d => Math.max(d[keyA] || 0, d[keyB] || 0)));
+  const chartW = W - pad.left - pad.right;
+  const chartH = H - pad.top - pad.bottom;
+  const step = data.length > 1 ? chartW / (data.length - 1) : chartW;
+
+  const points = (key) => data.map((d, i) => {
+    const x = pad.left + i * step;
+    const v = d[key] || 0;
+    const y = pad.top + chartH - (v / maxV) * chartH;
+    return { x, y, v };
+  });
+
+  const pathD = (pts) => pts.map((p, i) => (i ? "L" : "M") + `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  const ptsA = points(keyA), ptsB = points(keyB);
+
+  // 网格线 + Y 轴文字
+  let gridLines = "";
+  let yLabels = "";
+  const ySteps = 5;
+  for (let i = 0; i <= ySteps; i++) {
+    const v = Math.round((maxV / ySteps) * i);
+    const y = pad.top + chartH - (i / ySteps) * chartH;
+    gridLines += `<line x1="${pad.left}" y1="${y.toFixed(1)}" x2="${W - pad.right}" y2="${y.toFixed(1)}" stroke="rgba(255,255,255,.08)"/>`;
+    yLabels += `<text x="${pad.left - 8}" y="${y + 4}" text-anchor="end" fill="var(--text-dim)" font-size="11">${v}</text>`;
+  }
+
+  // X 轴标签，点太多时抽样
+  let xLabels = "";
+  const skip = Math.max(1, Math.ceil(labels.length / 10));
+  labels.forEach((lab, i) => {
+    if (i % skip !== 0 && i !== labels.length - 1) return;
+    const x = pad.left + i * step;
+    xLabels += `<text x="${x}" y="${H - 12}" text-anchor="middle" fill="var(--text-dim)" font-size="11">${esc(lab)}</text>`;
+  });
+
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = `
+    ${gridLines}${yLabels}${xLabels}
+    <path d="${pathD(ptsA)}" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+    <path d="${pathD(ptsB)}" fill="none" stroke="var(--green)" stroke-width="2.5"/>
+    ${ptsA.map(p => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3" fill="var(--accent)"/>`).join("")}
+    ${ptsB.map(p => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3" fill="var(--green)"/>`).join("")}
+  `;
+}
+
+function bindDataOverviewTabs() {
+  document.querySelectorAll("#dataOverviewTabs .chart-tab").forEach(btn => {
+    btn.onclick = () => {
+      document.querySelectorAll("#dataOverviewTabs .chart-tab").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      DATA_OVERVIEW_SERIES = btn.dataset.series;
+      renderDataOverviewChart();
+    };
+  });
+}
+
+async function exportDataOverview(fmt) {
+  const r = await apiCall("export_data_overview", fmt);
+  if (r && r.ok) toast("已导出：" + r.path, "ok");
+  else toast(r.error || "导出失败", "err");
 }
 
 /* ---------------- 日志 ---------------- */

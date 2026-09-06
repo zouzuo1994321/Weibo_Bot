@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from paths import DB_PATH
 
@@ -199,7 +199,118 @@ class HistoryDB:
                 "SELECT COUNT(*) FROM monitored_posts WHERE fetched_at LIKE ?",
                 (today + "%",)
             ).fetchone()[0]
-        return {"monitored_posts": c1, "forwards": c2, "forwards_success": c3, "monitored_posts_today": c4}
+            c5 = self.conn.execute(
+                "SELECT COUNT(*) FROM forwards WHERE status='success' AND created_at LIKE ?",
+                (today + "%",)
+            ).fetchone()[0]
+        return {"monitored_posts": c1, "forwards": c2, "forwards_success": c3,
+                "monitored_posts_today": c4, "forwards_today": c5}
+
+    def data_overview(self):
+        """为「数据总览」页聚合多维度统计数据与曲线序列。"""
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        month_start = now.strftime("%Y-%m-01")
+        year_start = now.strftime("%Y-01-01")
+
+        def _count_monitored(where, params=()):
+            sql = "SELECT COUNT(*) FROM monitored_posts"
+            if where:
+                sql += " WHERE " + where
+            return self.conn.execute(sql, params).fetchone()[0]
+
+        def _count_forwarded(where, params=()):
+            sql = "SELECT COUNT(*) FROM forwards WHERE status='success'"
+            if where:
+                sql += " AND " + where
+            return self.conn.execute(sql, params).fetchone()[0]
+
+        def _series(sql, params=()):
+            rows = self.conn.execute(sql, params).fetchall()
+            return {r[0]: r[1] for r in rows if r[0]}
+
+        with _lock:
+            summary = {
+                "today": {"monitored": _count_monitored("fetched_at LIKE ?", (today + "%",)),
+                          "forwarded": _count_forwarded("created_at LIKE ?", (today + "%",))},
+                "month": {"monitored": _count_monitored("fetched_at >= ?", (month_start,)),
+                          "forwarded": _count_forwarded("created_at >= ?", (month_start,))},
+                "year": {"monitored": _count_monitored("fetched_at >= ?", (year_start,)),
+                         "forwarded": _count_forwarded("created_at >= ?", (year_start,))},
+                "all": {"monitored": _count_monitored(""),
+                        "forwarded": _count_forwarded("")},
+            }
+
+            # 高频被转发对象（只统计成功转发）
+            top = self.conn.execute(
+                """SELECT uid, screen_name, COUNT(*) as cnt
+                     FROM forwards
+                    WHERE status='success'
+                    GROUP BY uid
+                    ORDER BY cnt DESC
+                    LIMIT 10"""
+            ).fetchall()
+            top_forwarded = [{"uid": r[0], "screen_name": r[1] or r[0], "count": r[2]} for r in top]
+
+            # 今日小时级
+            mon_h = _series(
+                "SELECT SUBSTR(fetched_at,12,2) as h, COUNT(*) FROM monitored_posts WHERE fetched_at LIKE ? GROUP BY h",
+                (today + "%",))
+            fwd_h = _series(
+                "SELECT SUBSTR(created_at,12,2) as h, COUNT(*) FROM forwards WHERE status='success' AND created_at LIKE ? GROUP BY h",
+                (today + "%",))
+            hours = [f"{i:02d}" for i in range(24)]
+            today_hourly = [{"label": h, "monitored": mon_h.get(h, 0), "forwarded": fwd_h.get(h, 0)} for h in hours]
+
+            # 本月天级
+            mon_d = _series(
+                "SELECT SUBSTR(fetched_at,1,10) as d, COUNT(*) FROM monitored_posts WHERE fetched_at >= ? GROUP BY d",
+                (month_start,))
+            fwd_d = _series(
+                "SELECT SUBSTR(created_at,1,10) as d, COUNT(*) FROM forwards WHERE status='success' AND created_at >= ? GROUP BY d",
+                (month_start,))
+            days = []
+            d = datetime.strptime(month_start, "%Y-%m-%d")
+            while d <= now:
+                days.append(d.strftime("%Y-%m-%d"))
+                d += timedelta(days=1)
+            month_daily = [{"label": d[-5:], "monitored": mon_d.get(d, 0), "forwarded": fwd_d.get(d, 0)} for d in days]
+
+            # 本年月级
+            mon_m = _series(
+                "SELECT SUBSTR(fetched_at,1,7) as m, COUNT(*) FROM monitored_posts WHERE fetched_at >= ? GROUP BY m",
+                (year_start,))
+            fwd_m = _series(
+                "SELECT SUBSTR(created_at,1,7) as m, COUNT(*) FROM forwards WHERE status='success' AND created_at >= ? GROUP BY m",
+                (year_start,))
+            months = []
+            y, mo = int(year_start[:4]), 1
+            while (y, mo) <= (now.year, now.month):
+                months.append(f"{y}-{mo:02d}")
+                mo += 1
+                if mo > 12:
+                    mo = 1
+                    y += 1
+            year_monthly = [{"label": m[-2:] + "月", "monitored": mon_m.get(m, 0), "forwarded": fwd_m.get(m, 0)} for m in months]
+
+            # 全部年月级
+            mon_all = _series(
+                "SELECT SUBSTR(fetched_at,1,7) as m, COUNT(*) FROM monitored_posts GROUP BY m ORDER BY m")
+            fwd_all = _series(
+                "SELECT SUBSTR(created_at,1,7) as m, COUNT(*) FROM forwards WHERE status='success' GROUP BY m ORDER BY m")
+            all_keys = sorted(set(mon_all.keys()) | set(fwd_all.keys()))
+            all_monthly = [{"label": k, "monitored": mon_all.get(k, 0), "forwarded": fwd_all.get(k, 0)} for k in all_keys]
+
+        return {
+            "summary": summary,
+            "top_forwarded": top_forwarded,
+            "series": {
+                "today_hourly": today_hourly,
+                "month_daily": month_daily,
+                "year_monthly": year_monthly,
+                "all_monthly": all_monthly,
+            }
+        }
 
     def close(self):
         try:
