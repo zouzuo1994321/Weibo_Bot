@@ -7,6 +7,7 @@ let histKind = "monitored";
 let HIST_SELECTED = new Set();   // 历史记录选中的行 id
 let MON_AUTO_TIMER = null;       // 监控自动刷新定时器
 let MON_LAST_REFRESH = 0;
+let _pollTimer = null;           // 「立即轮询一次」进度轮询定时器
 
 function apiCall(method, ...args) {
   if (!API) return Promise.reject("pywebview 未就绪");
@@ -35,6 +36,18 @@ async function init() {
   setInterval(updateWhBar, 30000);   // 工作时间条实时更新
   setInterval(monAutoTick, 15000);    // 监控列表定时刷新
   setInterval(refreshOverviewLive, 1000);  // 概览界面每秒自动刷新
+  setInterval(updateOverviewClock, 1000);  // 概览时钟每秒刷新
+  updateOverviewClock();
+  syncLogVerbose();
+}
+
+/* 同步「冗余调试日志」开关的当前状态 */
+async function syncLogVerbose() {
+  try {
+    const res = await apiCall("get_log_verbose");
+    const el = document.getElementById("logVerbose");
+    if (el && res) el.checked = !!res.verbose;
+  } catch (e) { /* 忽略：日志页面尚未渲染 */ }
 }
 
 async function loadState() {
@@ -69,12 +82,14 @@ function bindNav() {
       if (el.dataset.view === "license") renderLicense();
       if (el.dataset.view === "logs") loadLogs();
       if (el.dataset.view === "schedule") updateWhBar();
+      if (el.dataset.view === "media") loadMediaPage();
     };
   });
 }
 
 /* ---------------- 概览 ---------------- */
 function renderOverview() {
+  updateOverviewClock();
   const s = STATE.stats;
   const grid = document.getElementById("statGrid");
   grid.innerHTML = [
@@ -483,6 +498,11 @@ function renderForward() {
   const c = STATE.config;
   document.getElementById("intervalMin").value = c.interval_minutes;
   document.getElementById("aiSwitch").checked = !!c.ai_enabled;
+  const normal = document.getElementById("normalSwitch");
+  if (normal) normal.checked = !c.ai_enabled;   // 两种转发方式互斥
+  const eng = document.getElementById("aiEngine");
+  if (eng) eng.value = c.ai_engine || "rule";
+  refreshAiDeploy();
 }
 async function saveInterval() {
   const v = parseInt(document.getElementById("intervalMin").value, 10);
@@ -490,13 +510,33 @@ async function saveInterval() {
   await apiCall("save_config", JSON.stringify({ interval_minutes: v }));
   toast("间隔已保存", "ok"); await loadState();
 }
+/* 转发方式互斥切换：开启其一自动关闭另一种，且至少保留一种 */
+async function onForwardModeChange(which) {
+  const ai = document.getElementById("aiSwitch");
+  const normal = document.getElementById("normalSwitch");
+  if (which === "ai") {
+    normal.checked = !ai.checked;
+  } else {
+    ai.checked = !normal.checked;
+  }
+  if (!ai.checked && !normal.checked) {
+    // 用户把当前项关掉时，自动切到另一种，保证至少一种生效
+    if (which === "ai") { normal.checked = true; }
+    else { ai.checked = true; }
+  }
+  await apiCall("save_config", JSON.stringify({ ai_enabled: ai.checked }));
+  toast("转发设置已保存", "ok"); await loadState();
+}
 async function saveForwardMode() {
   const ai = document.getElementById("aiSwitch").checked;
+  const normal = document.getElementById("normalSwitch").checked;
+  if (!ai && !normal) { toast("请至少选择一种转发方式", "err"); return; }
   await apiCall("save_config", JSON.stringify({ ai_enabled: ai }));
   toast("转发设置已保存", "ok"); await loadState();
 }
 
 async function forwardRandomNow() {
+  // 回退至 v2609080004 行为：直接随机挑选并转发（不同步轮询），由后端同步返回结果
   toast("正在随机挑选并转发…");
   const r = await apiCall("forward_random_now");
   if (r.ok) {
@@ -508,8 +548,90 @@ async function forwardRandomNow() {
   await loadState();
 }
 
+/* ---------------- AI 引擎路线 + 部署进度 ---------------- */
+async function saveAiEngine() {
+  const eng = document.getElementById("aiEngine").value;
+  const r = await apiCall("set_ai_engine", eng);
+  if (r && r.ok) {
+    toast("AI 引擎路线已保存", "ok");
+    if (eng === "model") toast("已触发模型下载（见下方部署进度）", "ok");
+    await loadState();
+  } else {
+    toast((r && r.error) || "保存失败", "err");
+  }
+}
+
+async function startModelDownload() {
+  const r = await apiCall("start_model_download");
+  if (r && r.ok) {
+    toast(r.already ? "模型已存在，无需下载" : "已开始下载模型（后台进行）", "ok");
+    startDeployPoll();
+  } else {
+    toast((r && r.error) || "操作失败", "err");
+  }
+}
+
+async function openModelsDir() {
+  await apiCall("open_models_dir");
+}
+
+let _deployTimer = null;
+function startDeployPoll() {
+  if (_deployTimer) return;
+  _deployTimer = setInterval(async () => {
+    const r = await apiCall("get_model_progress");
+    if (!r) { stopDeployPoll(); return; }
+    updateAiDeployUI(r);
+    if (!r.downloading) stopDeployPoll();
+  }, 1000);
+}
+function stopDeployPoll() {
+  if (_deployTimer) { clearInterval(_deployTimer); _deployTimer = null; }
+}
+
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(1) + " " + u[i];
+}
+
+function updateAiDeployUI(s) {
+  const bar = document.getElementById("aiDeployBar");
+  const pct = document.getElementById("aiDeployPct");
+  const status = document.getElementById("aiDeployStatus");
+  const hint = document.getElementById("aiDeployHint");
+  if (!bar) return;
+  const p = Math.max(0, Math.min(100, Math.round((s.progress || 0) * 100)));
+  bar.style.width = p + "%";
+  pct.textContent = p + "%";
+  let msg = "";
+  if (s.downloading) {
+    msg = `下载中… ${fmtBytes(s.downloaded_bytes)} / ${fmtBytes(s.total_bytes)}（${fmtBytes(s.speed)}/s）`;
+  } else if (s.exists && s.loaded) {
+    msg = `已就绪：模型已下载并加载（${s.engine}）`;
+  } else if (s.exists && !s.loaded) {
+    msg = `模型已下载，将在首次使用时加载（${s.engine}）`;
+  } else if (s.error) {
+    msg = `错误：${s.error}`;
+  } else {
+    msg = `模型文件未下载（将保存到 ${s.models_dir}）`;
+  }
+  if (status) status.textContent = msg;
+  if (hint) hint.textContent = s.exists ? "" : "（首次启用主路线会自动下载，约 1GB）";
+}
+
+async function refreshAiDeploy() {
+  const r = await apiCall("get_model_progress");
+  if (!r) return;
+  updateAiDeployUI(r);
+  if (r.downloading) startDeployPoll();
+}
+
 /* ---------------- AI 人格 ---------------- */
 let SELECTED_PERSONA = "";
+let EDITING_CUSTOM = null;   // 正在编辑的自定义人格名称（null 表示新建）
 
 function allPersonas() {
   const builtins = STATE.personas || [];
@@ -522,6 +644,20 @@ function renderAI() {
   const current = STATE.config.persona || builtins[0] || "";
   SELECTED_PERSONA = current;
   document.getElementById("currentPersonaLabel").textContent = current || "—";
+
+  // 标题右侧：当前引擎与状态
+  const aiOn = STATE.config.ai_enabled;
+  const eng = STATE.config.ai_engine || "rule";
+  const engLabel = eng === "model"
+    ? "本地大模型 (llama.cpp · Qwen2.5-1.5B)"
+    : "轻量规则引擎 (jieba)";
+  const statusEl = document.getElementById("aiModelStatus");
+  if (statusEl) {
+    statusEl.innerHTML =
+      `引擎：<b>${engLabel}</b>` +
+      `<span class="dot ${aiOn ? "on" : "off"}"></span>${aiOn ? "已开启" : "已关闭"}` +
+      ` · 当前人格：<b>${esc(current || "—")}</b>`;
+  }
 
   const box = document.getElementById("personaList");
   const buildCard = (p, isCustom) => {
@@ -558,6 +694,30 @@ function selectPersona(name) {
   document.querySelectorAll(".persona-card").forEach(c => {
     c.classList.toggle("active", c.dataset.name === name);
   });
+  // 选中「自定义人格」时，将其人设介绍载入编辑区，便于直接修改后覆盖保存
+  const custom = (STATE.config.custom_personas || {})[name];
+  if (custom) {
+    document.getElementById("custName").value = name;
+    document.getElementById("custDesc").value = Array.isArray(custom) ? custom.join("\n") : custom;
+    EDITING_CUSTOM = name;
+    showCustomEditHint(name);
+  } else {
+    // 选中内置人格则清空编辑区，避免误覆盖
+    document.getElementById("custName").value = "";
+    document.getElementById("custDesc").value = "";
+    EDITING_CUSTOM = null;
+    clearCustomEditHint();
+  }
+}
+
+function showCustomEditHint(name) {
+  const el = document.getElementById("custEditHint");
+  if (el) el.textContent = `正在编辑「${name}」：修改后点击「保存自定义人格」即可覆盖更新。`;
+}
+
+function clearCustomEditHint() {
+  const el = document.getElementById("custEditHint");
+  if (el) el.textContent = "";
 }
 
 async function savePersona() {
@@ -579,13 +739,17 @@ async function previewAI() {
 
 async function saveCustom() {
   const name = document.getElementById("custName").value.trim();
-  const tpl = document.getElementById("custTpl").value.split("\n").map(s => s.trim()).filter(Boolean);
-  if (!name || !tpl.length) { toast("请填写名称与至少一条模板", "err"); return; }
-  const r = await apiCall("save_custom_persona", name, JSON.stringify(tpl));
+  const desc = document.getElementById("custDesc").value.trim();
+  if (!name || !desc) { toast("请填写人格名称与人设介绍", "err"); return; }
+  // 处于编辑态且改了名称：先删除旧条目，避免残留重复人格
+  if (EDITING_CUSTOM && EDITING_CUSTOM !== name) {
+    await apiCall("delete_custom_persona", EDITING_CUSTOM);
+  }
+  const r = await apiCall("save_custom_persona", name, JSON.stringify(desc));
   if (r.ok) {
     toast("自定义人格已保存", "ok");
-    document.getElementById("custName").value = "";
-    document.getElementById("custTpl").value = "";
+    EDITING_CUSTOM = name;
+    showCustomEditHint(name);
     await loadState();
   } else toast(r.error, "err");
 }
@@ -595,6 +759,12 @@ async function deleteCustom(name) {
   const r = await apiCall("delete_custom_persona", name);
   if (r.ok) {
     if (SELECTED_PERSONA === name) SELECTED_PERSONA = "";
+    if (EDITING_CUSTOM === name) {
+      EDITING_CUSTOM = null;
+      clearCustomEditHint();
+      document.getElementById("custName").value = "";
+      document.getElementById("custDesc").value = "";
+    }
     toast("已删除自定义人格", "ok");
     await loadState();
   } else toast(r.error || "删除失败", "err");
@@ -700,11 +870,70 @@ async function startScheduler() {
 async function stopScheduler() {
   await apiCall("stop_scheduler"); toast("已停止"); await loadState();
 }
+/* 统一的「后台异步轮询 + 进度条」驱动：manualRun 与 forwardRandomNow 共用。
+   apiName: 后端接口名（manual_run_async / forward_random_now）；
+   startLabel: 进度条初始文案。 */
+function runPollWithProgress(apiName, startLabel) {
+  const wrap = document.getElementById("pollProgressWrap");
+  const fill = document.getElementById("pollProgressBar");
+  const label = document.getElementById("pollProgressLabel");
+  wrap.style.display = "flex";
+  fill.style.width = "0%";
+  label.textContent = startLabel;
+
+  // 若已有进度轮询在跑，避免创建重复定时器（挂接在已有的那次进度轮询上）
+  if (_pollTimer) return;
+
+  // 后台异步执行，立即返回，避免阻塞界面
+  apiCall(apiName).then((r) => {
+    if (!r || !r.started) {
+      label.textContent = (r && r.error) ? r.error : "操作进行中…";
+    }
+  });
+
+  // 每 300ms 轮询进度，直到 active 变为 false
+  _pollTimer = setInterval(async () => {
+    try {
+      const p = await apiCall("get_poll_progress");
+      if (!p) return;
+      if (p.active) {
+        let pct = 5;
+        if (p.total > 0) pct = Math.round((p.done / p.total) * 100);
+        else if (p.phase === "forward") pct = 95;
+        fill.style.width = Math.min(100, pct) + "%";
+        label.textContent = `轮询中 ${p.done}/${p.total}` + (p.current ? ` · ${p.current}` : "");
+      } else {
+        clearInterval(_pollTimer);
+        _pollTimer = null;
+        fill.style.width = "100%";
+        const res = p.result || {};
+        if (res.ok) {
+          if (res.forwarded) label.textContent = "已转发 · " + (res.message || "本轮转发 1 条");
+          else label.textContent = "完成 · " + (res.message || "");
+        } else {
+          label.textContent = "完成 · " + (res.error || res.message || "无结果");
+        }
+        setTimeout(() => { wrap.style.display = "none"; }, 1800);
+        loadState();  // 刷新概览（含「最近一次轮询结果」）
+      }
+    } catch (e) { /* 忽略单次轮询异常，下一轮继续 */ }
+  }, 300);
+}
+
 async function manualRun() {
-  toast("正在轮询一次…");
-  const r = await apiCall("run_once");
-  toast(r.message || "完成", r.ok ? "ok" : "err");
-  await loadState();
+  runPollWithProgress("manual_run_async", "正在启动轮询…");
+}
+
+/* 概览左上角实时时钟（日期 + 时间 + 星期） */
+function updateOverviewClock() {
+  const el = document.getElementById("ovClock");
+  if (!el) return;
+  const d = new Date();
+  const wd = ["日", "一", "二", "三", "四", "五", "六"][d.getDay()];
+  const p = (n) => String(n).padStart(2, "0");
+  el.textContent =
+    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}  ` +
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}  星期${wd}`;
 }
 
 /* ---------------- 历史 ---------------- */
@@ -731,6 +960,24 @@ async function switchHist(kind) {
     HIST_ROWS = await apiCall("get_forwards", 500, 0);
   }
   applyHistFilter();
+}
+
+/* 修复历史记录里被抓成表情包的图片 */
+async function repairHistoryImages() {
+  if (!confirm("修复历史图片？\n\n将按微博详情接口重新抓取每条微博的真正配图（pic_infos），覆盖此前误存的表情包。\n最多处理最近 200 条，请耐心等待。")) return;
+  const btn = (typeof event !== "undefined" && event) ? event.target : null;
+  if (btn) { btn.disabled = true; btn.textContent = "修复中…"; }
+  try {
+    const res = await apiCall("repair_history_images", 200);
+    if (res && res.ok) {
+      toast(`修复完成：重新下载 ${res.fixed} 条，清除误存表情 ${res.cleaned} 条，失败 ${res.failed} 条`);
+      await switchHist(histKind);
+    } else {
+      toast("修复失败：" + ((res && res.error) || "未知错误"));
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "修复历史图片"; }
+  }
 }
 
 function renderHistFilters() {
@@ -1051,8 +1298,14 @@ function renderImageThumbs(images) {
 }
 
 function bindImagePreviews() {
-  document.querySelectorAll(".thumb").forEach(img => {
+  // 绑定点击预览 + 异步加载缩略图（修复：此前 img 无 src 且无人加载，缩略图永远空白）
+  document.querySelectorAll("img.thumb:not([data-loaded])").forEach(img => {
+    img.dataset.loaded = "1";
     img.onclick = () => previewImage(img.dataset.path);
+    apiCall("load_image_base64", img.dataset.path).then(r => {
+      if (r && r.ok) img.src = r.data_url;
+      else img.alt = "×";           // 文件缺失时显示占位符
+    }).catch(() => { img.alt = "×"; });
   });
 }
 
@@ -1099,28 +1352,41 @@ async function exportKind(kind) {
 /* ---------------- 数据总览 ---------------- */
 let DATA_OVERVIEW = null;
 let DATA_OVERVIEW_SERIES = "today_hourly";
+let DATA_OVERVIEW_DATE = null;   // 选中历史某天（YYYY-MM-DD）的数据；null 表示使用区间 tab
+let _dovChart = null;            // 趋势曲线当前渲染状态（供悬浮提示使用）
 
 async function loadDataOverview() {
   try {
     const r = await apiCall("get_data_overview");
     if (!r || !r.ok) { toast(r.error || "数据总览加载失败", "err"); return; }
     DATA_OVERVIEW = r.data;
+    const dp = document.getElementById("dataOverviewDate");
+    if (dp) dp.max = new Date().toISOString().slice(0, 10);  // 不可选未来日期
     renderDataOverview();
   } catch (e) { toast("数据总览加载异常", "err"); }
 }
 
 function renderDataOverview() {
-  if (!DATA_OVERVIEW) return;
-  const summary = DATA_OVERVIEW.summary || {};
-  const top = DATA_OVERVIEW.top_forwarded || [];
+  const ov = DATA_OVERVIEW_DATE || DATA_OVERVIEW;
+  if (!ov) return;
+  const isDate = !!DATA_OVERVIEW_DATE;
+  const dateLabel = isDate ? (DATA_OVERVIEW_DATE.date || "") : "";
+  const summary = ov.summary || {};
+  const top = ov.top_forwarded || [];
   const today = summary.today || {};
-  const month = summary.month || {};
+  // 日期模式下，本月统计回退到总览数据（DATA_OVERVIEW 始终含本月）
+  const baseMonth = (DATA_OVERVIEW && DATA_OVERVIEW.summary && DATA_OVERVIEW.summary.month) || {};
+  const month = isDate ? baseMonth : (summary.month || {});
 
-  // 核心指标：今日抓取 / 今日转发 / 本月抓取 / 本月转发 / 高频被转发
+  // 核心指标：日期模式下前两项展示该具体日期的抓取 / 转发
   const topName = top.length ? top[0].screen_name : "—";
+  const monVal = isDate ? (summary.monitored || 0) : (today.monitored || 0);
+  const fwdVal = isDate ? (summary.forwarded || 0) : (today.forwarded || 0);
+  const lblMon = isDate ? `抓取(${dateLabel})` : "本日抓取";
+  const lblFwd = isDate ? `转发(${dateLabel})` : "本日转发";
   document.getElementById("dataOverviewSummary").innerHTML = [
-    ["本日抓取", today.monitored || 0],
-    ["本日转发", today.forwarded || 0],
+    [lblMon, monVal],
+    [lblFwd, fwdVal],
     ["本月抓取", month.monitored || 0],
     ["本月转发", month.forwarded || 0],
     ["高频被转发", topName],
@@ -1143,8 +1409,13 @@ function renderDataOverview() {
 }
 
 function renderDataOverviewChart() {
-  if (!DATA_OVERVIEW) return;
-  const series = (DATA_OVERVIEW.series || {})[DATA_OVERVIEW_SERIES] || [];
+  let series;
+  if (DATA_OVERVIEW_DATE) {
+    series = (DATA_OVERVIEW_DATE.series || {}).hourly || [];
+  } else {
+    if (!DATA_OVERVIEW) return;
+    series = (DATA_OVERVIEW.series || {})[DATA_OVERVIEW_SERIES] || [];
+  }
   const wrap = document.getElementById("dataOverviewChartWrap");
   const svg = document.getElementById("dataOverviewChart");
   if (!series.length) {
@@ -1214,9 +1485,31 @@ function bindDataOverviewTabs() {
       document.querySelectorAll("#dataOverviewTabs .chart-tab").forEach(b => b.classList.remove("active"));
       btn.classList.add("active");
       DATA_OVERVIEW_SERIES = btn.dataset.series;
+      clearDataOverviewDate();   // 切换到区间 tab 时退出"按日期查看"
       renderDataOverviewChart();
     };
   });
+}
+
+// 趋势曲线日期选择器：查询历史某天的小时级抓取 / 转发曲线
+async function onDataOverviewDateChange() {
+  const el = document.getElementById("dataOverviewDate");
+  const d = el && el.value;
+  if (!d) { clearDataOverviewDate(); return; }
+  try {
+    const r = await apiCall("get_data_overview_by_date", d);
+    if (!r || !r.ok) { toast(r.error || "查询失败", "err"); return; }
+    DATA_OVERVIEW_DATE = r.data;
+    renderDataOverview();
+    renderDataOverviewChart();
+  } catch (e) { toast("按日期查询异常", "err"); }
+}
+
+function clearDataOverviewDate() {
+  DATA_OVERVIEW_DATE = null;
+  const el = document.getElementById("dataOverviewDate");
+  if (el) el.value = "";
+  renderDataOverview();
 }
 
 async function exportDataOverview(fmt) {
@@ -1226,13 +1519,65 @@ async function exportDataOverview(fmt) {
 }
 
 /* ---------------- 日志 ---------------- */
-async function loadLogs() {
-  const rows = await apiCall("get_logs", 500, 0);
-  const box = document.getElementById("logView");
-  box.textContent = rows.map(r => `[${r.created_at}][${r.level}] ${r.message}`).reverse().join("\n") || "暂无日志";
-  box.scrollTop = box.scrollHeight;
+let _logKeywordTimer = null;
+function onLogKeywordInput() {
+  clearTimeout(_logKeywordTimer);
+  _logKeywordTimer = setTimeout(loadLogs, 350);   // 输入防抖
 }
-function clearLogView() { document.getElementById("logView").textContent = ""; }
+
+function logLineHtml(r) {
+  const cls = { DEBUG: "log-d", INFO: "log-i", WARN: "log-w", ERROR: "log-e" }[r.level] || "log-i";
+  return `<div class="log-line ${cls}">`
+    + `<span class="log-time">[${esc(r.created_at)}]</span> `
+    + `<span class="log-level">[${esc(r.level)}]</span> `
+    + `<span class="log-msg">${esc(r.message)}</span></div>`;
+}
+
+async function loadLogs() {
+  const lv = document.getElementById("logLevel");
+  const cat = document.getElementById("logCategory");
+  const kw = document.getElementById("logKeyword");
+  const level = lv ? lv.value : "ALL";
+  const category = cat ? cat.value : "ALL";
+  const keyword = kw ? kw.value.trim() : "";
+
+  const res = await apiCall("get_logs", 500, 0, level, category, keyword);
+  // 兼容后端返回 {rows,total} 或纯数组两种形态
+  const rows = (res && res.rows) ? res.rows : (Array.isArray(res) ? res : []);
+  const total = (res && typeof res.total === "number") ? res.total : rows.length;
+
+  const box = document.getElementById("logView");
+  box.innerHTML = rows.length
+    ? rows.map(logLineHtml).reverse().join("")
+    : `<div class="log-line log-i"><span class="log-msg">没有符合条件的日志</span></div>`;
+
+  const stat = document.getElementById("logStat");
+  if (stat) stat.textContent = `共 ${total} 条 · 当前显示 ${rows.length} 条`;
+  box.scrollTop = box.scrollHeight;   // 新问题在底部（按 id 倒序后已反转）
+}
+
+async function onLogVerboseChange() {
+  const el = document.getElementById("logVerbose");
+  const on = el ? el.checked : false;
+  const res = await apiCall("set_log_verbose", on);
+  if (res && res.ok) toast(`冗余调试日志已${on ? "开启" : "关闭"}`);
+  else if (el) el.checked = !on;
+}
+
+async function clearAllLogs() {
+  if (!confirm("确定清空全部运行日志？此操作不可恢复。")) return;
+  const res = await apiCall("clear_logs");
+  if (res && res.ok) { toast("运行日志已清空"); loadLogs(); }
+  else toast("清空失败：" + ((res && res.error) || "未知错误"));
+}
+
+async function exportLogs(fmt) {
+  const res = await apiCall("export_logs", fmt);
+  if (res && res.ok) toast("已导出：" + res.path);
+  else if (res && res.error && !/取消/.test(res.error)) toast("导出失败：" + res.error);
+}
+
+function clearLogView() { document.getElementById("logView").innerHTML = ""; }
 
 /* ---------------- 关于 ---------------- */
 function renderAbout() {
@@ -1391,6 +1736,243 @@ async function deactivateLicense() {
   else toast(r.error || "失败", "err");
 }
 
+
+/* ---------------- 监控对象 导入 / 导出 ---------------- */
+function showMonImportBox() {
+  const b = document.getElementById("monImportBox");
+  if (b) {
+    b.style.display = "block";
+    const t = document.getElementById("monImportText");
+    if (t) t.focus();
+  }
+}
+
+function hideMonImportBox() {
+  const b = document.getElementById("monImportBox");
+  if (b) b.style.display = "none";
+  const r = document.getElementById("monImportResult");
+  if (r) r.textContent = "";
+}
+
+async function submitMonImport() {
+  const t = document.getElementById("monImportText");
+  const text = t ? t.value : "";
+  if (!text.trim()) { toast("请先粘贴要导入的内容"); return; }
+  const res = await apiCall("import_monitors_text", text);
+  const el = document.getElementById("monImportResult");
+  if (!res || !res.ok) {
+    if (el) el.textContent = "导入失败：" + ((res && res.error) || "未知错误");
+    return;
+  }
+  if (el) el.textContent = `新增 ${res.added} · 跳过 ${res.skipped} · 失败 ${res.failed}`;
+  toast(`导入完成：新增 ${res.added} 个，跳过 ${res.skipped} 个`);
+  if (t) t.value = "";
+  hideMonImportBox();
+  await loadState();
+  renderMonitors();
+}
+
+async function importMonitorsFile() {
+  const res = await apiCall("import_monitors_from_file");
+  if (res && res.ok) {
+    toast(`导入完成：新增 ${res.added} · 跳过 ${res.skipped} · 失败 ${res.failed}`);
+    await loadState();
+    renderMonitors();
+  } else if (res && res.error && !/取消/.test(res.error)) {
+    toast("导入失败：" + res.error);
+  }
+}
+
+async function exportMonitors(fmt) {
+  const res = await apiCall("export_monitors", fmt);
+  if (res && res.ok) toast(`已导出 ${res.count} 个监控对象 → ${res.path}`);
+  else if (res && res.error && !/取消/.test(res.error)) toast("导出失败：" + res.error);
+}
+
+/* ---------------- 视频 / 相册 ---------------- */
+let _mediaTimer = null;
+let _mediaKwTimer = null;
+
+function escAttr(s) { return esc(s).replace(/'/g, "&#39;"); }
+
+async function loadMediaPage() {
+  await loadMediaConfig();
+  await loadMediaSummary();
+  await loadMediaObjects();
+  // 若下载任务仍在执行（例如切走又切回），恢复进度轮询
+  try {
+    const p = await apiCall("get_media_progress");
+    if (p && p.active) startMediaProgressPolling();
+  } catch (e) { /* 忽略 */ }
+}
+
+async function loadMediaConfig() {
+  const c = await apiCall("get_media_config");
+  if (!c) return;
+  const chk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+  chk("mediaEnabled", c.enabled);
+  set("mediaInterval", c.interval_minutes || 30);
+  set("mediaPages", c.max_pages || 5);
+}
+
+function onMediaEnabledChange() { /* 需点击「保存设置」生效 */ }
+
+async function saveMediaConfig() {
+  const patch = {
+    enabled: document.getElementById("mediaEnabled").checked,
+    interval_minutes: parseInt(document.getElementById("mediaInterval").value || "30", 10),
+    max_pages: parseInt(document.getElementById("mediaPages").value || "5", 10),
+  };
+  const res = await apiCall("save_media_config", patch);
+  if (res && res.ok) toast("相册监控设置已保存");
+  else toast("保存失败：" + ((res && res.error) || "未知错误"));
+}
+
+async function loadMediaSummary() {
+  const s = await apiCall("get_media_summary");
+  const el = document.getElementById("mediaSummary");
+  if (!el || !s) return;
+  const mb = (s.size || 0) / 1024 / 1024;
+  el.textContent = `媒体库：${s.objects || 0} 个对象 · 图片 ${s.images || 0} 张 · 占用 ${mb.toFixed(1)} MB`;
+}
+
+async function loadMediaObjects() {
+  const list = await apiCall("list_media_objects") || [];
+  renderMediaObjects(list);
+}
+
+function onMediaKeywordInput() {
+  clearTimeout(_mediaKwTimer);
+  _mediaKwTimer = setTimeout(searchMedia, 350);
+}
+
+async function searchMedia() {
+  const kw = (document.getElementById("mediaKeyword").value || "").trim();
+  if (!kw) { loadMediaObjects(); return; }
+  const rows = await apiCall("search_media", kw) || [];
+  const map = {};
+  for (const r of rows) {
+    if (!map[r.uid]) map[r.uid] = { uid: r.uid, screen_name: r.screen_name || "", videos: 0, images: 0 };
+    if (r.media_type === "video") map[r.uid].videos++;
+    else map[r.uid].images++;
+  }
+  renderMediaObjects(Object.values(map));
+}
+
+function renderMediaObjects(list) {
+  const box = document.getElementById("mediaList");
+  if (!box) return;
+  if (!list.length) {
+    box.innerHTML = `<div class="muted" style="font-size:13px;">暂无媒体文件，点击「立即执行下载」开始抓取。</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="media-obj-grid">` + list.map(o => `
+    <div class="media-obj-card" onclick="toggleMediaObject('${escAttr(o.uid)}')">
+      <div class="media-obj-name">${esc(o.screen_name || "(无昵称)")}</div>
+      <div class="media-obj-uid">UID ${esc(o.uid)}</div>
+      <div class="media-obj-counts">相册 <b>${o.images || 0}</b> 张</div>
+      <div class="row" style="gap:8px; margin-top:10px;">
+        <button class="ghost" onclick="event.stopPropagation(); openMediaDir('${escAttr(o.uid)}')">打开目录</button>
+      </div>
+      <div id="mediaObj_${escAttr(o.uid)}"></div>
+    </div>`).join("") + `</div>`;
+}
+
+async function toggleMediaObject(uid) {
+  const box = document.getElementById("mediaObj_" + uid);
+  if (!box) return;
+  if (box.innerHTML.trim()) { box.innerHTML = ""; return; }   // 再次点击收起
+  box.innerHTML = `<div class="muted" style="font-size:12px;">加载中…</div>`;
+  const rows = await apiCall("get_media_by_uid", uid, "image") || [];
+  const imgs = rows;
+  let html = "";
+  if (imgs.length) {
+    html += `<div class="media-subtitle">相册（${imgs.length}）</div><div class="media-thumbs">`
+      + imgs.slice(0, 24).map(r =>
+        `<img class="media-thumb" data-rel="${escAttr(r.file_path)}" title="${escAttr(r.file_name)}"
+              onclick="event.stopPropagation(); previewMedia('${escAttr(r.file_path)}','image')">`).join("")
+      + `</div>`;
+  }
+  if (!html) html = `<div class="muted" style="font-size:12px;">该对象暂无相册图片</div>`;
+  box.innerHTML = html;
+  // 异步加载图片缩略图（避免一次性阻塞）
+  box.querySelectorAll("img.media-thumb").forEach(async (img) => {
+    const r = await apiCall("load_media_base64", img.dataset.rel);
+    if (r && r.ok) img.src = r.data_url;
+    else img.alt = "×";
+  });
+}
+
+async function previewMedia(rel, type) {
+  const box = document.getElementById("mediaPreview");
+  const mask = document.getElementById("mediaPreviewMask");
+  if (!box || !mask) return;
+  box.innerHTML = `<div class="muted">加载中…</div>`;
+  mask.classList.add("show");
+  const r = await apiCall("load_media_base64", rel);
+  box.innerHTML = (r && r.ok)
+    ? `<img src="${r.data_url}">`
+    : `<div class="muted" style="color:#ff8a8a;">无法加载：${esc((r && r.error) || "未知错误")}</div>`;
+}
+
+function closeMediaPreview() {
+  const mask = document.getElementById("mediaPreviewMask");
+  const box = document.getElementById("mediaPreview");
+  if (mask) mask.classList.remove("show");
+  if (box) box.innerHTML = "";
+}
+
+async function startMediaDownload() {
+  const res = await apiCall("start_media_download");
+  if (res && res.ok) { toast("下载任务已启动"); startMediaProgressPolling(); }
+  else toast("启动失败：" + ((res && res.error) || "未知错误"));
+}
+
+function startMediaProgressPolling() {
+  clearInterval(_mediaTimer);
+  _mediaTimer = setInterval(async () => {
+    let p;
+    try { p = await apiCall("get_media_progress"); } catch (e) { return; }
+    if (!p) return;
+    const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+    const bar = document.getElementById("mediaBar");
+    const pctEl = document.getElementById("mediaPct");
+    const stEl = document.getElementById("mediaStatus");
+    if (bar) bar.style.width = pct + "%";
+    if (pctEl) pctEl.textContent = pct + "%";
+    if (stEl) {
+      stEl.textContent = p.active
+        ? `下载中 ${p.done}/${p.total} · 当前：${p.current || "-"} · 扫描 ${p.posts} 条微博`
+          + ` · 新下载 ${p.files_done} · 增量跳过 ${p.files_skipped} · 失败 ${p.files_failed}`
+        : (p.message || "空闲");
+    }
+    if (!p.active) {
+      clearInterval(_mediaTimer);
+      _mediaTimer = null;
+      await loadMediaSummary();
+      await loadMediaObjects();
+    }
+  }, 1000);
+}
+
+async function openMediaDir(uid) {
+  const res = await apiCall("open_media_dir", uid || "");
+  if (res && !res.ok) toast("打开失败：" + (res.error || ""));
+}
+
+/* 清理下载记录：只重置增量判定，不动本地文件 */
+async function clearMediaRecords() {
+  if (!confirm("确认清理下载记录？\n\n· 仅清空软件内的下载记录，已下载的图片文件会完整保留\n· 清理后增量判定重置，再次执行下载将重新拉取并覆盖同名文件")) return;
+  const res = await apiCall("clear_media_records");
+  if (res && res.ok) {
+    toast("下载记录已清理（本地文件保留，增量判定已重置）");
+    await loadMediaSummary();
+    await loadMediaObjects();
+  } else {
+    toast("清理失败：" + ((res && res.error) || "未知错误"));
+  }
+}
 
 /* ---------------- 启动 ---------------- */
 if (window.pywebview) {

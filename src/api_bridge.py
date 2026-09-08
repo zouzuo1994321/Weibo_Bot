@@ -15,17 +15,24 @@ from account_manager import get_account_manager
 from ai_generator import generate as ai_generate, list_personas
 from config_manager import get_config
 from exporter import export, export_all, export_filtered, export_rows
-from forward_engine import run_once, _download_avatar
+from forward_engine import (run_once, _download_avatar, _download_post_images,
+                            manual_run_async, get_poll_progress)
 from history_db import get_history_db
-from logger import info, warn, error, read_file_lines
+from logger import (info, warn, error, debug, read_file_lines,
+                    set_verbose, is_verbose, CAT_CORE, CAT_MEDIA)
 from monitor_manager import get_monitor_manager
+from pathlib import Path
 from paths import (APP_NAME, COPYRIGHT, COPYRIGHT_FULL, HISTORY_DIR,
-                   MAJOR_VERSION, BASE_DIR, DATA_DIR)
+                   MAJOR_VERSION, BASE_DIR, DATA_DIR, MEDIA_DIR)
 from licensemgr import (get_status, generate_feature_code, activate_license,
                       deactivate_license, can_forward, forward_block_reason,
                       FEATURE_CODE_VALID_DAYS)
 from scheduler import get_scheduler
-from weibo_client import get_user_info, get_latest_posts, diagnose_account, repost
+from media_engine import (get_media_progress, start_media_download_async,
+                          user_media_dir, maybe_run_scheduled_media_download)
+from weibo_client import (get_user_info, get_latest_posts, diagnose_account,
+                          repost, get_post_detail)
+import model_manager
 
 
 def _ver():
@@ -113,6 +120,11 @@ class Api:
     def get_state(self):
         # 触发节流式自动账户健康检测（后台线程，不阻塞）
         self._auto_check_accounts()
+        # 软件运行时：若启用「本地大模型」路线且模型缺失，自动开始后台下载
+        try:
+            model_manager.maybe_autostart()
+        except Exception:
+            pass
         cfg = get_config().to_dict()
         acc = get_account_manager().list_accounts()
         mon = get_monitor_manager().list()
@@ -131,6 +143,7 @@ class Api:
             "stats": db.stats(),
             "personas": list_personas(),
             "license": get_status(),
+            "ai_deploy": model_manager.get_state(),   # AI 部署进度（模型下载/加载状态）
         }
 
     def get_data_overview(self):
@@ -139,6 +152,14 @@ class Api:
             return {"ok": True, "data": get_history_db().data_overview()}
         except Exception as e:
             error(f"数据总览查询失败：{e}")
+            return {"ok": False, "error": str(e)}
+
+    def get_data_overview_by_date(self, date):
+        """按指定日期（YYYY-MM-DD）查询当日抓取 / 转发趋势，供趋势曲线日期选择器使用。"""
+        try:
+            return {"ok": True, "data": get_history_db().data_overview_date(date)}
+        except Exception as e:
+            error(f"按日期查询数据总览失败：{e}")
             return {"ok": False, "error": str(e)}
 
     def export_data_overview(self, fmt="json"):
@@ -437,9 +458,22 @@ class Api:
     def run_once(self):
         return run_once()
 
+    def manual_run_async(self):
+        """后台异步执行一轮完整轮询，轮询完毕后立即转发一条（不保留抖动延迟）。
+        前端通过 get_poll_progress 轮询进度与结果；转发内容经 run_once 去重（不重复）。"""
+        return manual_run_async(force_immediate=True)
+
+    def get_poll_progress(self):
+        """返回当前轮询进度（用于「立即轮询一次」进度条）。"""
+        try:
+            return get_poll_progress()
+        except Exception as e:
+            return {"active": False, "error": str(e)}
+
     def forward_random_now(self):
         """立即转发：在监控列表中随机挑一个对象，转发其最新一条（非置顶）微博。
-        手动触发，不依赖轮询增量状态；命中黑名单则跳过。"""
+        手动触发，不依赖轮询增量状态；命中黑名单则跳过。
+        （回退至 v2609080004 行为：直接随机挑选并转发，不先轮询。）"""
         am = get_account_manager()
         accs = am.list_accounts()
         if not accs:
@@ -487,7 +521,7 @@ class Api:
         if hit:
             db.add_forward(acc["id"], acc_name, uid, screen_name, chosen["id"],
                            chosen["text"], comment, ftype,
-                           "skipped", reason=f"命中黑名单：{','.join(hit)}")
+                           "skipped", reason=f"命中黑名单：{','.join(hit)}", persona=persona)
             return {"ok": True, "skipped": True, "uid": uid,
                     "screen_name": screen_name,
                     "detail": f"命中黑名单跳过：{','.join(hit)}"}
@@ -495,13 +529,13 @@ class Api:
         r = repost(chosen["id"], comment, cookie, uid=uid)
         if r.get("ok"):
             db.add_forward(acc["id"], acc_name, uid, screen_name, chosen["id"],
-                           chosen["text"], comment, ftype, "success")
+                           chosen["text"], comment, ftype, "success", persona=persona)
             info(f"手动立即转发成功：UID={uid} persona={persona}")
             return {"ok": True, "uid": uid, "screen_name": screen_name,
                     "detail": f"已转发（{ftype}）：{comment or '纯转发'}"}
         db.add_forward(acc["id"], acc_name, uid, screen_name, chosen["id"],
                        chosen["text"], comment, ftype,
-                       "failed", reason=r.get("error", "未知错误"))
+                       "failed", reason=r.get("error", "未知错误"), persona=persona)
         error(f"手动立即转发失败：UID={uid} {r.get('error')}")
         return {"ok": False, "error": f"转发失败：{r.get('error', '未知错误')}"}
 
@@ -529,14 +563,25 @@ class Api:
                           persona or "幽默", custom)
         return {"ok": True, "text": out}
 
-    def save_custom_persona(self, name, templates):
+    def save_custom_persona(self, name, desc):
+        """保存自定义人格。
+
+        desc 可为：
+        - 字符串：新版「人设介绍」自然语言描述（如「你是猫娘，说话软萌」）
+        - 列表：旧版模板列表（兼容历史数据，内部归一为文本存储）
+        """
         try:
-            templates = json.loads(templates) if isinstance(templates, str) else templates
+            desc = json.loads(desc) if isinstance(desc, str) else desc
         except Exception:
-            return {"ok": False, "error": "模板格式错误"}
+            desc = desc  # 当作纯文本处理
+        if isinstance(desc, (list, tuple)):
+            desc = "\n".join(str(t) for t in desc)
+        desc = (desc or "").strip()
+        if not desc:
+            return {"ok": False, "error": "请填写人格介绍"}
         cfg = get_config()
         cp = cfg.get("custom_personas", {}) or {}
-        cp[name] = templates
+        cp[name] = desc
         cfg.set("custom_personas", cp)
         return {"ok": True}
 
@@ -574,20 +619,187 @@ class Api:
         del cp[name]
         cfg.set("custom_personas", cp)
         info(f"已删除自定义人格：{name}")
+
+    # ---------------- AI 引擎路线（主：本地大模型 / 备：轻量规则） ----------------
+    def get_ai_engine_status(self):
+        cfg = get_config()
+        return {
+            "ok": True,
+            "ai_engine": cfg.get("ai_engine", "rule"),
+            "ai_enabled": cfg.get("ai_enabled", False),
+            "deploy": model_manager.get_state(),
+        }
+
+    def set_ai_engine(self, engine):
+        if engine not in ("model", "rule"):
+            return {"ok": False, "error": "未知引擎路线"}
+        get_config().set("ai_engine", engine)
+        info(f"AI 引擎路线已切换为：{engine}")
+        # 切换到本地大模型且模型缺失时，自动开始后台下载
+        if engine == "model":
+            try:
+                model_manager.maybe_autostart()
+            except Exception as e:
+                warn(f"切换后触发模型下载失败：{e}")
+        return {"ok": True, "ai_engine": engine}
+
+    def start_model_download(self):
+        return model_manager.start_download()
+
+    def get_model_progress(self):
+        return model_manager.get_state()
+
+    def open_models_dir(self):
+        path = model_manager.ensure_models_dir()
+        try:
+            os.startfile(path)  # Windows：打开资源管理器
+            return {"ok": True, "path": path}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "path": path}
         return {"ok": True}
 
     # ---------------- 历史 / 日志 ----------------
     def get_monitored_posts(self, uid=None, limit=200, offset=0):
         return get_history_db().get_monitored_posts(uid, limit, offset)
 
+    def repair_history_images(self, limit=100):
+        """修复历史记录里被抓成表情包的微博图片。
+
+        逐条按微博 ID 重新请求详情接口取 `pic_infos`（真正的推文配图），
+        重新下载并覆盖同名文件后写回数据库；纯文本微博则清空其错误图片。
+        """
+        try:
+            from account_manager import get_account_manager
+            acc_mgr = get_account_manager()
+            accounts = acc_mgr.list_accounts()
+            if not accounts:
+                return {"ok": False, "error": "没有可用账户，请先登录"}
+            cookie = acc_mgr.get_cookie(accounts[0]["id"])
+
+            db = get_history_db()
+            try:
+                limit = max(1, min(int(limit or 100), 1000))
+            except Exception:
+                limit = 100
+            posts = db.get_monitored_posts(limit=limit)
+            fixed = cleaned = failed = 0
+            debug(f"开始修复历史图片 · 共 {len(posts)} 条", CAT_CORE)
+            for p in posts:
+                pid = str(p.get("post_id") or "")
+                if not pid:
+                    continue
+                try:
+                    d = get_post_detail(pid, cookie)
+                except Exception as e:
+                    failed += 1
+                    debug(f"修复失败 {pid}：{e}", CAT_CORE)
+                    time.sleep(0.5)
+                    continue
+                if not d.get("ok"):
+                    failed += 1
+                    time.sleep(0.5)
+                    continue
+                imgs = d.get("images") or []
+                if not imgs:
+                    # 详情接口明确无配图 → 清掉此前误存的表情包
+                    if p.get("images"):
+                        db.update_post_images(pid, [])
+                        cleaned += 1
+                    time.sleep(0.4)
+                    continue
+                saved = _download_post_images(imgs, p.get("uid") or "", pid, cookie)
+                if saved:
+                    db.update_post_images(pid, saved)
+                    fixed += 1
+                else:
+                    failed += 1
+                time.sleep(0.6)   # 控速，避免触发风控
+            msg = (f"历史图片修复完成 · 重新下载 {fixed} 条 · 清除误存表情 {cleaned} 条"
+                   f" · 失败/无权限 {failed} 条")
+            info(msg, CAT_CORE)
+            return {"ok": True, "fixed": fixed, "cleaned": cleaned,
+                    "failed": failed, "total": len(posts), "message": msg}
+        except Exception as e:
+            error(f"历史图片修复失败：{e}", CAT_CORE)
+            return {"ok": False, "error": str(e)}
+
     def get_forwards(self, limit=200, offset=0):
         return get_history_db().get_forwards(limit, offset)
 
-    def get_logs(self, limit=500, offset=0):
-        return get_history_db().get_logs(limit, offset)
+    def get_logs(self, limit=500, offset=0, level="ALL", category="ALL", keyword=""):
+        """查询日志，支持级别 / 模块分类筛选与关键字搜索。"""
+        db = get_history_db()
+        rows = db.get_logs(limit, offset, level, category, keyword)
+        try:
+            total = db.count_logs(level, category, keyword)
+        except Exception:
+            total = len(rows)
+        return {"rows": rows, "total": total}
 
     def read_log_file(self, limit=500):
         return read_file_lines(limit)
+
+    def clear_logs(self):
+        """清空运行日志（数据库），并返回是否成功。"""
+        try:
+            get_history_db().clear_logs()
+            info("运行日志已清空", CAT_CORE)
+            return {"ok": True}
+        except Exception as e:
+            error(f"清空日志失败：{e}", CAT_CORE)
+            return {"ok": False, "error": str(e)}
+
+    def set_log_verbose(self, flag):
+        """开启/关闭冗余调试日志（DEBUG 级，记录 HTTP 细节与每步决策）。"""
+        try:
+            set_verbose(bool(flag))
+            try:
+                cfg = get_config()
+                cfg.set("log_verbose", bool(flag))
+            except Exception:
+                pass
+            info(f"冗余调试日志已{'开启' if flag else '关闭'}", CAT_CORE)
+            return {"ok": True, "verbose": bool(flag)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def get_log_verbose(self):
+        return {"verbose": is_verbose()}
+
+    def export_logs(self, fmt="txt"):
+        """导出当前筛选后的日志到用户指定位置。"""
+        import webview
+        suffix = {"csv": ".csv", "json": ".json", "txt": ".txt"}.get(fmt, ".txt")
+        try:
+            win = getattr(self, "main_window", None)
+            res = win.create_file_dialog(
+                webview.SAVE_DIALOG,
+                directory=BASE_DIR,
+                save_filename=f"weibobot_logs{suffix}",
+                file_types=("日志文件 (*.txt;*.csv;*.json)",),
+            )
+            path = res[0] if isinstance(res, (list, tuple)) and res else (res or "")
+            if not path:
+                return {"ok": False, "error": "已取消", "path": ""}
+            rows = get_history_db().get_logs(limit=100000, offset=0)
+            if fmt == "json":
+                import json as _json
+                with open(path, "w", encoding="utf-8") as f:
+                    _json.dump(rows, f, ensure_ascii=False, indent=2)
+            elif fmt == "csv":
+                import csv
+                with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["id", "level", "message", "created_at"])
+                    for r in rows:
+                        w.writerow([r["id"], r["level"], r["message"], r["created_at"]])
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    for r in rows:
+                        f.write(f"[{r['created_at']}][{r['level']}] {r['message']}\n")
+            return {"ok": True, "path": path}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "path": ""}
 
     # ---------------- 导出 ----------------
     def export_data(self, kind, fmt):
@@ -696,3 +908,241 @@ class Api:
             return {"ok": False, "error": f"图片文件不存在：{rel_path}"}
         except Exception as e:
             return {"ok": False, "error": f"读取图片失败：{e}"}
+
+    # ---------------- 视频 / 相册 ----------------
+    def get_media_config(self):
+        """获取视频/相册下载设置。"""
+        return get_config().get("media_download", {}) or {}
+
+    def save_media_config(self, patch):
+        """保存视频/相册下载设置（局部更新）。"""
+        try:
+            cfg = get_config()
+            md = dict(cfg.get("media_download", {}) or {})
+            md.update(patch or {})
+            cfg.set("media_download", md)
+            info(f"视频/相册设置已更新：{list((patch or {}).keys())}")
+            return {"ok": True, "config": md}
+        except Exception as e:
+            error(f"保存视频/相册设置失败：{e}")
+            return {"ok": False, "error": str(e)}
+
+    def start_media_download(self):
+        """手动执行一次下载（后台线程，首次全量、后续增量）。"""
+        return start_media_download_async()
+
+    def get_media_progress(self):
+        """下载进度快照，供前端轮询。"""
+        return get_media_progress()
+
+    def get_media_summary(self):
+        """媒体库统计：对象数 / 视频数 / 图片数 / 占用空间。"""
+        return get_history_db().get_media_summary()
+
+    def clear_media_records(self):
+        """清理软件内的下载记录（media_files 表），**不删除已下载的文件**。
+
+        清理后增量判定重置：再次执行「立即执行下载」会重新拉取全部资源，
+        并对文件名一致的文件直接覆盖。
+        """
+        try:
+            get_history_db().clear_media_files()
+            info("已清理下载记录（本地文件保留，增量判定已重置）", CAT_MEDIA)
+            return {"ok": True}
+        except Exception as e:
+            error(f"清理下载记录失败：{e}", CAT_MEDIA)
+            return {"ok": False, "error": str(e)}
+
+    def list_media_objects(self):
+        """列出媒体库中已有的监控对象。"""
+        return get_history_db().list_media_objects()
+
+    def search_media(self, keyword):
+        """按 UID / 昵称 / 正文搜索媒体文件。"""
+        return get_history_db().search_media(keyword or "")
+
+    def get_media_by_uid(self, uid, media_type="all"):
+        """取某个监控对象的媒体列表。"""
+        return get_history_db().get_media_by_uid(uid, media_type)
+
+    def load_media_base64(self, rel_path):
+        """读取媒体文件并返回 base64 Data URL（图片预览用）。"""
+        try:
+            rel = os.path.normpath(str(rel_path).replace("/", os.sep))
+            p = os.path.abspath(os.path.join(MEDIA_DIR, rel))
+            if not os.path.isfile(p):
+                return {"ok": False, "error": f"文件不存在：{rel_path}"}
+            with open(p, "rb") as f:
+                data = f.read()
+            ext = os.path.splitext(p)[1].lower()
+            mime_map = {
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+                ".mp4": "video/mp4", ".mov": "video/quicktime",
+                ".m4v": "video/mp4", ".webm": "video/webm",
+            }
+            mime = mime_map.get(ext, "application/octet-stream")
+            return {"ok": True,
+                    "data_url": f"data:{mime};base64,{base64.b64encode(data).decode()}",
+                    "size": len(data)}
+        except Exception as e:
+            return {"ok": False, "error": f"读取媒体失败：{e}"}
+
+    def get_media_file_url(self, rel_path):
+        """返回媒体文件的 file:// URL（视频预览用，避免 base64 过大卡界面）。"""
+        try:
+            rel = os.path.normpath(str(rel_path).replace("/", os.sep))
+            p = os.path.abspath(os.path.join(MEDIA_DIR, rel))
+            if not os.path.isfile(p):
+                return {"ok": False, "error": "文件不存在"}
+            return {"ok": True, "url": Path(p).as_uri(),
+                    "path": p, "size": os.path.getsize(p)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ---------------- 监控对象 导入 / 导出 ----------------
+    def export_monitors(self, fmt="json"):
+        """导出监控列表（json / csv / txt）到用户指定位置。"""
+        import webview
+        suffix = {"csv": ".csv", "json": ".json", "txt": ".txt"}.get(fmt, ".txt")
+        try:
+            win = getattr(self, "main_window", None)
+            res = win.create_file_dialog(
+                webview.SAVE_DIALOG, directory=BASE_DIR,
+                save_filename=f"monitors{suffix}",
+                file_types=("监控列表 (*.json;*.csv;*.txt)",))
+            path = res[0] if isinstance(res, (list, tuple)) and res else (res or "")
+            if not path:
+                return {"ok": False, "error": "已取消", "path": ""}
+            items = get_monitor_manager().list()
+            if fmt == "json":
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump([{"uid": it["uid"], "screen_name": it.get("screen_name", "")}
+                               for it in items], f, ensure_ascii=False, indent=2)
+            elif fmt == "csv":
+                import csv as _csv
+                with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                    w = _csv.writer(f)
+                    w.writerow(["uid", "screen_name"])
+                    for it in items:
+                        w.writerow([it["uid"], it.get("screen_name", "")])
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    for it in items:
+                        f.write(f"{it['uid']}\n")
+            info(f"导出监控对象 {len(items)} 个 → {path}")
+            return {"ok": True, "path": path, "count": len(items)}
+        except Exception as e:
+            error(f"导出监控对象失败：{e}")
+            return {"ok": False, "error": str(e), "path": ""}
+
+    def import_monitors_from_file(self):
+        """从文件导入监控列表（json / csv / txt）。"""
+        import webview
+        try:
+            win = getattr(self, "main_window", None)
+            res = win.create_file_dialog(
+                webview.OPEN_DIALOG, directory=BASE_DIR,
+                file_types=("监控列表 (*.json;*.csv;*.txt)", "所有文件 (*.*)"))
+            path = res[0] if isinstance(res, (list, tuple)) and res else (res or "")
+            if not path:
+                return {"ok": False, "error": "已取消"}
+            try:
+                with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+                    text = f.read()
+            except Exception as e:
+                return {"ok": False, "error": f"读取文件失败：{e}"}
+            return self.import_monitors_text(text)
+        except Exception as e:
+            error(f"导入监控对象失败：{e}")
+            return {"ok": False, "error": str(e)}
+
+    def import_monitors_text(self, text):
+        """按文本导入监控对象。
+
+        支持三种格式：
+          1) JSON 数组：[{"uid":"123","screen_name":"昵称"}] 或 {"monitors":[...]}
+          2) CSV / 文本：每行 `UID,昵称`（也兼容逗号、制表符、分号分隔）
+          3) 纯 UID 或微博主页链接（https://weibo.com/u/1234567890），每行一个
+        已存在的 UID 自动跳过，不会重复添加。
+        """
+        import re as _re
+        try:
+            mon = get_monitor_manager()
+            text = (text or "").strip()
+            if not text:
+                return {"ok": False, "error": "内容为空"}
+
+            rows = []
+            if text.startswith("[") or text.startswith("{"):
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, dict):
+                        data = (data.get("monitors") or data.get("list")
+                                or data.get("data") or [])
+                    for it in data:
+                        if isinstance(it, dict):
+                            rows.append((
+                                str(it.get("uid") or it.get("id") or "").strip(),
+                                str(it.get("screen_name") or it.get("name")
+                                    or it.get("nickname") or "").strip()))
+                        else:
+                            rows.append((str(it).strip(), ""))
+                except Exception as e:
+                    return {"ok": False, "error": f"JSON 解析失败：{e}"}
+            else:
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = _re.split(r"[,，\t;]+", line, 1)
+                    uid = parts[0].strip()
+                    name = parts[1].strip() if len(parts) > 1 else ""
+                    rows.append((uid, name))
+
+            added, skipped, failed, msgs = 0, 0, 0, []
+            for uid, name in rows:
+                if not uid:
+                    continue
+                # 兼容微博主页链接，提取其中的 UID
+                m = (_re.search(r"weibo\.(?:com|cn)/(?:u/)?(\d{5,})", uid)
+                     or _re.match(r"^(\d{5,})$", uid))
+                if m:
+                    uid = m.group(1)
+                if not uid.isdigit():
+                    failed += 1
+                    msgs.append(f"无效 UID：{uid}")
+                    continue
+                ok, msg = mon.add(uid, name)
+                if ok:
+                    added += 1
+                elif "已在监控列表" in str(msg):
+                    skipped += 1
+                else:
+                    failed += 1
+                    msgs.append(f"{uid}：{msg}")
+
+            info(f"导入监控对象完成 · 新增 {added} · 已存在跳过 {skipped} · 失败 {failed}")
+            return {"ok": True, "added": added, "skipped": skipped,
+                    "failed": failed, "messages": msgs[:10]}
+        except Exception as e:
+            error(f"导入监控对象异常：{e}")
+            return {"ok": False, "error": str(e)}
+
+    def open_media_dir(self, uid=""):
+        """打开媒体目录（传入 uid 则打开该对象的目录）。"""
+        try:
+            if uid:
+                items = {it["uid"]: it for it in get_monitor_manager().list()}
+                it = items.get(str(uid)) or {}
+                target = user_media_dir(str(uid), it.get("screen_name", ""))
+            else:
+                target = MEDIA_DIR
+            os.makedirs(target, exist_ok=True)
+            try:
+                os.startfile(target)          # Windows 资源管理器
+            except Exception:
+                webbrowser.open(Path(target).as_uri())
+            return {"ok": True, "path": target}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}

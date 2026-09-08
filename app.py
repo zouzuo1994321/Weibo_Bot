@@ -24,9 +24,13 @@ from api_bridge import Api  # noqa: E402
 
 def main():
     import webview
+    from logger import info, error, CAT_CORE
 
     ver = get_version()
     ver_note = f"{APP_NAME} {ver['display']}"
+    info(f"===== {APP_NAME} 启动 ===== 版本 {ver['display']}（内部 {ver.get('internal', '')}）"
+         f" · Python {sys.version.split()[0]} · 平台 {sys.platform}", CAT_CORE)
+    info(f"运行环境：{'打包 exe' if getattr(sys, 'frozen', False) else '源码开发'} · 数据目录 {_BD}", CAT_CORE)
 
     # 关键：禁止把新窗口请求甩到系统浏览器。
     # 否则微博登录页（login/passport）触发的 NewWindowRequested 会被 pywebview
@@ -52,13 +56,22 @@ def main():
     )
     # 记录窗口引用，便于登录窗口等场景
     api.main_window = window
+    try:
+        from monitor_manager import get_monitor_manager
+        from account_manager import get_account_manager
+        info(f"初始状态：监控对象 {get_monitor_manager().count()} 个"
+             f" · 账户 {len(get_account_manager().list_accounts())} 个", CAT_CORE)
+    except Exception as e:
+        error(f"读取初始状态失败：{e}", CAT_CORE)
     # 使用 Edge WebView2 内核（edgechromium），无需 .NET/pythonnet 依赖；
     # 若本机未安装 WebView2 运行时，请先从微软官网安装。
     try:
         webview.start(gui="edgechromium", debug=False)
-    except Exception:
-        # 回退到自动选择的内核
+        info("===== 程序正常退出 =====", CAT_CORE)
+    except Exception as e:
+        error(f"edgechromium 内核启动失败，回退默认内核：{e}", CAT_CORE)
         webview.start(debug=False)
+        info("===== 程序正常退出（回退内核）=====", CAT_CORE)
 
 
 if __name__ == "__main__":

@@ -2,9 +2,14 @@
 # 安装：pip install -r requirements.txt
 pywebview>=6.0          # 原生窗口（Edge WebView2 内核），不依赖外部浏览器
 requests>=2.28          # HTTP 请求（微博接口）
-jieba>=0.42             # 中文分词（AI 轻量生成器关键词抽取）
+jieba>=0.42             # 中文分词（AI 轻量生成器关键词抽取 / 规则引擎）
 Pillow>=10.0            # 图片处理（历史存档）
 cryptography>=42.0      # Cookie 本地加密存储
 PyInstaller>=6.0        # 打包为独立 exe
+# 本地离线大模型引擎（AI 增强转发「主路线」）：llama.cpp 的 Python 绑定，全离线推理
+# 安装需从预编译 wheel 索引获取（避免源码编译）：
+#   pip install llama-cpp-python==0.3.35 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+llama-cpp-python==0.3.35
+numpy>=1.20             # llama-cpp-python 依赖
 # 可选：导出 XLSX 需要 openpyxl
 # openpyxl>=3.1

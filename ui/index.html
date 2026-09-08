@@ -1,449 +1,629 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="zh-CN" data-page-node-id="ro0TIv8Vrrt5ZPuUP4f0na">
+<head data-page-node-id="VMejtyBUeBqnbsrYqOLzg9">
+<meta charset="utf-8" data-page-node-id="1oJRUKJpGVH2I19npp5Ugg">
+<meta name="viewport" content="width=device-width, initial-scale=1" data-page-node-id="WjwF1H5Lbrilevp2Hnu5V6">
 <title>微博bot小助手</title>
-<link rel="icon" type="image/png" href="logo.png">
-<link rel="stylesheet" href="style.css">
+<link rel="icon" type="image/png" href="logo.png" data-page-node-id="C1chaDHP1Kb05qa854mgbu">
+<link rel="stylesheet" href="style.css" data-page-node-id="8ueuITdyPwsePzQ6oY7tSO">
 </head>
-<body>
-<div id="app">
-  <aside id="sidebar">
-    <div class="brand">
-      <img src="logo.png" class="brand-logo" alt="logo">
-      <div>微博bot小助手<small id="verLabel"></small></div>
+<body data-page-node-id="sV98qYgIUrbz6CiFLFAI0d">
+<div id="app" data-page-node-id="Nr2Ww3z5dZVHijyfflfzjJ">
+  <aside id="sidebar" data-page-node-id="RIQ3pdOCYWdzLAqs8s5oxJ">
+    <div class="brand" data-page-node-id="3ZV7t3MgvYIqIBKWdD4pj8">
+      <img src="logo.png" class="brand-logo" alt="logo" data-page-node-id="efEwPDtDPFuBJbGNSUfP56">
+      <div data-page-node-id="Mlt9NjOCEdDd5io1mnj3Sx">微博bot小助手<small id="verLabel" data-page-node-id="40o5yaAe3LlUOJqL8diTmq"></small></div>
     </div>
-    <div class="nav-item active" data-view="overview">系统概览</div>
-    <div class="nav-item" data-view="accounts">账户管理</div>
-    <div class="nav-item" data-view="monitors">监控列表</div>
-    <div class="nav-item" data-view="forward">转发设置</div>
-    <div class="nav-item" data-view="ai">AI 人格</div>
-    <div class="nav-item" data-view="blacklist">关键词黑名单</div>
-    <div class="nav-item" data-view="schedule">工作时间</div>
-    <div class="nav-item" data-view="history">历史记录</div>
-    <div class="nav-item" data-view="dataoverview">数据总览</div>
-    <div class="nav-item" data-view="license">软件授权</div>
-    <div class="nav-item" data-view="logs">运行日志</div>
-    <div class="nav-item" data-view="about">关于 / 版权</div>
-    <div class="foot" id="copyLabel" style="cursor:pointer;" title="点击打开 GitHub 仓库"></div>
+    <div class="nav-item active" data-view="overview" data-page-node-id="VyTfPmla2yRTvycJEg9SNA">系统概览</div>
+    <div class="nav-item" data-view="accounts" data-page-node-id="YNkR6pwr9gC6OKTyMiLNgE">账户管理</div>
+    <div class="nav-item" data-view="monitors" data-page-node-id="DlgfdQ4R4rPOyr7r62kb2O">监控列表</div>
+    <div class="nav-item" data-view="forward" data-page-node-id="84owFVZosWm60mlTPRYaTO">转发设置</div>
+    <div class="nav-item" data-view="ai" data-page-node-id="K5Ac4IeCQUcvcE0SEs8JAu">AI 人格</div>
+    <div class="nav-item" data-view="blacklist" data-page-node-id="1r4PAg5aqX8HBhFUQUyk2W">关键词黑名单</div>
+    <div class="nav-item" data-view="schedule" data-page-node-id="uogF8w3FQ3OGdPSzkGLcKo">工作时间</div>
+    <div class="nav-item" data-view="media">相册监控</div>
+    <div class="nav-item" data-view="history" data-page-node-id="TL6KOLIqrVs8SJQDtEvAb4">历史记录</div>
+    <div class="nav-item" data-view="dataoverview" data-page-node-id="n60dhX8eleUUIjpe1mNDDI">数据总览</div>
+    <div class="nav-item" data-view="license" data-page-node-id="zqOHcZ015dYhEtDUv1aJkA">软件授权</div>
+    <div class="nav-item" data-view="logs" data-page-node-id="uzqsaYj21VLwiAfGFTDPrg">运行日志</div>
+    <div class="nav-item" data-view="about" data-page-node-id="2d1LZzAFwvJsFOHR0Z4dtW">关于 / 版权</div>
+    <div class="foot" id="copyLabel" style="cursor:pointer;" title="点击打开 GitHub 仓库" data-page-node-id="4UGANLiL009KPCTFNPsyEx"></div>
   </aside>
 
-  <main id="main">
+  <main id="main" data-page-node-id="Oe3oTx2hHgzaFTTBcqBrbR">
 
     <!-- 概览 -->
-    <section class="view active" id="view-overview">
-      <h2>系统概览</h2>
-      <p class="sub">本软件运行总览与快捷操作。</p>
-      <div class="card">
-        <div class="stat-grid" id="statGrid"></div>
+    <section class="view active" id="view-overview" data-page-node-id="K5mpEyHkj787HyFtkce1YM">
+      <div class="overview-header" data-page-node-id="WznvaFpnpXzVvFgHpHcDvC">
+        <h2 data-page-node-id="wRlHbztgGjeUPWzeMsExxX">系统概览</h2>
+        <div id="ovClock" class="ov-clock" data-page-node-id="FwHiSTm8flOwxxNrFtfQDE"></div>
       </div>
-      <div class="card">
-        <h3>调度状态</h3>
-        <div class="row" style="margin-bottom:10px;">
-          <span id="schedState" class="tag blue">未运行</span>
-          <span class="muted" id="schedInfo"></span>
+      <p class="sub" data-page-node-id="qUmYaC7NFfEIV036UtHE3h">本软件运行总览与快捷操作。</p>
+      <div class="card" data-page-node-id="TmfoLAm60qmtnHMWfFvCX8">
+        <div class="stat-grid" id="statGrid" data-page-node-id="plRq0z9NefwXEjnFXXTsQo"></div>
+      </div>
+      <div class="card" data-page-node-id="GqZthIEweAcE7rCAAFbu22">
+        <h3 data-page-node-id="dKtcE2t4jwsN6omesKBZ4Y">调度状态</h3>
+        <div class="row" style="margin-bottom:10px;" data-page-node-id="nh9g12UAgftme8RhPek0Cs">
+          <span id="schedState" class="tag blue" data-page-node-id="dVqV9UsDhgsECbUOdzCLGu">未运行</span>
+          <span class="muted" id="schedInfo" data-page-node-id="PnDMd90BmsaNX49MdWkl0d"></span>
         </div>
-        <div class="row">
-          <button id="btnStart" onclick="startScheduler()">启动自动轮询</button>
-          <button class="ghost" id="btnStop" onclick="stopScheduler()">停止</button>
-          <button class="ghost" onclick="manualRun()">立即轮询一次</button>
-          <button class="ghost" onclick="refreshAll()">刷新数据</button>
-          <span id="licLine"></span>
+        <div class="row" data-page-node-id="PUo9eb6vubTErzV6DHU39g">
+          <button id="btnStart" onclick="startScheduler()" data-page-node-id="2k4Pxdy2EqWpK3ADcKhw2H">启动自动轮询</button>
+          <button class="ghost" id="btnStop" onclick="stopScheduler()" data-page-node-id="og7WhS58ovxMx7RD7cxEbf">停止</button>
+          <button class="ghost" onclick="manualRun()" data-page-node-id="5RdLL9w3ieXfgqvHGlvA4y">立即轮询一次</button>
+          <button class="ghost" onclick="refreshAll()" data-page-node-id="co9tEXeAFPTfwzZCbnxbGX">刷新数据</button>
+          <span id="licLine" data-page-node-id="hEsjNWlnW95aDV3BUFC1g8"></span>
+        </div>
+        <div id="pollProgressWrap" class="poll-progress" style="display:none;" data-page-node-id="btZuEvWCFJrVWDs3OU82NC">
+          <div class="poll-progress-bar" data-page-node-id="3O1XaFp0FfHpBXv66IYbFw"><div id="pollProgressBar" class="poll-progress-fill" data-page-node-id="xShgbjRx3gdo8kMCP0gSqm"></div></div>
+          <span id="pollProgressLabel" class="poll-progress-label" data-page-node-id="M0xwUE0XuhTheGPt4WLPnN"></span>
         </div>
       </div>
-      <div class="card">
-        <h3>最近一次轮询结果</h3>
-        <div id="lastResult" class="log-box last-result-box">尚未运行</div>
+      <div class="card" data-page-node-id="Yhh5sDL3AuAhO6iKLPWAf6">
+        <h3 data-page-node-id="JufYtlVLnzWGZID4CA20Hv">最近一次轮询结果</h3>
+        <div id="lastResult" class="log-box last-result-box" data-page-node-id="DZi1s7yrjmVrgjhW2CvYjH">尚未运行</div>
       </div>
     </section>
 
     <!-- 账户管理 -->
-    <section class="view" id="view-accounts">
-      <h2>账户管理</h2>
-      <p class="sub">最多记录 5 个微博账户 Cookie。支持内置浏览器登录自动获取或系统浏览器手动粘贴。</p>
-      <div class="card">
-        <h3>添加账户</h3>
-        <div class="row">
-          <label class="field" style="flex:1; min-width:160px;">
+    <section class="view" id="view-accounts" data-page-node-id="qcIR3cFO3MubfoyCLvIsfs">
+      <h2 data-page-node-id="kMTKg0ALj3KECLnA8RCSxT">账户管理</h2>
+      <p class="sub" data-page-node-id="ndDC3g119EskIgHjiNqO58">最多记录 5 个微博账户 Cookie。支持内置浏览器登录自动获取或系统浏览器手动粘贴。</p>
+      <div class="card" data-page-node-id="RggBPhjOtplUt6fbSB3r4F">
+        <h3 data-page-node-id="vrzkYlVCZkHMJ4DKfW6Awv">添加账户</h3>
+        <div class="row" data-page-node-id="W1Pwq5DYPDQ8jNR7a1GY31">
+          <label class="field" style="flex:1; min-width:160px;" data-page-node-id="AG4baSXvw7BEq5CoPR3XeE">
             账户备注
-            <input id="accName" placeholder="如：我的小号">
+            <input id="accName" placeholder="如：我的小号" data-page-node-id="WW8SogD0PgAgTt4FZgQSOA">
           </label>
-          <label class="field" style="flex:3; min-width:300px;">
+          <label class="field" style="flex:3; min-width:300px;" data-page-node-id="vgX0ri8rQQrAYxpsLHQCdP">
             Cookie（内置登录后自动填入，或手动粘贴）
             <textarea id="accCookie" placeholder="SUB=...; SUBP=...; 完整 Cookie 字符串"></textarea>
           </label>
         </div>
-        <div class="row" style="margin-top:12px;">
-          <button onclick="openBuiltinLogin()">内置浏览器登录</button>
-          <button class="ghost" onclick="openSystemLogin()">系统浏览器登录</button>
-          <button class="ghost" onclick="captureCookie()">从内置浏览器获取Cookie</button>
-          <button class="ghost" onclick="closeLogin()">关闭登录窗口</button>
-          <button onclick="addAccount()">添加账户</button>
+        <div class="row" style="margin-top:12px;" data-page-node-id="dT2FBfTpM6ChJRiNNR0IkF">
+          <button onclick="openBuiltinLogin()" data-page-node-id="98OXBxqASnAYHZMKkX8lC8">内置浏览器登录</button>
+          <button class="ghost" onclick="openSystemLogin()" data-page-node-id="DElO2NT4VctmRGkWlecljq">系统浏览器登录</button>
+          <button class="ghost" onclick="captureCookie()" data-page-node-id="qbsGHzhkpQFXx0ZLfxHAMf">从内置浏览器获取Cookie</button>
+          <button class="ghost" onclick="closeLogin()" data-page-node-id="aQ8VpfqCPHlebpBfMm1luD">关闭登录窗口</button>
+          <button onclick="addAccount()" data-page-node-id="7aHNRuMvZqh1UoMNI9O8vv">添加账户</button>
         </div>
-        <p class="help" id="loginHint">提示：点击「内置浏览器登录」后，在弹出窗口内完成微博登录，再点「获取Cookie」即可自动填入上方文本框。</p>
+        <p class="help" id="loginHint" data-page-node-id="mZvrNVsqD0Qc7fdSJG5UU2">提示：点击「内置浏览器登录」后，在弹出窗口内完成微博登录，再点「获取Cookie」即可自动填入上方文本框。</p>
       </div>
-      <div class="card">
-        <h3>已记录账户（<span id="accCount">0</span>/5）</h3>
-        <div class="row" style="margin-bottom:10px;">
-          <button class="ghost" onclick="checkAllAccounts()">检测全部账户</button>
-          <span class="muted" style="font-size:12px;">手动或自动（每 5 分钟）检测账户登录态与转发能力</span>
+      <div class="card" data-page-node-id="3boiUIkNRQ5vyI2bXsP5Z7">
+        <h3 data-page-node-id="2JqDtFX3VEJY2he3TC4LWj">已记录账户（<span id="accCount" data-page-node-id="JY1QOBingicmPADcLOI0jR">0</span>/5）</h3>
+        <div class="row" style="margin-bottom:10px;" data-page-node-id="vnAPFfqEwDpXmjQQP8zJYC">
+          <button class="ghost" onclick="checkAllAccounts()" data-page-node-id="texXyJBpV9okHQO5P4FjKC">检测全部账户</button>
+          <span class="muted" style="font-size:12px;" data-page-node-id="ChdLXLSD3ilusV8UNmI4jv">手动或自动（每 5 分钟）检测账户登录态与转发能力</span>
         </div>
-        <table>
-          <thead><tr><th>昵称（备注）</th><th>添加时间</th><th>最近使用</th><th>状态</th><th>检测时间</th><th>操作</th></tr></thead>
-          <tbody id="accList"></tbody>
+        <table data-page-node-id="DCNzcDn9V9qPGigMWjB6Xz">
+          <thead data-page-node-id="shryF0UBPBXkTG2TOeTYGw"><tr data-page-node-id="1LSfnF8Gcvb5uiCOvU3njk"><th data-page-node-id="F5oBU0qB9CWkvmt2cuJILT">昵称（备注）</th><th data-page-node-id="8X8JmZFa69JNusz0TE8GR9">添加时间</th><th data-page-node-id="g3HWSMjqFxzzfhnzOuHxHQ">最近使用</th><th data-page-node-id="1U4Y1NgJrTEgmDrsAD3uHs">状态</th><th data-page-node-id="0VBGsv2Mk3Ycln8sGozWAx">检测时间</th><th data-page-node-id="kLcx52uqrQW5zEG5IdsbGO">操作</th></tr></thead>
+          <tbody id="accList" data-page-node-id="eGSa67wmw8KLQzXXUURM2r"></tbody>
         </table>
       </div>
     </section>
 
     <!-- 监控列表 -->
-    <section class="view" id="view-monitors">
-      <h2>监控列表</h2>
-      <p class="sub">填入微博 UID（如 https://weibo.com/u/5789387121 中的 5789387121）。监控数量无上限，添加后自动获取最新昵称并实时检测状态。</p>
-      <div class="card">
-        <div class="row" style="align-items:flex-end;">
-          <label class="field" style="flex:2; min-width:260px;">
+    <section class="view" id="view-monitors" data-page-node-id="4wr68hSzsK2K9kue6F695c">
+      <h2 data-page-node-id="LgaEKTyES346qBRcG4mQPU">监控列表</h2>
+      <p class="sub" data-page-node-id="B8hHbfwvqUf8GbBclFST58">填入微博 UID（如 https://weibo.com/u/5789387121 中的 5789387121）。监控数量无上限，添加后自动获取最新昵称并实时检测状态。</p>
+      <div class="card" data-page-node-id="d5E5p3iCjFfwdOHiLVVaaF">
+        <div class="row" style="align-items:flex-end;" data-page-node-id="l5028i78R38wV1F5fMIQYo">
+          <label class="field" style="flex:2; min-width:260px;" data-page-node-id="vc5OaRdj1AXsAqFkTe52e2">
             微博 UID
-            <input id="monUid" placeholder="例如 5789387121">
+            <input id="monUid" placeholder="例如 5789387121" data-page-node-id="zlUsHrikOa2SGwmA5K1K54">
           </label>
-          <button onclick="addMonitor()">添加监控</button>
-          <button class="ghost" onclick="refreshMonitors()">刷新昵称/状态</button>
+          <button onclick="addMonitor()" data-page-node-id="cBB3KVoay9CE3rjyM8vJnA">添加监控</button>
+          <button class="ghost" onclick="refreshMonitors()" data-page-node-id="h7oDEUjjea7vcvR9CvBSFm">刷新昵称/状态</button>
+        </div>
+        <hr>
+        <div class="mon-io-bar">
+          <b class="mon-io-title">批量导入 / 导出</b>
+          <button class="ghost" onclick="importMonitorsFile()">从文件导入</button>
+          <button class="ghost" onclick="showMonImportBox()">粘贴导入</button>
+          <span class="mon-io-sep"></span>
+          <button class="ghost" onclick="exportMonitors('json')">导出 JSON</button>
+          <button class="ghost" onclick="exportMonitors('csv')">导出 CSV</button>
+          <button class="ghost" onclick="exportMonitors('txt')">导出 TXT</button>
+          <span class="muted mon-io-hint">支持：每行一个 UID · <code>UID,昵称</code> · 微博主页链接 · JSON 数组</span>
+        </div>
+        <div id="monImportBox" class="mon-import-box" style="display:none;">
+          <textarea id="monImportText" rows="5" placeholder="每行一个，例如：&#10;5789387121&#10;7533347976,昵称&#10;https://weibo.com/u/1234567890"></textarea>
+          <div class="row" style="gap:10px; margin-top:8px; align-items:center;">
+            <button onclick="submitMonImport()">开始导入</button>
+            <button class="ghost" onclick="hideMonImportBox()">取消</button>
+            <span id="monImportResult" class="muted" style="font-size:12px;"></span>
+          </div>
         </div>
       </div>
 
-      <div class="card mon-refresh-bar">
-        <div class="mon-refresh-inner">
-          <label class="switch"><input type="checkbox" id="monAutoRefresh"><span class="slider"></span></label>
-          <span class="mon-refresh-label">自动刷新昵称/状态</span>
-          <span class="muted mon-refresh-hint">停留本页时按间隔自动刷新</span>
-          <span style="flex:1;"></span>
-          <div class="mon-refresh-input">
-            <span class="mon-refresh-input-label">间隔</span>
-            <input id="monRefreshMin" type="number" min="1" value="10">
-            <span class="mon-refresh-input-unit">分钟</span>
+      <div class="card mon-refresh-bar" data-page-node-id="tLIGDqrDBGDg8mbwUhwauy">
+        <div class="mon-refresh-inner" data-page-node-id="SJCOtuIBifnISJYXCtq0Kr">
+          <label class="switch" data-page-node-id="9q8WT1Y9hZH8YPWLtkkyFZ"><input type="checkbox" id="monAutoRefresh" data-page-node-id="8uVOJAvfsyMLYyErHrA0oB"><span class="slider" data-page-node-id="nQdEABukLCWQ2bYCBsHyHO"></span></label>
+          <span class="mon-refresh-label" data-page-node-id="0mTcn48TmWRoIQyBviWQCE">自动刷新昵称/状态</span>
+          <span class="muted mon-refresh-hint" data-page-node-id="qT3ajVg7IN1BNaH8BnXVLd">停留本页时按间隔自动刷新</span>
+          <span style="flex:1;" data-page-node-id="k4uNpwzFEHGIswUuQyUXLD"></span>
+          <div class="mon-refresh-input" data-page-node-id="KlNAnETwsMzy3Iyc9eogWm">
+            <span class="mon-refresh-input-label" data-page-node-id="yxH94PlHKvu1m3iP6vABn2">间隔</span>
+            <input id="monRefreshMin" type="number" min="1" value="10" data-page-node-id="lS8OXBW0dY75irWET6nzPD">
+            <span class="mon-refresh-input-unit" data-page-node-id="NGglve5iXMO0SQBYZulDeF">分钟</span>
           </div>
-          <button class="ghost" onclick="saveMonAutoRefresh()">保存</button>
-          <span id="monAutoState" class="muted" style="font-size:12px;"></span>
+          <button class="ghost" onclick="saveMonAutoRefresh()" data-page-node-id="GShuepyItiYJQHNHO5splt">保存</button>
+          <span id="monAutoState" class="muted" style="font-size:12px;" data-page-node-id="mZFy6GdX76nlmaCiOqhUeQ"></span>
         </div>
       </div>
-      <div class="card">
-        <div class="mon-filter-bar">
-          <div class="hist-filter-group">
-            <label class="field hist-filter-keyword">关键词（昵称/UID）
-              <input id="monKeyword" placeholder="输入关键词" oninput="applyMonFilter()">
+      <div class="card" data-page-node-id="AtHy5n2pEEwAmjyzUtnPfT">
+        <div class="mon-filter-bar" data-page-node-id="dvG5A1U32bwrnniHm60VAS">
+          <div class="hist-filter-group" data-page-node-id="dKNDghzxZfgnh5z8kOgYgC">
+            <label class="field hist-filter-keyword" data-page-node-id="Iv2VZCiTF5ESWpFphWplOd">关键词（昵称/UID）
+              <input id="monKeyword" placeholder="输入关键词" oninput="applyMonFilter()" data-page-node-id="oqbKMh5951ONHJadO3e01J">
             </label>
-            <label class="field hist-filter-date">状态
-              <select id="monStatus" onchange="applyMonFilter()">
-                <option value="all">全部</option>
-                <option value="online">在线</option>
-                <option value="error">异常</option>
-                <option value="unknown">未知</option>
+            <label class="field hist-filter-date" data-page-node-id="wBikCTEBxHiEyNXc2bd8Zg">状态
+              <select id="monStatus" onchange="applyMonFilter()" data-page-node-id="HRuxXIgBRXypXb8swggIXe">
+                <option value="all" data-page-node-id="ydxyjfLz3WHtoXu2xigwjr">全部</option>
+                <option value="online" data-page-node-id="ayG1DmoTmPRxTbL85kwJN9">在线</option>
+                <option value="error" data-page-node-id="8bhM1sHmsZSHjglK2eJZzG">异常</option>
+                <option value="unknown" data-page-node-id="SQPFdayh0oVFpH3fw6RjHX">未知</option>
               </select>
             </label>
-            <label class="field hist-filter-check">
-              <span class="hist-check-label">仅看置顶</span>
-              <span class="hist-check-box"><input type="checkbox" id="monPinnedOnly" onchange="applyMonFilter()"></span>
+            <label class="field hist-filter-check" data-page-node-id="T8zJ2Bg9vx9JyaE4Lsl7U4">
+              <span class="hist-check-label" data-page-node-id="B1FOHeyCqO4jIg1ogUAge5">仅看置顶</span>
+              <span class="hist-check-box" data-page-node-id="rAfbLooc8KXGgyLIlgNS4Q"><input type="checkbox" id="monPinnedOnly" onchange="applyMonFilter()" data-page-node-id="UxpWC60AouAyniulYHylFj"></span>
             </label>
-            <button class="ghost hist-filter-clear" onclick="clearMonFilters()">清空筛选</button>
+            <button class="ghost hist-filter-clear" onclick="clearMonFilters()" data-page-node-id="TqaRfqhk60qMvSwSLLqIE0">清空筛选</button>
           </div>
         </div>
-        <h3 class="mon-count-title">监控对象（<span id="monCount">0</span>）</h3>
-        <div id="monPagination" class="mon-pagination mon-pagination-top"></div>
-        <div id="monList" class="monitor-list"></div>
+        <h3 class="mon-count-title" data-page-node-id="GgO0N3ITGaeLGeFB62swm3">监控对象（<span id="monCount" data-page-node-id="M4hFV4wn7Fxlape9Xi3qxH">0</span>）</h3>
+        <div id="monPagination" class="mon-pagination mon-pagination-top" data-page-node-id="nq6hL7xMTJx07IRfKMBe9Y"></div>
+        <div id="monList" class="monitor-list" data-page-node-id="rArAzCYSYcQEDsNFvvtTl1"></div>
       </div>
     </section>
 
     <!-- 转发设置 -->
-    <section class="view" id="view-forward">
-      <h2>转发设置</h2>
-      <p class="sub">核心策略：每轮自动轮询会抓取所有监控对象的最新微博，若本轮存在新微博，则从中随机挑选一条进行转发。</p>
-      <div class="card">
-        <h3>轮询间隔</h3>
-        <div class="row align-end">
-          <label class="field" style="width:200px;">
-            间隔（分钟）
-            <input id="intervalMin" type="number" min="1" value="30">
-          </label>
-          <button onclick="saveInterval()">保存间隔</button>
+    <section class="view" id="view-forward" data-page-node-id="v6uZj2IVmh1stHmblJnPw9">
+      <h2 data-page-node-id="IpPCN4lMtPQCBn8wK1LTQ7">转发设置</h2>
+      <p class="sub" data-page-node-id="Su6FtnyjOhRrYoEhB53l4Z">核心策略：每轮自动轮询会抓取所有监控对象的最新微博，若本轮存在新微博，则从中随机挑选一条进行转发。本次迭代新增 <b data-page-node-id="SCV2eaqcbV8fObk0P00jnU">AI 三层去重</b>（采样 / 历史库 / 结构随机化）与 <b data-page-node-id="lcymxXaMBw9JsHuYDaKinY">人格安全条款</b>（本地大模型路线下生效）。</p>
+      <div class="fwd-grid" data-page-node-id="YCJYr5mkU6l6RX4pcrIO0Z">
+        <div class="card" data-page-node-id="Q4mkD5mo4x5XhASnCyvow6">
+          <h3 data-page-node-id="G3Snhwpt8MWWUNMklmrnjN">轮询间隔</h3>
+          <div class="fwd-body">
+            <p class="help" data-page-node-id="aF1intrule0">
+              实际间隔在设定值 <b>±15%</b> 内随机抖动（30 分钟 → 约 25.5–34.5 分钟），转发也在「设定间隔 ±15%」内随机延后（至多 4.5 分钟），避免固定节奏被识别为机器人。
+            </p>
+          </div>
+          <div class="fwd-actions row align-end" data-page-node-id="oKC3Eidt6TLXRAAshD5qRQ">
+            <label class="field" style="width:200px;" data-page-node-id="h3KNxqxgVyl65WhJyv31Yk">
+              间隔（分钟）
+              <input id="intervalMin" type="number" min="1" value="30" data-page-node-id="PFeE8AybZOx8swcK4OZqVn">
+            </label>
+            <button onclick="saveInterval()" data-page-node-id="E6olTs6t9L1QjCEEj2ek3s">保存间隔</button>
+          </div>
         </div>
-      </div>
-      <div class="card">
-        <h3>转发方式</h3>
-        <div class="row" style="gap:24px;">
-          <div class="row">
-            <label class="switch"><input type="checkbox" id="aiSwitch"><span class="slider"></span></label>
-            <div>
-              <b>AI 增强转发</b>
-              <div class="muted" style="font-size:12px;">开启后由内置轻量 AI 根据被转发内容生成转发文案</div>
+
+        <div class="card" data-page-node-id="C1VSAsMc1humvx56rX8GOR">
+          <h3 data-page-node-id="89LVgX5NEG3Pzfea89JrEM">AI 引擎路线（主 / 备）</h3>
+          <div class="fwd-body">
+            <p class="help" data-page-node-id="UdQHn9RQNekDp0EUZvrSH0">主：本地大模型（llama.cpp + Qwen2.5-1.5B GGUF，全离线、约 1GB，首次启用后自动下载到 data/models/）；备：轻量规则（jieba，零依赖）。两者共享「人格 / 原文锚定」逻辑。</p>
+            <label class="field" style="width:100%;" data-page-node-id="3T0Iw20hmuE4w9hFfHp2bD">
+              AI 引擎路线
+              <select id="aiEngine" data-page-node-id="D8lWZ3JRpNV1JHN5Uy5r0w">
+                <option value="model" data-page-node-id="Wek7JELEhDVXHNJi009owi">主：本地大模型（llama.cpp · Qwen2.5-1.5B）</option>
+                <option value="rule" data-page-node-id="lsRra442oQZ2ikLVnxUxH4">备：轻量规则（jieba · 零依赖）</option>
+              </select>
+            </label>
+          </div>
+          <div class="fwd-actions" data-page-node-id="6VNNHcpJ3AZ4XwEiWKmNWx">
+            <button onclick="saveAiEngine()" data-page-node-id="JgSLiEChRyRBC7lH4ct1Sh">保存引擎路线</button>
+          </div>
+        </div>
+
+        <div class="card" data-page-node-id="TMeAhcgUxgdgaagIW0Mpoz">
+          <h3 data-page-node-id="uM7Sxp24KeXanQdHOs5441">转发方式</h3>
+          <div class="fwd-body">
+          <p class="help" data-page-node-id="aF2fwmode0">两种转发方式互斥，开启其一将自动关闭另一种；至少需启用一种。</p>
+          <div class="row" style="gap:24px; align-items:flex-start;" data-page-node-id="bQNASdhoG4b0rrevdaWdxH">
+            <div class="row" data-page-node-id="w7dhKBoSxTvDHCviR8bDP0">
+              <label class="switch" data-page-node-id="n2uYte6uYA6x8EXXX9ONSc"><input type="checkbox" id="aiSwitch" onchange="onForwardModeChange('ai')" data-page-node-id="MAr7YOKUfy76wHyE31AqCv"><span class="slider" data-page-node-id="4Uq3uJ4SSrHXLR6NkYsWUA"></span></label>
+              <div data-page-node-id="Fv2JjZMdNfTFGbAfKhBi0H">
+                <b data-page-node-id="Afxl2WVWYWVkqMyeDbeEHI">AI 增强转发</b>
+                <div class="muted" style="font-size:12px;" data-page-node-id="Hraqa2qVYxH4W8eoa5bnyF">由内置轻量 AI 根据被转发内容生成转发文案</div>
+              </div>
+            </div>
+            <div class="row" data-page-node-id="MT4Lu6xXixCjzo4UFmA6MK">
+              <label class="switch" data-page-node-id="n2uYte6uYA6x8EXXX9ONSc2"><input type="checkbox" id="normalSwitch" onchange="onForwardModeChange('normal')" data-page-node-id="M2rmN0rmlFwdSwFMtHsXk"><span class="slider" data-page-node-id="4Uq3uJ4SSrHXLR6NkYsWUB"></span></label>
+              <div data-page-node-id="Fv2JjZMdNfTFGbAfKhBi0I">
+                <b data-page-node-id="2etjJSrx5tDiARYpC24UO1">普通转发</b>
+                <div class="muted" style="font-size:12px;" data-page-node-id="pVc88y4gMkxVTyECVzXq4f">关闭 AI 时执行纯转发（不带文案）</div>
+              </div>
             </div>
           </div>
-          <div>
-            <b>普通转发</b>
-            <div class="muted" style="font-size:12px;">关闭 AI 时执行纯转发（不带文案）</div>
+          <span class="muted" style="font-size:12px; display:block; margin-top:16px;" data-page-node-id="lTlqA8owxcnmuHEfmsPUS6">随机挑选一个监控对象，转发其最新非置顶微博</span>
+          </div>
+          <div class="fwd-actions row" style="gap:10px; align-items:center;">
+            <button onclick="saveForwardMode()" data-page-node-id="uMxvYDIVs9bFhgXJq6B5jY">保存转发设置</button>
+            <button class="ghost" onclick="forwardRandomNow()" data-page-node-id="ldno3wsyRhwWDoT2poOBWH">立即转发（随机一条）</button>
           </div>
         </div>
-        <hr>
-        <button onclick="saveForwardMode()">保存转发设置</button>
-        <button class="ghost" onclick="forwardRandomNow()">立即转发（随机一条）</button>
-        <span class="muted" style="font-size:12px; margin-left:6px;">随机挑选一个监控对象，转发其最新非置顶微博</span>
+
+        <div class="card" data-page-node-id="PDiCxwgg4doGUKDCfiTXnl">
+          <h3 data-page-node-id="6eXglhlVB7JaKwjzkZSRkN">AI 部署进度（本地大模型）</h3>
+          <div class="fwd-body">
+          <div id="aiDeployStatus" class="muted" style="font-size:12px;" data-page-node-id="0jLP7Sfro7GQsCh3ih0BfW">检测中…</div>
+          <div class="poll-progress" style="margin-top:10px;" data-page-node-id="7OFMZkIHBGtfaPwJRZpglg">
+            <div class="poll-progress-bar" data-page-node-id="X7mwMQJ6qwcpOJWGwckMxS"><div id="aiDeployBar" class="poll-progress-fill" data-page-node-id="yCnz2iEc8dLQAnBUbe0FEr"></div></div>
+            <span id="aiDeployPct" class="poll-progress-label" data-page-node-id="BKKtYOTDdDvJBcyvAqQ8IG">0%</span>
+          </div>
+          </div>
+          <div class="fwd-actions row" style="gap:10px; align-items:center;" data-page-node-id="hDtl2yvjoMBRmflz8WzmDP">
+            <button onclick="startModelDownload()" data-page-node-id="VJ6cLFSUfOsfSq6R5pBd8N">下载 / 重试模型</button>
+            <button class="ghost" onclick="openModelsDir()" data-page-node-id="V9LnBtDPDngKq5NoVGXX7h">打开模型目录</button>
+            <span id="aiDeployHint" class="muted" style="font-size:12px;" data-page-node-id="y2DipLni6qszLdaIBbbVHg"></span>
+          </div>
+        </div>
       </div>
     </section>
 
     <!-- AI 人格 -->
-    <section class="view" id="view-ai">
-      <h2>AI 转发人格</h2>
-      <p class="sub">内置轻量化内容生成引擎（离线可用，无需联网大模型）。选择人格后，AI 将据此生成符合人设的转发文案。</p>
+    <section class="view" id="view-ai" data-page-node-id="rMSMlSGEnor2osTF7z7mgy">
+      <div class="ai-header" data-page-node-id="AGZt7X9BRSP9Q8CHoXFXyg">
+        <h2 data-page-node-id="ku4TVkJmPHokuDxPMZp9WE">AI 转发人格</h2>
+        <div id="aiModelStatus" class="ai-model-status" data-page-node-id="dlPFJz9OlFLG8Kc2jsWu6j"></div>
+      </div>
+      <p class="sub" data-page-node-id="WYhM30vPMQk6jolAQH5laL">内置轻量化内容生成引擎（离线可用，无需联网大模型）。选择人格后，AI 将据此生成符合人设的转发文案。</p>
 
-      <div class="card">
-        <h3>选择当前人格</h3>
-        <div id="personaList" class="persona-list"></div>
-        <div class="row" style="margin-top:14px;">
-          <button onclick="savePersona()">保存当前选择</button>
-          <span class="muted" style="font-size:12px;">当前已选：<b id="currentPersonaLabel">—</b></span>
+      <div class="card" data-page-node-id="4SbmbFSoJHBLFuKlTVLiza">
+        <h3 data-page-node-id="gwwNCOGjrCLOugdpTPBpq8">选择当前人格</h3>
+        <div id="personaList" class="persona-list" data-page-node-id="3zu7MQjwF9ucXCwNno4Idx"></div>
+        <div class="row" style="margin-top:14px;" data-page-node-id="5367d8L46IC2GHe4lmkopk">
+          <button onclick="savePersona()" data-page-node-id="5yiFUddMlzkqY82iNv7WR0">保存当前选择</button>
+          <span class="muted" style="font-size:12px;" data-page-node-id="UR2XWqFFjtFfP4YoIS3JjL">当前已选：<b id="currentPersonaLabel" data-page-node-id="wwTREg1KlASKV8mB0lq9kI">—</b></span>
         </div>
       </div>
 
-      <div class="card">
-        <h3>实时预览</h3>
-        <div class="row" style="align-items:stretch;">
-          <label class="field" style="flex:1; min-width:260px;">原微博内容
+      <div class="card" data-page-node-id="HtfipeU1UGaIJcwgD3oxQr">
+        <h3 data-page-node-id="rxIPmGkvCaFOEQnYDdcVRF">实时预览</h3>
+        <div class="row" style="align-items:stretch;" data-page-node-id="G8KCQpZUy9PegVngSmLc9T">
+          <label class="field" style="flex:1; min-width:260px;" data-page-node-id="hwwWsPPKShzJxk2pIqk05k">原微博内容
             <textarea id="aiTest" placeholder="粘贴一段微博内容用于预览生成效果">今天开源了一个情感分析的小模型，效果意外地好，分享给大家～</textarea>
           </label>
-          <div style="flex:1; min-width:260px; display:flex; flex-direction:column;">
-            <label class="field" style="flex:1;">AI 生成转发文案
-              <div id="aiPreview" class="ai-preview">点击「生成预览」查看效果</div>
+          <div style="flex:1; min-width:260px; display:flex; flex-direction:column;" data-page-node-id="KBEt7vvA2wyuskimjLVX5P">
+            <label class="field" style="flex:1;" data-page-node-id="t5v1OJUzGbTfmXQeHQGQaD">AI 生成转发文案
+              <div id="aiPreview" class="ai-preview" data-page-node-id="3TqTEv4dWJJJGdlVE5cb3T">点击「生成预览」查看效果</div>
             </label>
           </div>
         </div>
-        <div class="row" style="margin-top:14px;">
-          <button onclick="previewAI()">生成预览</button>
-          <span class="muted" style="font-size:12px;">使用当前已选人格生成</span>
+        <div class="row" style="margin-top:14px;" data-page-node-id="XPpRXlTx2ZlCBRQCdvVMLn">
+          <button onclick="previewAI()" data-page-node-id="I5GL8BPAOGitS9685rd1jY">生成预览</button>
+          <span class="muted" style="font-size:12px;" data-page-node-id="VXM3yHu5BMeYScmBswxviQ">使用当前已选人格生成</span>
         </div>
       </div>
 
-      <div class="card">
-        <h3>自定义人格</h3>
-        <p class="help" style="margin:-8px 0 12px;">创建属于你自己的转发风格。每行一条模板，可用 <span class="kbd">{k1}</span> <span class="kbd">{k2}</span> <span class="kbd">{k3}</span> 表示从原文抽取的关键词。</p>
-        <div class="row align-end">
-          <label class="field" style="width:220px;">人格名称
-            <input id="custName" placeholder="如：毒舌点评 / 文艺青年">
+      <div class="card" data-page-node-id="qVmbiOmNekir5Ph39MXxCF">
+        <h3 data-page-node-id="rTWJyRtSccuQVbBMhkSVXz">自定义人格</h3>
+        <p class="help" style="margin:-8px 0 12px;" data-page-node-id="a6UkqO7QxeuWwEpSP3uuDQ">用一句话描述这个人设即可，系统会在<strong data-page-node-id="nxbLDr6Lj9ulupgG2VnwNX">本地离线</strong>分析你设定的人设（识别猫娘/动漫/毒舌/文艺/专业/暖心/吃瓜等风格，并可识别你写的「口头禅」），据此生成贴合人设的转发回复，无需联网。选中左侧已创建的自定义人格，可将其介绍载入下方直接修改并覆盖保存。</p>
+        <div class="row align-end" data-page-node-id="qLBHUEVcdSesn19uIQ50AW">
+          <label class="field" style="width:220px;" data-page-node-id="FjmB7lsK1fcwl52UO224ON">人格名称
+            <input id="custName" placeholder="如：猫娘 / 动漫博主" data-page-node-id="XSZfmdPj2UDENNWIFOizN0">
           </label>
-          <button class="ghost" onclick="saveCustom()">保存自定义人格</button>
+          <button class="ghost" onclick="saveCustom()" data-page-node-id="CEMvSPQaYhXy1xo7iyOFx3">保存自定义人格</button>
         </div>
-        <label class="field" style="margin-top:12px;">模板（每行一条，系统会随机挑选）
-          <textarea id="custTpl" placeholder="看到{k1}，我只想说{k2}又来了。&#10;{k1}这件事，{k3}就挺离谱的。&#10;关于{k1}，我的评价是：{k2}。"></textarea>
+        <label class="field" style="margin-top:12px;" data-page-node-id="SkqbYDZwXMgxXP48cGPQsp">人设介绍（用自然语言描述这个人格）
+          <textarea id="custDesc" placeholder="例如：你是猫娘，说话软萌可爱，喜欢用喵~结尾，对二次元动漫很熟悉。口头禅：喵呜~"></textarea>
         </label>
+        <div id="custEditHint" class="muted" style="margin-top:8px; color:var(--accent);" data-page-node-id="4rruzzr66Wb2mUH8S3jORQ"></div>
       </div>
     </section>
 
     <!-- 黑名单 -->
-    <section class="view" id="view-blacklist">
-      <h2>关键词黑名单</h2>
-      <p class="sub">转发内容或原微博中出现以下任意关键词时，跳过该条微博不转发。</p>
-      <div class="card">
-        <div class="row">
-          <label class="field" style="flex:1;">
+    <section class="view" id="view-blacklist" data-page-node-id="xNwLFVznBBRJSIYVSP0Z9j">
+      <h2 data-page-node-id="UvembE3ofWiEKuC00HB27Q">关键词黑名单</h2>
+      <p class="sub" data-page-node-id="ScYg6E8mplixUFxI509Sih">转发内容或原微博中出现以下任意关键词时，跳过该条微博不转发。</p>
+      <div class="card" data-page-node-id="dC5Uqx8m8CArkyl0Gt8Xpu">
+        <div class="row" data-page-node-id="7iuSDLlVVxnUWHAQlRvZ2K">
+          <label class="field" style="flex:1;" data-page-node-id="ehjI1cjrg8n2wGX6NEY2et">
             新增关键词
-            <input id="blInput" placeholder="输入关键词后回车或点击添加">
+            <input id="blInput" placeholder="输入关键词后回车或点击添加" data-page-node-id="8B9Se9ezPRIVU5pwr4Yshj">
           </label>
-          <button onclick="addBlacklist()">添加</button>
+          <button onclick="addBlacklist()" data-page-node-id="R5dZdw2RF0EfOLgshU2Fwo">添加</button>
         </div>
-        <div class="chips" id="blChips" style="margin-top:12px;"></div>
-        <button class="ghost" style="margin-top:12px;" onclick="saveBlacklist()">保存黑名单</button>
+        <div class="chips" id="blChips" style="margin-top:12px;" data-page-node-id="VwkXQ1wJFROGxcs53Gd1wy"></div>
+        <button class="ghost" style="margin-top:12px;" onclick="saveBlacklist()" data-page-node-id="umpVXX20WOhnlrtIsM610W">保存黑名单</button>
       </div>
     </section>
 
     <!-- 工作时间 -->
-    <section class="view" id="view-schedule">
-      <h2>工作时间</h2>
-      <p class="sub">开启后，仅在设定时间段内执行轮询与转发，其余时间自动跳过。</p>
-      <div class="card">
-        <div class="row" style="justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap;">
-          <div class="row" style="gap:12px;">
-            <label class="switch"><input type="checkbox" id="whSwitch"><span class="slider"></span></label>
-            <b style="font-size:15px;">启用工作时间限制</b>
+    <section class="view" id="view-schedule" data-page-node-id="iOIsZHB2pgZ5wiiJ8qSfLl">
+      <h2 data-page-node-id="mBACwrLXAiMqk0E4zCE8MM">工作时间</h2>
+      <p class="sub" data-page-node-id="AZWedwDjkt2dhQmeTqFkRH">开启后，仅在设定时间段内执行轮询与转发，其余时间自动跳过。</p>
+      <div class="card" data-page-node-id="elqqzlAvb6FHptg6lb0sku">
+        <div class="row" style="justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap;" data-page-node-id="kQU27348WTF7FggWoYh24g">
+          <div class="row" style="gap:12px;" data-page-node-id="ECaAdBLRmkM0bzu1Pi4S7R">
+            <label class="switch" data-page-node-id="BrY8NTcfQRvZ2G8i7sMGx1"><input type="checkbox" id="whSwitch" data-page-node-id="gIysFcsV2FEixOQxEtFD44"><span class="slider" data-page-node-id="7lfrRP6h75jE0CLgu9yCYS"></span></label>
+            <b style="font-size:15px;" data-page-node-id="Rqb9nod2BfJQMDC70J5BSf">启用工作时间限制</b>
           </div>
-          <span id="whNow" class="tag blue">当前：—</span>
+          <span id="whNow" class="tag blue" data-page-node-id="OJhwLyfD6gB7mbVLbDuUoF">当前：—</span>
         </div>
-        <hr>
-        <div class="row" style="gap:20px; flex-wrap:wrap; align-items:flex-end;">
-          <label class="field" style="width:160px;">开始时间
-            <input id="whStart" type="time" value="09:00">
+        <hr data-page-node-id="aCkGfPLyQxxDoOCtGgkNnd">
+        <div class="row" style="gap:20px; flex-wrap:wrap; align-items:flex-end;" data-page-node-id="PBdtTPWHzGWJCb3R4i1TGo">
+          <label class="field" style="width:160px;" data-page-node-id="2uavoyioQbUyD4YfuLn3g1">开始时间
+            <input id="whStart" type="time" value="09:00" data-page-node-id="n8N0RYyk3ffw3BMKNGODmQ">
           </label>
-          <span class="range-arrow">→</span>
-          <label class="field" style="width:160px;">结束时间
-            <input id="whEnd" type="time" value="23:00">
+          <span class="range-arrow" data-page-node-id="K9wI6Xqkudyyue07P2HIcQ">→</span>
+          <label class="field" style="width:160px;" data-page-node-id="qS64vZLi8QqJnhI7QppgEs">结束时间
+            <input id="whEnd" type="time" value="23:00" data-page-node-id="DIrVBLTcqcESy3YpidAHpW">
           </label>
-          <button onclick="saveWorkingHours()">保存设置</button>
+          <button onclick="saveWorkingHours()" data-page-node-id="YzNdbwXr2695jpT8S56orF">保存设置</button>
         </div>
-        <div id="whBar" class="time-bar">
-          <div class="time-bar-fill" id="whFill"></div>
-          <div class="time-bar-now" id="whNowMark" title="当前时间"></div>
+        <div id="whBar" class="time-bar" data-page-node-id="8PsoUkTdvC55qZfVColSrJ">
+          <div class="time-bar-fill" id="whFill" data-page-node-id="1IHm7NDa0KXeYgH85m9Sv8"></div>
+          <div class="time-bar-now" id="whNowMark" title="当前时间" data-page-node-id="tn4eznZMBuOhFD0KiwMcYd"></div>
         </div>
-        <p class="help" style="margin-top:12px;">支持跨天，例如 22:00 - 08:00 表示仅在夜间工作。保存后实时生效。</p>
+        <p class="help" style="margin-top:12px;" data-page-node-id="KcXz6aDimjDIE3MLjBa0Pz">支持跨天，例如 22:00 - 08:00 表示仅在夜间工作。保存后实时生效。</p>
       </div>
     </section>
 
     <!-- 历史记录 -->
-    <section class="view" id="view-history">
-      <h2>历史记录</h2>
-      <p class="sub">被监控对象发过的微博（含文字与图片）、本软件转发记录均可查询、筛选、预览图片与导出。</p>
+    <!-- 相册监控 -->
+    <section class="view" id="view-media">
+      <h2>相册监控</h2>
+      <p class="sub">自动下载监控对象的微博相册（对应 <code>?tabtype=album</code>）。<b>首次为全量下载，后续自动增量</b>（已下载的资源会跳过，不再重复请求）。每个监控对象按「微博ID_昵称」单独建立文件夹存放图片。</p>
+
+      <!-- 下载任务 -->
       <div class="card">
-        <div class="row" style="margin-bottom:12px; border-bottom:1px solid var(--border); padding-bottom:12px;">
-          <button class="ghost" id="btnHistMon" onclick="switchHist('monitored')">被监控微博</button>
-          <button class="ghost" id="btnHistFwd" onclick="switchHist('forwards')">转发记录</button>
-          <span style="flex:1;"></span>
-          <button class="ghost" onclick="exportSelected()" id="btnExportSel" disabled>导出选中(<span id="selCount">0</span>)</button>
-          <button class="ghost" onclick="exportFiltered()">导出当前筛选</button>
-          <button class="ghost" onclick="exportAll()">导出全部(含图片)</button>
+        <h3>下载任务</h3>
+        <div class="row" style="flex-wrap:wrap; gap:16px; align-items:center;">
+          <label class="switch" title="开启后每隔设定分钟自动增量下载一次">
+            <input type="checkbox" id="mediaEnabled" onchange="onMediaEnabledChange()"><span class="slider"></span>
+          </label>
+          <div>
+            <b>按监控间隔自动下载</b>
+            <div class="muted" style="font-size:12px;">每隔设定分钟自动下载全部监控对象的相册（增量）</div>
+          </div>
+          <label class="field" style="width:130px;">间隔（分钟）
+            <input id="mediaInterval" type="number" min="1" value="30">
+          </label>
+          <label class="field" style="width:120px;">每对象页数
+            <input id="mediaPages" type="number" min="1" max="50" value="5">
+          </label>
+          <button onclick="saveMediaConfig()">保存设置</button>
         </div>
-        <div class="row" id="histFilters"></div>
+        <hr>
+        <div class="row" style="gap:10px; align-items:center;">
+          <button onclick="startMediaDownload()">立即执行下载</button>
+          <button class="ghost" onclick="openMediaDir('')">打开媒体目录</button>
+          <button class="ghost" onclick="clearMediaRecords()" title="仅清空软件内的下载记录，不删除已下载的文件；清理后重新下载会覆盖同名文件">清理下载记录</button>
+          <span id="mediaSummary" class="muted" style="font-size:12px;"></span>
+        </div>
+        <p class="help" style="margin-top:8px;">「清理下载记录」只重置增量判定（本地已下载文件原样保留）；清理后再次执行下载，遇到文件名一致的文件会直接覆盖。</p>
+        <div class="poll-progress" style="margin-top:12px;">
+          <div class="poll-progress-bar"><div id="mediaBar" class="poll-progress-fill"></div></div>
+          <span id="mediaPct" class="poll-progress-label">0%</span>
+        </div>
+        <div id="mediaStatus" class="muted" style="font-size:12px; margin-top:8px;">空闲</div>
       </div>
+
+      <!-- 媒体检索 -->
       <div class="card">
-        <div class="hist-toolbar">
-          <div class="hist-toolbar-left">
-            <h3 id="histTitle">被监控对象发过的微博</h3>
-            <label class="hist-select-all-inline">
-              <input type="checkbox" id="selAll" onchange="selectAllToggle(this.checked)">
-              <span>全选本页</span>
+        <h3>媒体检索</h3>
+        <div class="row" style="gap:10px; align-items:center;">
+          <input id="mediaKeyword" type="text" placeholder="按 UID 或昵称搜索…" style="flex:1; max-width:320px;" oninput="onMediaKeywordInput()">
+          <button onclick="searchMedia()">搜索</button>
+          <button class="ghost" onclick="loadMediaObjects()">显示全部</button>
+          <span class="muted" style="font-size:12px;">点击对象卡片可展开查看其相册图片</span>
+        </div>
+        <div id="mediaList" style="margin-top:16px;"></div>
+      </div>
+
+      <!-- 预览浮层 -->
+      <div id="mediaPreviewMask" onclick="if(event.target===this) closeMediaPreview()">
+        <div id="mediaPreview"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-history" data-page-node-id="nP1FkQwP3w7fQsjuNAGnVS">
+      <h2 data-page-node-id="bvE5qidk4UebiCcbyCZ7QX">历史记录</h2>
+      <p class="sub" data-page-node-id="lVjLVdlp7Sfawy967Szhiu">被监控对象发过的微博（含文字与图片）、本软件转发记录均可查询、筛选、预览图片与导出。</p>
+      <div class="card" data-page-node-id="vCAMxtVQSz8XMOpoJvU2gY">
+        <div class="row" style="margin-bottom:12px; border-bottom:1px solid var(--border); padding-bottom:12px;" data-page-node-id="RU4zMaiJSZ8SrcK2m4LcGb">
+          <button class="ghost" id="btnHistMon" onclick="switchHist('monitored')" data-page-node-id="KEN03TZebIeYRBOtele5Ls">被监控微博</button>
+          <button class="ghost" id="btnHistFwd" onclick="switchHist('forwards')" data-page-node-id="xu88q2oupF86OcuxyuvBcK">转发记录</button>
+          <span style="flex:1;" data-page-node-id="rEMI65JHv0mRooxOATMzGv"></span>
+          <button class="ghost" onclick="repairHistoryImages()" title="按微博详情接口重新取真正的推文配图，覆盖此前误抓的表情包">修复历史图片</button>
+          <button class="ghost" onclick="exportSelected()" id="btnExportSel" disabled data-page-node-id="aFwQjAy3S5oqfN69NWsb9x">导出选中(<span id="selCount" data-page-node-id="w5QZvsftpOG2VVQ777yOAR">0</span>)</button>
+          <button class="ghost" onclick="exportFiltered()" data-page-node-id="VYOAWN1ONLZEJuwU2iKbY2">导出当前筛选</button>
+          <button class="ghost" onclick="exportAll()" data-page-node-id="wVxGghMuvxmh5cGgY7tSLD">导出全部(含图片)</button>
+        </div>
+        <div class="row" id="histFilters" data-page-node-id="nCJylOcIAvSPAfWunixeTr"></div>
+      </div>
+      <div class="card" data-page-node-id="bP5PkXNITin1IFfJS8e1Jf">
+        <div class="hist-toolbar" data-page-node-id="Ep3QMFPyPcwHPSCVUo72NK">
+          <div class="hist-toolbar-left" data-page-node-id="lhZCifUpprGsLFRKeG78fw">
+            <h3 id="histTitle" data-page-node-id="alx8uS40tosTwXjl7QdbYz">被监控对象发过的微博</h3>
+            <label class="hist-select-all-inline" data-page-node-id="vbF1eA1r9Pv3MNdheqQ9Qv">
+              <input type="checkbox" id="selAll" onchange="selectAllToggle(this.checked)" data-page-node-id="uaKysusi2Si8aXqrzbxSNU">
+              <span data-page-node-id="kor8XqW7ZFaNWFYSnTnNNd">全选本页</span>
             </label>
           </div>
-          <div class="hist-toolbar-right" id="histPagination"></div>
+          <div class="hist-toolbar-right" id="histPagination" data-page-node-id="pqYAGpdDixCFWVJMl8EHgc"></div>
         </div>
-        <div id="histBody"></div>
+        <div id="histBody" data-page-node-id="pvrdgm0JvPwfV5mM3FglOd"></div>
       </div>
     </section>
 
     <!-- 数据总览 -->
-    <section class="view" id="view-dataoverview">
-      <h2>数据总览</h2>
-      <p class="sub">聚合展示抓取与转发趋势，支持导出整理好的数据供 AI 进一步分析。</p>
+    <section class="view" id="view-dataoverview" data-page-node-id="2fT836tlMzJNCrAWEdzhm8">
+      <h2 data-page-node-id="YfQN0VwvG2SYYGgU8ujDrG">数据总览</h2>
+      <p class="sub" data-page-node-id="2ZUAeS03e3Ru9CNpsxbewm">聚合展示抓取与转发趋势，支持导出整理好的数据供 AI 进一步分析。</p>
 
-      <div class="card">
-        <h3>核心指标</h3>
-        <div class="data-overview-grid" id="dataOverviewSummary">
-          <div class="stat"><div class="num">—</div><div class="lbl">本日抓取</div></div>
-          <div class="stat"><div class="num">—</div><div class="lbl">本日转发</div></div>
-          <div class="stat"><div class="num">—</div><div class="lbl">本月抓取</div></div>
-          <div class="stat"><div class="num">—</div><div class="lbl">本月转发</div></div>
-          <div class="stat"><div class="num">—</div><div class="lbl">高频被转发</div></div>
+      <div class="card" data-page-node-id="HceFWIpeAQRixZ6ZdDeoSf">
+        <h3 data-page-node-id="JWnTFCwmdn9n0jcqSc0wj9">核心指标</h3>
+        <div class="data-overview-grid" id="dataOverviewSummary" data-page-node-id="TLICdYPyDVMLqK3JVxSuSy">
+          <div class="stat" data-page-node-id="Anp601SnlxqIZvvC2dOn64"><div class="num" data-page-node-id="2Dw2tRZjBjXrMhjE9GXa17">—</div><div class="lbl" data-page-node-id="QayglGQzrOvWipTdygE3Ii">本日抓取</div></div>
+          <div class="stat" data-page-node-id="iMAYH7fzHAtqw48q13CAk0"><div class="num" data-page-node-id="QngIMnUYo7ieCJa08HzuAP">—</div><div class="lbl" data-page-node-id="SQWCubmApXOPrlqUtCJQhT">本日转发</div></div>
+          <div class="stat" data-page-node-id="B1htdaaHhaTQtk8MXMeebw"><div class="num" data-page-node-id="Yx47OyqFr8NDbBLvQuzU4M">—</div><div class="lbl" data-page-node-id="0NUU5ijqxbfkgSOfoG0yxi">本月抓取</div></div>
+          <div class="stat" data-page-node-id="z3FcRNdXppjrm8gwsAsmBM"><div class="num" data-page-node-id="YuZn6cSSyEBMFurcOXDF9x">—</div><div class="lbl" data-page-node-id="eVqu9RoBh1PD5BSYlaZ8bf">本月转发</div></div>
+          <div class="stat" data-page-node-id="E0UhpsjrOf89DEXYraKdKn"><div class="num" data-page-node-id="jqXIATzQGncxTj1uwTd62J">—</div><div class="lbl" data-page-node-id="u2sCeRSGXtFoLdPhEBvBvr">高频被转发</div></div>
         </div>
       </div>
 
-      <div class="card chart-card">
-        <div class="row" style="justify-content:space-between; align-items:center;">
-          <h3 style="margin:0;">趋势曲线</h3>
-          <div class="chart-tabs" id="dataOverviewTabs">
-            <button class="chart-tab active" data-series="today_hourly">今日</button>
-            <button class="chart-tab" data-series="month_daily">本月</button>
-            <button class="chart-tab" data-series="year_monthly">本年</button>
-            <button class="chart-tab" data-series="all_monthly">全部</button>
+      <div class="card chart-card" data-page-node-id="iOxWDM010XhIVPNvO93rkt">
+        <div class="row" style="justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;" data-page-node-id="10WU9bB04jmKXM4dUHYDyn">
+          <h3 style="margin:0;" data-page-node-id="3M0sEl0PdNPf5J8vv1F5Jx">趋势曲线</h3>
+          <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;" data-page-node-id="dovControls">
+            <div class="chart-tabs" id="dataOverviewTabs" data-page-node-id="GZvwJfbTBcRaoESMl9D3tq">
+              <button class="chart-tab active" data-series="today_hourly" data-page-node-id="rytTcjisgMlvt8LeNPOmcj">今日</button>
+              <button class="chart-tab" data-series="month_daily" data-page-node-id="CR1mTJdyh1xEp17Ns7L7Cg">本月</button>
+              <button class="chart-tab" data-series="year_monthly" data-page-node-id="5wbnzm9d0WDnpKTUx24lKo">本年</button>
+              <button class="chart-tab" data-series="all_monthly" data-page-node-id="ukCdlRmEfrw72pSAO2yHH5">全部</button>
+            </div>
+            <label class="date-label" style="display:inline-flex; align-items:center; gap:6px; font-size:13px;" data-page-node-id="dovDateLabel">
+              查看历史某天：
+              <input type="date" id="dataOverviewDate" onchange="onDataOverviewDateChange()" data-page-node-id="dovDateInput" />
+            </label>
+            <button class="ghost" onclick="clearDataOverviewDate()" data-page-node-id="dovDateClear">回到区间</button>
           </div>
         </div>
-        <div class="chart-wrap" id="dataOverviewChartWrap">
-          <svg id="dataOverviewChart" class="data-chart" viewBox="0 0 800 260"></svg>
+        <div id="dovSeriesSummary" class="chart-summary"></div>
+        <div class="chart-wrap" id="dataOverviewChartWrap" data-page-node-id="twUKuy07iq9IRWBd7saqnk">
+          <svg id="dataOverviewChart" class="data-chart" viewBox="0 0 800 260" data-page-node-id="iBUo6ZGkRIqhJJdBb4z8cv"></svg>
+          <div id="dovChartTip" class="chart-tip"></div>
         </div>
-        <div class="chart-legend">
-          <span><i style="background:var(--accent);"></i>抓取</span>
-          <span><i style="background:var(--green);"></i>转发</span>
+        <div class="chart-legend" data-page-node-id="9DVDhtlniSkR9YhVZ3BXGn">
+          <span data-page-node-id="miB7IXDwT1QDLpErSQBBPT"><i style="background:var(--accent);" data-page-node-id="3X2t9HwKpcwwWVI7jj7MaS"></i>抓取</span>
+          <span data-page-node-id="kjNEtb4I4sEDBpf9KVEAzc"><i style="background:var(--green);" data-page-node-id="XFqfSMNjzknztKB2cI2Zy3"></i>转发</span>
         </div>
       </div>
 
-      <div class="card">
-        <h3>高频被转发对象 TOP10</h3>
-        <ul class="data-overview-list" id="dataOverviewTop">
-          <li class="muted">暂无数据</li>
+      <div class="card" data-page-node-id="eE6DRaSDvcN7xpAumalaFB">
+        <h3 data-page-node-id="EB1n11F58QnCEeDYfMjvpp">高频被转发对象 TOP10</h3>
+        <ul class="data-overview-list" id="dataOverviewTop" data-page-node-id="0mqBr1JLFgnCmuVwiJRRqs">
+          <li class="muted" data-page-node-id="KTTDT1xcqRohvNce6xmbVO">暂无数据</li>
         </ul>
       </div>
 
-      <div class="card">
-        <h3>数据导出</h3>
-        <p class="sub">将整理好的汇总数据、曲线序列与高频对象导出为文件，方便交给 AI 分析。</p>
-        <div class="row">
-          <button onclick="exportDataOverview('json')">导出 JSON（推荐）</button>
-          <button class="ghost" onclick="exportDataOverview('csv')">导出 CSV（汇总表）</button>
-          <button class="ghost" onclick="loadDataOverview()">刷新数据</button>
+      <div class="card" data-page-node-id="hehtrTDQZCB9EPMi80O8C3">
+        <h3 data-page-node-id="Zpr5FBtUo9DhXjd7tcLzBR">数据导出</h3>
+        <p class="sub" data-page-node-id="yqz6JDo5YNWuCyaJgaeX4H">将整理好的汇总数据、曲线序列与高频对象导出为文件，方便交给 AI 分析。</p>
+        <div class="row" data-page-node-id="4GYLVeGzLIZM4LO0y3Bj9h">
+          <button onclick="exportDataOverview('json')" data-page-node-id="cJHsM4y9AgVVBG5hEaFLY2">导出 JSON（推荐）</button>
+          <button class="ghost" onclick="exportDataOverview('csv')" data-page-node-id="jfoh3BhJJRoj1LsfnUDCAe">导出 CSV（汇总表）</button>
+          <button class="ghost" onclick="loadDataOverview()" data-page-node-id="pABR84tAoamKWGCuWFtBic">刷新数据</button>
         </div>
       </div>
     </section>
 
     <!-- 授权 -->
-    <section class="view" id="view-license">
-      <h2>软件授权</h2>
-      <p class="sub">默认 7 天免费试用；试用期结束后需激活授权方可使用转发功能。</p>
+    <section class="view" id="view-license" data-page-node-id="cHf3lyjdagXPu23FAHkFO0">
+      <h2 data-page-node-id="FLCp4Htq6r5fkBAkjNuSOH">软件授权</h2>
+      <p class="sub" data-page-node-id="GBkDrW0zp62MeNq5cqlc4q">默认 7 天免费试用；试用期结束后需激活授权方可使用转发功能。</p>
 
-      <div class="card lic-card" id="licStatusCard">
-        <div class="lic-status-big">
-          <div class="lic-icon" id="licIcon">🔒</div>
-          <div class="lic-info">
-            <div class="lic-title" id="licTitle">加载中…</div>
-            <div class="lic-desc" id="licDesc">请稍候</div>
-            <div class="lic-meta" id="licMeta"></div>
+      <div class="card lic-card" id="licStatusCard" data-page-node-id="tr3w2sGYhHzFGG00HH3hKe">
+        <div class="lic-status-big" data-page-node-id="vk6no9DS0nCnnC8wZyVX04">
+          <div class="lic-icon" id="licIcon" data-page-node-id="AhfS1Z9ztDeC3KiNFztDvF">🔒</div>
+          <div class="lic-info" data-page-node-id="fHHAS6xa4EX3ugdfJ05FTk">
+            <div class="lic-title" id="licTitle" data-page-node-id="CuBKE4JaL4k6TFHVTdLSYF">加载中…</div>
+            <div class="lic-desc" id="licDesc" data-page-node-id="ovJLMQpnme2pTPk8tRk0mv">请稍候</div>
+            <div class="lic-meta" id="licMeta" data-page-node-id="4n0gMHYm4UVK2BoRs6diCa"></div>
           </div>
         </div>
       </div>
 
-      <div class="row" style="align-items:stretch; gap:16px; flex-wrap:wrap;">
-        <div class="card" style="flex:1; min-width:320px;">
-          <h3>获取授权</h3>
-          <p class="help" style="margin:-8px 0 14px;">将 48 位特征码发送给作者，作者用授权机生成密钥后回发给你。</p>
-          <label class="field" style="margin-bottom:12px;">本机特征码
+      <div class="row" style="align-items:stretch; gap:16px; flex-wrap:wrap;" data-page-node-id="wYLak8vm3Khpw8yxdgOnMy">
+        <div class="card" style="flex:1; min-width:320px;" data-page-node-id="sVGSRT0FmKFh7Jc9xsdaDA">
+          <h3 data-page-node-id="X8gQTtqlh1Tm2PSVlHqPwL">获取授权</h3>
+          <p class="help" style="margin:-8px 0 14px;" data-page-node-id="6wXy06XaDRRRZK7u30XKTV">将 48 位特征码发送给作者，作者用授权机生成密钥后回发给你。</p>
+          <label class="field" style="margin-bottom:12px;" data-page-node-id="Hfq9EdG9Ih9zQodQ8PTPtE">本机特征码
             <textarea id="featCode" readonly rows="2" style="font-family:monospace; word-break:break-all;"></textarea>
           </label>
-          <div class="row" style="gap:10px;">
-            <button onclick="genFeatureCode()">重新生成</button>
-            <button class="ghost" onclick="copyFeatureCode()">复制特征码</button>
+          <div class="row" style="gap:10px;" data-page-node-id="vedl2R31OvxdPT3QNqPzNE">
+            <button onclick="genFeatureCode()" data-page-node-id="nSj1tqnEKWwrKVq79qo9Ar">重新生成</button>
+            <button class="ghost" onclick="copyFeatureCode()" data-page-node-id="cuwPtW38yWRrfj1MMmOIZp">复制特征码</button>
           </div>
-          <div class="muted" style="font-size:12px; margin-top:10px;" id="featValid"></div>
+          <div class="muted" style="font-size:12px; margin-top:10px;" id="featValid" data-page-node-id="FsG0804DpopdL5dZAWNMMg"></div>
         </div>
 
-        <div class="card" style="flex:1; min-width:320px;">
-          <h3>激活授权</h3>
-          <p class="help" style="margin:-8px 0 14px;">粘贴作者提供的密钥，点击激活；密钥与当前机器绑定。</p>
-          <label class="field" style="margin-bottom:12px;">授权密钥
-            <input id="licKey" placeholder="0000-0000-0000-0000-0000" style="font-family:monospace;">
+        <div class="card" style="flex:1; min-width:320px;" data-page-node-id="gDiV2IcFJnKNPPKl1myMdu">
+          <h3 data-page-node-id="CF0XdU0NzepsbSPCWE4Ukd">激活授权</h3>
+          <p class="help" style="margin:-8px 0 14px;" data-page-node-id="90DD4mDBTLPYagWz9YGOGF">粘贴作者提供的密钥，点击激活；密钥与当前机器绑定。</p>
+          <label class="field" style="margin-bottom:12px;" data-page-node-id="YxUi7Ug6MaCouhVS7ZeIU0">授权密钥
+            <input id="licKey" placeholder="0000-0000-0000-0000-0000" style="font-family:monospace;" data-page-node-id="HiAI1n3jFKiUY5juKR9amp">
           </label>
-          <div class="row" style="gap:10px;">
-            <button onclick="activateLicense()">激活</button>
-            <button class="ghost danger" onclick="deactivateLicense()">清除授权</button>
+          <div class="row" style="gap:10px;" data-page-node-id="amaXLM4vhBPL5IQgC1FYp5">
+            <button onclick="activateLicense()" data-page-node-id="RmVaVEeS2TcVT8xFgCzqzp">激活</button>
+            <button class="ghost danger" onclick="deactivateLicense()" data-page-node-id="P9kP5e6BaZfXdBTyf7nMjf">清除授权</button>
           </div>
         </div>
       </div>
     </section>
 
     <!-- 图片预览浮层 -->
-    <div id="imgOverlay" class="overlay" style="display:none;" onclick="closeImgPreview()">
-      <div class="overlay-content" onclick="event.stopPropagation()">
-        <button class="ghost" onclick="closeImgPreview()" style="float:right;">关闭</button>
-        <div style="clear:both;"></div>
-        <div id="imgPreviewBox"></div>
+    <div id="imgOverlay" class="overlay" style="display:none;" onclick="closeImgPreview()" data-page-node-id="PdOhJdXNHXtPACH9i7Bh3e">
+      <div class="overlay-content" onclick="event.stopPropagation()" data-page-node-id="dZSLDJSrpT96r2LFpnX0Cz">
+        <button class="ghost" onclick="closeImgPreview()" style="float:right;" data-page-node-id="lebowrj4tHHONg637hvwGJ">关闭</button>
+        <div style="clear:both;" data-page-node-id="Wq9GXpU8ugxJF9NiaDRk3d"></div>
+        <div id="imgPreviewBox" data-page-node-id="3vNjoaTPWGGgEec2DSPlq6"></div>
       </div>
     </div>
 
     <!-- 运行日志 -->
-    <section class="view" id="view-logs">
-      <h2>运行日志</h2>
-      <p class="sub">软件运行过程中的操作与错误记录。</p>
-      <div class="card">
-        <div class="row">
-          <button class="ghost" onclick="loadLogs()">刷新日志</button>
-          <button class="ghost" onclick="exportKind('logs')">导出日志</button>
-          <button class="ghost" onclick="clearLogView()">清空显示</button>
+    <section class="view" id="view-logs" data-page-node-id="xfAskPiAe2erACPIxTt9Br">
+      <h2 data-page-node-id="h9NOYa47dfZUKPohoKt5H6">运行日志</h2>
+      <p class="sub" data-page-node-id="TqkoqUnkDj9PoOxFejwm3F">软件运行全过程记录。可按级别、模块分类筛选，或按关键字搜索定位问题；开启「冗余调试日志」后可查看 HTTP 请求细节与每步决策。</p>
+      <div class="card" data-page-node-id="Au1iAZuX7aIEDMPPiO1fs9">
+        <div class="row log-toolbar" data-page-node-id="5gljODL9wFqDzB2NDJQOuJ">
+          <label class="field" style="width:120px;">级别
+            <select id="logLevel" onchange="loadLogs()">
+              <option value="ALL">全部级别</option>
+              <option value="DEBUG">DEBUG</option>
+              <option value="INFO">INFO</option>
+              <option value="WARN">WARN</option>
+              <option value="ERROR">ERROR</option>
+            </select>
+          </label>
+          <label class="field" style="width:140px;">模块
+            <select id="logCategory" onchange="loadLogs()">
+              <option value="ALL">全部模块</option>
+              <option value="CORE">核心 / 启动</option>
+              <option value="SCHED">调度器</option>
+              <option value="FWD">转发</option>
+              <option value="HTTP">网络请求</option>
+              <option value="MEDIA">视频 / 相册</option>
+              <option value="ACCT">账户</option>
+              <option value="MON">监控</option>
+              <option value="CONF">配置</option>
+              <option value="AI">AI 生成</option>
+              <option value="LIC">授权</option>
+            </select>
+          </label>
+          <label class="field" style="width:220px;">关键字
+            <input id="logKeyword" type="text" placeholder="搜索日志内容…" oninput="onLogKeywordInput()">
+          </label>
+          <button class="ghost" onclick="loadLogs()" data-page-node-id="Gd0glF6xNh302SAH7DAZXh">刷新</button>
+          <button class="ghost" onclick="exportLogs('txt')">导出 TXT</button>
+          <button class="ghost" onclick="exportLogs('csv')">导出 CSV</button>
+          <span style="width:12px;"></span>
+          <label class="switch" title="开启后记录 HTTP 请求细节与每步决策（DEBUG 级），排查问题时建议开启">
+            <input type="checkbox" id="logVerbose" onchange="onLogVerboseChange()"><span class="slider"></span>
+          </label>
+          <span class="muted" style="font-size:12px;">冗余调试日志</span>
+          <button class="ghost" onclick="clearAllLogs()" style="margin-left:auto;">清空日志</button>
         </div>
-        <div id="logView" class="log-box" style="margin-top:12px;"></div>
+        <div id="logStat" class="muted" style="font-size:12px; margin-top:12px;"></div>
+        <div id="logView" class="log-box" style="margin-top:8px;" data-page-node-id="ix0DVutIOKZaa7rzOO4PW5"></div>
       </div>
     </section>
 
     <!-- 关于 -->
-    <section class="view" id="view-about">
-      <h2>关于 / 版权</h2>
-      <p class="sub">软件信息、版权声明与使用须知。</p>
-      <div id="aboutCard"></div>
+    <section class="view" id="view-about" data-page-node-id="KrVbXdg7JoYgrNt1bAOmRs">
+      <h2 data-page-node-id="cJdl2iAQW10jyQCKXKPdaM">关于 / 版权</h2>
+      <p class="sub" data-page-node-id="HWH8HUPjPuy2LTl7pksEOT">软件信息、版权声明与使用须知。</p>
+      <div id="aboutCard" data-page-node-id="LhJMMzbejeuASNnJcY0Y50"></div>
     </section>
 
   </main>
 </div>
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" data-page-node-id="OfyJDZHY6q5wG5eJSiLwxV"></div>
 <script src="app.js"></script>
 </body>
 </html>

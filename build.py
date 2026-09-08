@@ -67,6 +67,10 @@ def main():
         "--collect-data", "webview",
         "--collect-submodules", "jieba",
         "--collect-data", "jieba",
+        "--hidden-import", "llama_cpp",
+        "--hidden-import", "llama_cpp.llama",
+        "--collect-submodules", "llama_cpp",
+        "--collect-data", "llama_cpp",
         "--icon", "logo.ico",
         "app.py",
     ]

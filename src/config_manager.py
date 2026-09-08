@@ -10,6 +10,7 @@ from paths import CONFIG_PATH
 DEFAULT_CONFIG = {
     "interval_minutes": 30,          # 轮询间隔（分钟）
     "ai_enabled": False,             # AI 增强转发开关
+    "ai_engine": "rule",             # AI 引擎路线：model=本地大模型(llama.cpp) / rule=轻量规则(jieba)
     "persona": "幽默",               # 当前转发人格
     "custom_personas": {},           # 自定义人格: {name: [templates]}
     "blacklist": [],                 # 关键词黑名单
@@ -18,12 +19,21 @@ DEFAULT_CONFIG = {
         "start": "09:00",
         "end": "23:00",
     },
+    "forward_time_jitter": True,     # 转发时间在工作时段内随机偏移（避免固定时刻批量转发）
+    "poll_jitter_ratio": 0.15,       # 轮询间隔 / 转发延后 抖动比例（±15%）
     "max_accounts": 5,               # 最多记录账户数
     "forward_mode": "random_one",    # 转发模式：random_one 随机一条
     "monitor_auto_refresh": {        # 监控列表自动刷新昵称/状态
         "enabled": False,
         "minutes": 10,
     },
+    "media_download": {              # 相册监控（自动下载监控对象的相册图片）
+        "enabled": False,            #   自动下载开关
+        "interval_minutes": 30,      #   执行间隔（分钟），与监控轮询节奏一致
+        "max_pages": 5,              #   每个监控对象最多翻页数（每页约 10 条）
+        "last_run_ts": 0,            #   上次执行时间戳（用于间隔判定）
+    },
+    "log_verbose": False,            # 冗余调试日志（DEBUG 级）
 }
 
 

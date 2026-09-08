@@ -19,6 +19,8 @@ else:
 # 运行时数据目录
 DATA_DIR = os.path.join(BASE_DIR, "data")
 IMAGE_DIR = os.path.join(DATA_DIR, "images")
+# 视频 / 相册下载根目录：其下按「微博ID + 昵称」建子目录，再分 video/ 与 album/
+MEDIA_DIR = os.path.join(DATA_DIR, "media")
 HISTORY_DIR = os.path.join(BASE_DIR, "history")  # exe 历史版本留档
 DB_PATH = os.path.join(DATA_DIR, "history.db")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
@@ -26,7 +28,7 @@ ACCOUNTS_PATH = os.path.join(DATA_DIR, "accounts.json")
 LOG_PATH = os.path.join(DATA_DIR, "app.log")
 
 # 大版本号
-MAJOR_VERSION = "v1.0"
+MAJOR_VERSION = "v1.1.0"
 
 # 应用元信息
 APP_NAME = "微博bot小助手"
@@ -41,4 +43,5 @@ def ensure_dirs():
     """确保运行时所需目录存在。"""
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(IMAGE_DIR, exist_ok=True)
+    os.makedirs(MEDIA_DIR, exist_ok=True)
     os.makedirs(HISTORY_DIR, exist_ok=True)

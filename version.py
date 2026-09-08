@@ -13,7 +13,7 @@ import os
 import sys
 from datetime import datetime
 
-MAJOR = "v1.0.1"
+MAJOR = "v1.1.0"
 
 
 def _base_dir():
