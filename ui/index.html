@@ -95,8 +95,11 @@
         <h3 data-page-node-id="2JqDtFX3VEJY2he3TC4LWj">已记录账户（<span id="accCount" data-page-node-id="JY1QOBingicmPADcLOI0jR">0</span>/5）</h3>
         <div class="row" style="margin-bottom:10px;" data-page-node-id="vnAPFfqEwDpXmjQQP8zJYC">
           <button class="ghost" onclick="checkAllAccounts()" data-page-node-id="texXyJBpV9okHQO5P4FjKC">检测全部账户</button>
-          <span class="muted" style="font-size:12px;" data-page-node-id="ChdLXLSD3ilusV8UNmI4jv">手动或自动（每 5 分钟）检测账户登录态与转发能力</span>
+          <span class="muted" style="font-size:12px;" data-page-node-id="ChdLXLSD3ilusV8UNmI4jv">手动或自动（每 5 分钟）检测：登录态 + 真实抓取 + 转发能力</span>
         </div>
+        <p class="help" style="margin:0 0 10px;" data-page-node-id="accStatusHintNode">
+          状态说明：<b>正常</b>=能登录、能抓到微博、能转发；<b>Cookie失效</b>=登录态过期，需删除该账户后重新登录；<b>被风控</b>=请求被微博限流，请调大轮询间隔；<b>网络异常</b>=本机网络或接口超时。软件会在每次成功请求后自动续期 Cookie（会话保活），无需频繁重登。
+        </p>
         <table data-page-node-id="DCNzcDn9V9qPGigMWjB6Xz">
           <thead data-page-node-id="shryF0UBPBXkTG2TOeTYGw"><tr data-page-node-id="1LSfnF8Gcvb5uiCOvU3njk"><th data-page-node-id="F5oBU0qB9CWkvmt2cuJILT">昵称（备注）</th><th data-page-node-id="8X8JmZFa69JNusz0TE8GR9">添加时间</th><th data-page-node-id="g3HWSMjqFxzzfhnzOuHxHQ">最近使用</th><th data-page-node-id="1U4Y1NgJrTEgmDrsAD3uHs">状态</th><th data-page-node-id="0VBGsv2Mk3Ycln8sGozWAx">检测时间</th><th data-page-node-id="kLcx52uqrQW5zEG5IdsbGO">操作</th></tr></thead>
           <tbody id="accList" data-page-node-id="eGSa67wmw8KLQzXXUURM2r"></tbody>
@@ -318,17 +321,37 @@
     <!-- 黑名单 -->
     <section class="view" id="view-blacklist" data-page-node-id="xNwLFVznBBRJSIYVSP0Z9j">
       <h2 data-page-node-id="UvembE3ofWiEKuC00HB27Q">关键词黑名单</h2>
-      <p class="sub" data-page-node-id="ScYg6E8mplixUFxI509Sih">转发内容或原微博中出现以下任意关键词时，跳过该条微博不转发。</p>
+      <p class="sub" data-page-node-id="ScYg6E8mplixUFxI509Sih">转发内容或原微博中出现以下任意关键词时，跳过该条微博不转发（不区分大小写）。支持一次粘贴多个、搜索定位与批量编辑。</p>
       <div class="card" data-page-node-id="dC5Uqx8m8CArkyl0Gt8Xpu">
+        <div class="bl-toolbar" data-page-node-id="blTb">
+          <div class="bl-stat">共 <b id="blCount">0</b> 个关键词<span id="blDirty" class="bl-dirty" style="display:none;">· 有未保存修改</span></div>
+          <input id="blSearch" class="bl-search" type="text" placeholder="搜索关键词…" oninput="drawChips()">
+          <button class="ghost small" onclick="toggleBlBulk()" title="用文本框批量粘贴 / 编辑整个列表">批量编辑</button>
+          <button class="ghost small" onclick="exportBlacklist()" title="导出为 txt（每行一个）">导出</button>
+          <button class="ghost small" onclick="clearBlacklist()" title="清空当前列表（需保存后生效）">清空</button>
+        </div>
+        <hr>
         <div class="row" data-page-node-id="7iuSDLlVVxnUWHAQlRvZ2K">
           <label class="field" style="flex:1;" data-page-node-id="ehjI1cjrg8n2wGX6NEY2et">
             新增关键词
-            <input id="blInput" placeholder="输入关键词后回车或点击添加" data-page-node-id="8B9Se9ezPRIVU5pwr4Yshj">
+            <input id="blInput" placeholder="回车添加；可用逗号 / 空格 / 分号分隔，一次添加多个" onkeydown="onBlInputKey(event)" data-page-node-id="8B9Se9ezPRIVU5pwr4Yshj">
           </label>
           <button onclick="addBlacklist()" data-page-node-id="R5dZdw2RF0EfOLgshU2Fwo">添加</button>
         </div>
+        <div class="mon-import-box" id="blBulkBox" style="display:none;">
+          <textarea id="blBulkText" rows="8" placeholder="每行一个关键词，也可用逗号 / 空格 / 分号分隔。确认后将按此内容重建整个列表（自动去重、去空行）。"></textarea>
+          <div class="row" style="margin-top:8px; gap:8px; align-items:center;">
+            <button class="small" onclick="submitBlBulk()">按此内容重建</button>
+            <button class="ghost small" onclick="toggleBlBulk()">取消</button>
+            <span class="muted" style="font-size:12px;">适合从别处整段粘贴，或从文件复制后一次性导入</span>
+          </div>
+        </div>
         <div class="chips" id="blChips" style="margin-top:12px;" data-page-node-id="VwkXQ1wJFROGxcs53Gd1wy"></div>
-        <button class="ghost" style="margin-top:12px;" onclick="saveBlacklist()" data-page-node-id="umpVXX20WOhnlrtIsM610W">保存黑名单</button>
+        <div class="bl-actions">
+          <button id="btnSaveBl" onclick="saveBlacklist()">保存黑名单</button>
+          <button class="ghost" onclick="renderBlacklist()">撤销更改</button>
+          <span class="muted" style="font-size:12px;">修改后需点击「保存黑名单」才会生效</span>
+        </div>
       </div>
     </section>
 
@@ -430,9 +453,9 @@
           <button class="ghost" id="btnHistFwd" onclick="switchHist('forwards')" data-page-node-id="xu88q2oupF86OcuxyuvBcK">转发记录</button>
           <span style="flex:1;" data-page-node-id="rEMI65JHv0mRooxOATMzGv"></span>
           <button class="ghost" onclick="repairHistoryImages()" title="按微博详情接口重新取真正的推文配图，覆盖此前误抓的表情包">修复历史图片</button>
-          <button class="ghost" onclick="exportSelected()" id="btnExportSel" disabled data-page-node-id="aFwQjAy3S5oqfN69NWsb9x">导出选中(<span id="selCount" data-page-node-id="w5QZvsftpOG2VVQ777yOAR">0</span>)</button>
-          <button class="ghost" onclick="exportFiltered()" data-page-node-id="VYOAWN1ONLZEJuwU2iKbY2">导出当前筛选</button>
-          <button class="ghost" onclick="exportAll()" data-page-node-id="wVxGghMuvxmh5cGgY7tSLD">导出全部(含图片)</button>
+          <button class="ghost" onclick="exportSelected()" id="btnExportSel" disabled title="导出为文件夹：数据文件 + 这些记录引用到的图片副本" data-page-node-id="aFwQjAy3S5oqfN69NWsb9x">导出选中(<span id="selCount" data-page-node-id="w5QZvsftpOG2VVQ777yOAR">0</span>)</button>
+          <button class="ghost" onclick="exportFiltered()" title="导出为文件夹：数据文件 + 筛选结果引用到的图片副本" data-page-node-id="VYOAWN1ONLZEJuwU2iKbY2">导出当前筛选</button>
+          <button class="ghost" onclick="exportAll()" title="导出为文件夹：JSON + CSV + 全部记录引用到的图片副本" data-page-node-id="wVxGghMuvxmh5cGgY7tSLD">导出全部(含图片)</button>
         </div>
         <div class="row" id="histFilters" data-page-node-id="nCJylOcIAvSPAfWunixeTr"></div>
       </div>

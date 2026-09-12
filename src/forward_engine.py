@@ -195,13 +195,28 @@ def _record_monitored_post(post, uid, screen_name, cookie, avatar_local=""):
 def fetch_uid(uid, cookie, item):
     """拉取单个 UID 的最新微博，记录到历史库，更新监控状态。
 
-    返回 (posts, new_posts, screen_name)。
+    返回 (posts, new_posts, screen_name, renewed_cookie)。
+    renewed_cookie 为微博 Set-Cookie 续期后的新 Cookie（无续期时为空串），
+    调用方应回写账户实现「会话保活」，显著延长 Cookie 寿命（v1.1.1）。
     """
     resp = get_latest_posts(uid, cookie, page=1, count=10)
     if not resp.get("ok"):
         get_monitor_manager().update(uid, {
             "status": "error", "last_check": _now()})
-        return [], [], item.get("screen_name", "")
+        # v1.1.1：按失败性质给出可操作日志，而不是笼统一句「拉取失败」
+        st = resp.get("status") or "error"
+        reason = resp.get("reason") or resp.get("error") or "未知原因"
+        if st == "cookie_expired":
+            error(f"抓取失败 UID={uid} · 原因：Cookie 已失效，"
+                  f"请在「账户管理」删除该账户后重新登录", CAT_HTTP)
+        elif st == "risk_control":
+            warn(f"抓取失败 UID={uid} · 原因：被微博风控拦截，建议调大轮询间隔后重试",
+                 CAT_HTTP)
+        elif st == "network_error":
+            warn(f"抓取失败 UID={uid} · 原因：网络异常（{reason}）", CAT_HTTP)
+        else:
+            warn(f"抓取失败 UID={uid} · 原因：{reason}", CAT_HTTP)
+        return [], [], item.get("screen_name", ""), ""
 
     posts = resp.get("posts", [])
     # 刷新昵称与头像
@@ -239,7 +254,7 @@ def fetch_uid(uid, cookie, item):
         "screen_name": item.get("screen_name", ""),
         "avatar_local": avatar_local,
     })
-    return posts, new_posts, item.get("screen_name", "")
+    return posts, new_posts, item.get("screen_name", ""), resp.get("renewed_cookie", "")
 
 
 def _forward_one(acc_id, acc_name, cookie, uid, screen_name, chosen, force_immediate=False):
@@ -340,7 +355,14 @@ def run_once(force_immediate=False):
             uid = it["uid"]
             _poll_progress["current"] = it.get("screen_name") or uid
             try:
-                posts, new_posts, screen_name = fetch_uid(uid, cookie, it)
+                posts, new_posts, screen_name, renewed = fetch_uid(uid, cookie, it)
+                # 会话保活：微博下发的续期 Cookie 立即回写并沿用（v1.1.1）
+                if renewed and renewed != cookie:
+                    if acc_mgr.update_cookie(acc["id"], renewed,
+                                             "轮询时已自动续期 Cookie（会话保活）"):
+                        debug(f"账户 Cookie 已自动续期（保活），后续对象沿用新 Cookie",
+                              CAT_HTTP)
+                    cookie = renewed
             except Exception as e:
                 results[uid] = {"uid": uid, "screen_name": it.get("screen_name", ""),
                                 "new_count": 0, "action": "error", "detail": str(e)}

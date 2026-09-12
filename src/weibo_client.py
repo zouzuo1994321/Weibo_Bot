@@ -15,6 +15,9 @@ from logger import warn, debug, CAT_HTTP
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+# 移动端 UA：m.weibo.cn 接口对 UA 敏感，用桌面 UA 极易被判定为风控（HTTP 432）
+M_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
 M_BASE = "https://m.weibo.cn"
 WEB_BASE = "https://weibo.com"
 
@@ -52,15 +55,135 @@ def _looks_like_photo(url: str) -> bool:
     return bool(url) and bool(_PHOTO_URL_RE.search(url))
 
 
-def _session(cookie: str, referer: str = None) -> requests.Session:
+# ---------------------------------------------------------------------------
+# 登录态 / 风控 判定（v1.1.1 新增：修复「检测正常但抓取全挂」）
+#
+# 背景：微博登录态由 SUB（及 SUBP/ALF）决定，而 XSRF-TOKEN 只是 CSRF 令牌。
+# 服务端 session 过期后 SUB 失效，所有数据接口返回 ok=-100 并跳转 login.php；
+# 但 XSRF-TOKEN 仍残留在客户端 Cookie 里。旧版 check_login 把「存在 XSRF-TOKEN」
+# 当作已登录的兜底证据，于是检测显示「正常登录、可转发」，实际抓取全部失败。
+# 这里把所有判定收敛到下面几个纯函数，杜绝同类误判。
+# ---------------------------------------------------------------------------
+# 微博风控 / 反爬状态码：432 为 m.weibo.cn 限流或要求验证，418/429 为频控
+_RISK_STATUS = {403, 418, 429, 432}
+# ajax 接口明确的「未登录」返回码
+_NOT_LOGIN_OK = {"-100"}
+# 登录墙特征（含通行证 HTML，注意其编码为 GBK，requests 会按 latin-1 解码成乱码，
+# 因此这里同时保留可读与乱码两种形态的关键词）
+_LOGIN_WALL_MARKS = (
+    "login.php", "passport", "login?", "sso/login",
+    "dÐÂÀËÍ¨ÐÐÖ¤", "Í¨ÐÐÖ¤", "通行证", "安全验证", "请登录", "重新登录",
+)
+
+
+def _looks_not_login(status: int, text: str = "", j=None) -> bool:
+    """响应是否为「未登录 / 登录墙」。"""
+    if isinstance(j, dict):
+        if str(j.get("ok")) in _NOT_LOGIN_OK:
+            return True
+        u = j.get("url")
+        if isinstance(u, str) and "login" in u.lower():
+            return True
+        # 注意：这里不能用宽松的 "login" in v —— 正常响应里常有 "login":false 这类字段，
+        # 会被误判成登录墙。只认明确表述（中文「登录/未登录」或英文固定短语）。
+        for key in ("msg", "message", "error"):
+            v = str(j.get(key) or "")
+            if not v:
+                continue
+            low = v.lower()
+            if ("登录" in v or "not login" in low or "please login" in low
+                    or "unlogin" in low or "need login" in low):
+                return True
+    if status in (302, 401):
+        return True
+    t = (text or "")[:3000]
+    if not t:
+        return False
+    low = t.lower()
+    for m in _LOGIN_WALL_MARKS:
+        if m.lower() in low:
+            return True
+    return False
+
+
+def _looks_risk_control(status: int, text: str = "") -> bool:
+    """响应是否为微博风控拦截（而非普通失败）。"""
+    if status in _RISK_STATUS:
+        return True
+    t = (text or "")[:800]
+    return ("验证码" in t) or ("访问过于频繁" in t) or ("请求过于频繁" in t)
+
+
+# ---------------------------------------------------------------------------
+# Cookie 工具：解析 / 合并 / 续期
+# ---------------------------------------------------------------------------
+# 微博每次网页请求都可能通过 Set-Cookie 续期这些键，实现「滑动续期」。
+_COOKIE_RENEW_KEYS = ("SUB", "SUBP", "SUBP_0033", "XSRF-TOKEN",
+                      "ALF", "ALF_SSOINFO", "SSOLoginState", "WBPSESS")
+
+
+def _cookie_dict(cookie: str) -> dict:
+    """把 Cookie 字符串解析为 dict。"""
+    d = {}
+    for part in (cookie or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        d[k.strip()] = v.strip()
+    return d
+
+
+def _cookie_str(d: dict) -> str:
+    return "; ".join(f"{k}={v}" for k, v in d.items() if v != "" and v is not None)
+
+
+def _has_login_cookie(cookie: str) -> bool:
+    """是否持有微博登录凭证 SUB。没有 SUB 必然未登录（XSRF-TOKEN 无意义）。"""
+    return bool(_cookie_dict(cookie).get("SUB"))
+
+
+def _merge_cookies(cookie: str, session) -> str:
+    """把 Session 中服务端下发的（已续期的）Cookie 合并回原始 Cookie 串。
+
+    微博在网页请求响应里常通过 Set-Cookie 续期 SUB / SUBP / XSRF-TOKEN / ALF，
+    把续期结果回写即等价于「会话保活」，可显著延长 Cookie 寿命，减少必须
+    重新登录的次数。只合并与登录相关的键，避免把无关追踪 Cookie 塞进来。
+    """
+    try:
+        jar = session.cookies.get_dict()
+    except Exception:
+        return cookie
+    if not jar:
+        return cookie
+    base = _cookie_dict(cookie)
+    changed = False
+    for k in _COOKIE_RENEW_KEYS:
+        v = jar.get(k)
+        if v and base.get(k) != v:
+            base[k] = v
+            changed = True
+    return _cookie_str(base) if changed else cookie
+
+
+def _session(cookie: str, referer: str = None, mobile: bool = False) -> requests.Session:
     s = requests.Session()
     if referer is None:
-        referer = f"{M_BASE}/"
+        referer = f"{M_BASE}/" if mobile else f"{WEB_BASE}/"
     s.headers.update({
-        "User-Agent": UA,
+        "User-Agent": M_UA if mobile else UA,
         "Cookie": cookie,
         "Referer": referer,
     })
+    # 关键：同时把 Cookie 灌进 Session 的 CookieJar。
+    # 只用请求头传 Cookie 时，服务端下发的 Set-Cookie（SUB/SUBP/XSRF-TOKEN 续期）
+    # 无法被 Session 接收，也就拿不到续期结果；灌入 jar 后才能实现会话保活。
+    d = _cookie_dict(cookie)
+    if d:
+        try:
+            s.cookies.update(requests.utils.cookiejar_from_dict(d))
+        except Exception:
+            pass
     return s
 
 
@@ -394,11 +517,18 @@ def get_user_info(uid: str, cookie: str) -> dict:
     try:
         r = s.get(f"{WEB_BASE}/ajax/profile/info", params={"uid": uid}, timeout=15)
         j = _safe_json(r)
+        # v1.1.1：显式识别未登录 / 风控，便于上层区分「Cookie 失效」与「该用户不可见」
+        if _looks_not_login(r.status_code, r.text, j):
+            return {"ok": False, "status": "cookie_expired",
+                    "error": "Cookie 已失效（微博要求重新登录）"}
+        if _looks_risk_control(r.status_code, r.text):
+            return {"ok": False, "status": "risk_control",
+                    "error": f"被微博风控拦截（HTTP {r.status_code}）"}
         d = j.get("data") if isinstance(j, dict) else None
         u = _find_user_obj(d)
         if u:
             return {
-                "ok": True,
+                "ok": True, "status": "ok",
                 "uid": uid,
                 "screen_name": u.get("name") or u.get("screen_name", ""),
                 "avatar_url": _pick_avatar(u),
@@ -420,7 +550,7 @@ def get_user_info(uid: str, cookie: str) -> dict:
                     break
         if user.get("screen_name"):
             return {
-                "ok": True,
+                "ok": True, "status": "ok",
                 "uid": uid,
                 "screen_name": user.get("screen_name", ""),
                 "avatar_url": _pick_avatar(user),
@@ -429,16 +559,66 @@ def get_user_info(uid: str, cookie: str) -> dict:
             }
     except Exception:
         pass
-    return {"ok": False, "error": "未获取到用户信息（可能 Cookie 失效或无权限）"}
+    return {"ok": False, "status": "unknown",
+            "error": "未获取到用户信息（可能 Cookie 失效或无权限）"}
 
 
-def get_latest_posts(uid: str, cookie: str, page: int = 1, count: int = 10) -> dict:
-    """获取该 UID 最新微博列表。
+def warm_session(cookie: str, uid: str = "") -> dict:
+    """网页端会话预热 + Cookie 续期（会话保活）。
 
-    优先使用网页端 /ajax/statuses/mymblog（Cookie 同源），再尝试 getProfileFeed，
-    最后以移动端 container 兜底。返回中附带 http_summary 用于前端/日志诊断。
+    两个作用：
+      1) 访问一次真实页面，让微博通过 Set-Cookie 续期 SUB / SUBP / XSRF-TOKEN / ALF，
+         把续期结果合并回 Cookie 串 —— 相当于滑动续期，可显著延长 Cookie 寿命；
+      2) 顺带判定当前 Cookie 是否已被登出（页面落到登录墙即失效）。
+
+    返回 {"ok":bool, "cookie":续期后的 cookie, "status":ok/cookie_expired/risk_control/network_error}
+    """
+    if not cookie:
+        return {"ok": False, "cookie": cookie, "status": "cookie_expired",
+                "error": "Cookie 为空"}
+    url = f"{WEB_BASE}/u/{uid}" if uid else f"{WEB_BASE}/"
+    try:
+        s = _session(cookie, referer=url)
+        s.headers.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+        })
+        r = s.get(url, timeout=15, allow_redirects=True)
+        if _looks_risk_control(r.status_code, r.text):
+            return {"ok": False, "cookie": cookie, "status": "risk_control",
+                    "error": f"会话预热被风控拦截（HTTP {r.status_code}）"}
+        if _looks_not_login(r.status_code, r.text):
+            return {"ok": False, "cookie": cookie, "status": "cookie_expired",
+                    "error": "会话预热落到登录页，Cookie 已失效"}
+        renewed = _merge_cookies(cookie, s)
+        if renewed != cookie:
+            debug(f"会话预热完成 · Cookie 已续期（{url}）", CAT_HTTP)
+        return {"ok": True, "cookie": renewed, "status": "ok",
+                "renewed": renewed != cookie}
+    except Exception as e:
+        return {"ok": False, "cookie": cookie, "status": "network_error",
+                "error": f"会话预热异常：{e}"}
+
+
+def _fetch_once(uid: str, cookie: str, page: int, count: int):
+    """按「网页端 mymblog → getProfileFeed → 移动端 container」顺序尝试一次。
+
+    返回 (result|None, err_parts, flags)
+      - result: 成功时的 {"ok":True, "posts":[...], "page":page, "cookie":...}
+      - flags : {"not_login" / "risk" / "network"} 用于上层区分失败性质
     """
     err_parts = []
+    flags = set()
+
+    def _mark(status, text, j):
+        """按响应特征打标记，返回 True 表示已明确判定为未登录。"""
+        if _looks_risk_control(status, text):
+            flags.add("risk")
+        if _looks_not_login(status, text, j):
+            flags.add("not_login")
+            return True
+        return False
 
     # 策略 1：网页端 /ajax/statuses/mymblog
     try:
@@ -453,24 +633,31 @@ def get_latest_posts(uid: str, cookie: str, page: int = 1, count: int = 10) -> d
         _cost = int((time.time() - _t0) * 1000)
         j = _safe_json(r)
         feed = _extract_feed(j)
-        debug(f"HTTP {r.status_code} mymblog uid={uid} page={page} · {_cost}ms · 原始 {len(feed or [])} 条",
-              CAT_HTTP)
+        debug(f"HTTP {r.status_code} mymblog uid={uid} page={page} · {_cost}ms · "
+              f"原始 {len(feed or [])} 条", CAT_HTTP)
         if feed:
             posts = _build_posts(feed, count)
             if posts:
                 debug(f"mymblog 解析成功 uid={uid} → {len(posts)} 条", CAT_HTTP)
-                return {"ok": True, "posts": posts, "page": page}
-        # 未拿到帖子，记录诊断信息
-        ok_flag = j.get("ok") if isinstance(j, dict) else None
-        err_parts.append(f"mymblog HTTP {r.status_code}, ok={ok_flag}, "
-                         f"body={r.text[:120]!r}")
+                return ({"ok": True, "posts": posts, "page": page,
+                         "cookie": _merge_cookies(cookie, s)}, err_parts, flags)
+        if _mark(r.status_code, r.text, j):
+            err_parts.append(f"mymblog HTTP {r.status_code} · 未登录（ok={j.get('ok') if isinstance(j, dict) else None}）")
+        else:
+            ok_flag = j.get("ok") if isinstance(j, dict) else None
+            err_parts.append(f"mymblog HTTP {r.status_code}, ok={ok_flag}, "
+                             f"body={r.text[:120]!r}")
     except Exception as e:
+        flags.add("network")
         err_parts.append(f"mymblog exc: {e}")
 
     # 策略 2：网页端 /ajax/profile/getProfileFeed
     try:
         s = _session(cookie, referer=f"{WEB_BASE}/u/{uid}")
-        s.headers.update({"X-Requested-With": "XMLHttpRequest"})
+        s.headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+        })
         r = s.get(f"{WEB_BASE}/ajax/profile/getProfileFeed", params={
             "uid": uid, "page": page, "feature": 0}, timeout=15)
         j = _safe_json(r)
@@ -478,17 +665,32 @@ def get_latest_posts(uid: str, cookie: str, page: int = 1, count: int = 10) -> d
         if feed:
             posts = _build_posts(feed, count)
             if posts:
-                return {"ok": True, "posts": posts, "page": page}
-        ok_flag = j.get("ok") if isinstance(j, dict) else None
-        err_parts.append(f"getProfileFeed HTTP {r.status_code}, ok={ok_flag}, "
-                         f"body={r.text[:120]!r}")
+                return ({"ok": True, "posts": posts, "page": page,
+                         "cookie": _merge_cookies(cookie, s)}, err_parts, flags)
+        if _mark(r.status_code, r.text, j):
+            err_parts.append(f"getProfileFeed HTTP {r.status_code} · 未登录/登录墙")
+        else:
+            ok_flag = j.get("ok") if isinstance(j, dict) else None
+            err_parts.append(f"getProfileFeed HTTP {r.status_code}, ok={ok_flag}, "
+                             f"body={r.text[:120]!r}")
     except Exception as e:
+        flags.add("network")
         err_parts.append(f"getProfileFeed exc: {e}")
 
-    # 兜底：移动端 container
+    # 策略 3：移动端 container（先预热移动端首页拿 MLOGIN，否则极易 HTTP 432）
     try:
-        s2 = _session(cookie)
-        r2 = s2.get(f"{M_BASE}/api/container/getIndex", params={
+        ms = _session(cookie, referer=f"{M_BASE}/u/{uid}", mobile=True)
+        try:
+            ms.get(f"{M_BASE}/", timeout=10)   # 预热：换取移动端会话 Cookie
+        except Exception:
+            pass
+        m_cookie = _merge_cookies(cookie, ms)
+        ms.headers.update({
+            "Cookie": m_cookie,
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+        })
+        r2 = ms.get(f"{M_BASE}/api/container/getIndex", params={
             "containerid": f"107603{uid}", "page": page}, timeout=15)
         j2 = _safe_json(r2)
         cards = (j2 or {}).get("data", {}).get("cards", []) if isinstance(j2, dict) else []
@@ -496,16 +698,76 @@ def get_latest_posts(uid: str, cookie: str, page: int = 1, count: int = 10) -> d
         if items:
             posts = _build_posts(items, count)
             if posts:
-                return {"ok": True, "posts": posts, "page": page}
-        ok_flag = j2.get("ok") if isinstance(j2, dict) else None
-        err_parts.append(f"m.container HTTP {r2.status_code}, ok={ok_flag}, "
-                         f"body={r2.text[:120]!r}")
+                return ({"ok": True, "posts": posts, "page": page,
+                         "cookie": m_cookie}, err_parts, flags)
+        # 关键：移动端与 Cookie 不同源，其「未登录」是常态，**不作为失效依据**
+        # （否则网页端只要有一次空响应，就会被跨域信号误判成 Cookie 失效）。
+        # 这里只采纳它的风控状态码（432/418/429/403），那是真实的反爬信号。
+        if _looks_risk_control(r2.status_code, r2.text):
+            flags.add("risk")
+            err_parts.append(f"m.container HTTP {r2.status_code} · 风控拦截")
+        else:
+            ok_flag = j2.get("ok") if isinstance(j2, dict) else None
+            err_parts.append(f"m.container HTTP {r2.status_code}, ok={ok_flag}, "
+                             f"body={r2.text[:120]!r}")
     except Exception as e:
+        flags.add("network")
         err_parts.append(f"m.container exc: {e}")
 
-    _err = "; ".join(err_parts) or "拉取失败"
-    warn(f"拉取微博失败 uid={uid} page={page} · 已尝试 3 种接口 · 原因：{_err}", CAT_HTTP)
-    return {"ok": False, "error": _err, "posts": []}
+    return (None, err_parts, flags)
+
+
+def get_latest_posts(uid: str, cookie: str, page: int = 1, count: int = 10) -> dict:
+    """获取该 UID 最新微博列表。
+
+    在 v1.1.1 中重写了失败处理：
+      - 三种接口任一命中「未登录 / 风控 / 网络异常」都会被打上 flag；
+      - 首次全败且 flag 非空时，先做一次**会话预热**（页面访问触发 Set-Cookie 续期
+        SUB/SUBP/XSRF-TOKEN），拿到续期 Cookie 后**重试一轮**；
+      - 仍失败则按 flag 分类返回结构化 status：
+        cookie_expired（须重新登录）/ risk_control（被风控）/ network_error / empty，
+        并附带可直接展示给用户的中文原因。
+
+    成功时返回值可能含 `cookie` / `renewed_cookie` 键为续期后的 Cookie，
+    调用方应回写账户，从而实现「越用越不容易掉线」的会话保活。
+    """
+    res, errs, flags = _fetch_once(uid, cookie, page, count)
+    if res:
+        return res
+
+    # 首次全败：若疑似会话过期 / 风控，先预热续期再重试一次
+    if flags:
+        w = warm_session(cookie, uid)
+        if w.get("ok") and w.get("cookie") and w["cookie"] != cookie:
+            debug(f"会话预热后重试抓取 uid={uid} · 失败标记={sorted(flags)}", CAT_HTTP)
+            res2, errs2, flags2 = _fetch_once(uid, w["cookie"], page, count)
+            if res2:
+                res2["renewed_cookie"] = w["cookie"]
+                res2["cookie"] = w["cookie"]
+                info(f"会话续期后抓取恢复 uid={uid}（此前标记：{sorted(flags)}）", CAT_HTTP)
+                return res2
+            errs = errs + errs2
+            flags |= flags2
+
+    # 分类失败原因，给出可操作结论
+    if "not_login" in flags:
+        status = "cookie_expired"
+        reason = "Cookie 登录态已失效（微博要求重新登录）"
+    elif "risk" in flags:
+        status = "risk_control"
+        reason = "被微博风控拦截（HTTP 432/418/403），请降低轮询频率后重试"
+    elif "network" in flags:
+        status = "network_error"
+        reason = "网络异常或接口超时"
+    else:
+        status = "empty"
+        reason = "未获取到微博数据（该用户可能暂无公开微博）"
+
+    _err = "; ".join(errs) or "拉取失败"
+    warn(f"拉取微博失败 uid={uid} page={page} · 判定={status} · 已尝试 3 种接口 · "
+         f"原因：{_err}", CAT_HTTP)
+    return {"ok": False, "status": status, "reason": reason,
+            "error": f"{reason}（{_err}）", "posts": []}
 
 
 # ---------------- 相册 / 视频 专属接口 ----------------
@@ -718,6 +980,11 @@ def get_st(cookie: str, uid: str = "") -> str:
       2) 抓取网页端页面（带 uid 的主页 / 首页），从内嵌 JS 配置提取 ST 令牌兜底。
     返回空串表示取不到，调用方应据此判定「无转发权限 / Cookie 失效」。
     """
+    # v1.1.1：XSRF-TOKEN 只是 CSRF 令牌，登录态由 SUB 决定。
+    # 缺少 SUB 时即便存在 XSRF-TOKEN 也必然未登录，直接返回空，
+    # 杜绝「有令牌 → 判定可转发」的假阳性（旧版 get_st 无此校验）。
+    if not _has_login_cookie(cookie):
+        return ""
     # 来源一：XSRF-TOKEN cookie（最可靠）
     m = re.search(r"XSRF-TOKEN=([^;\s]+)", cookie)
     if m and m.group(1):
@@ -746,57 +1013,121 @@ def get_st(cookie: str, uid: str = "") -> str:
     return ""
 
 
-def check_login(cookie: str) -> dict:
-    """检测 Cookie 是否仍处于登录态，并尝试取回自身 UID 与昵称。
+def check_login(cookie: str, uid: str = "") -> dict:
+    """检测 Cookie 是否仍处于**真实**登录态，并尝试取回自身 UID 与昵称。
 
-    本软件的 Cookie 取自 weibo.com 网页登录，因此优先用「网页端」接口校验，
-    再辅以「移动端」接口与「XSRF-TOKEN 令牌存在性」兜底，避免跨域误判“失效”。
+    【v1.1.1 修复 · 消除「检测正常但抓取全挂」的假阳性】
+    旧实现把「Cookie 中存在 XSRF-TOKEN」当作已登录的兜底证据，但：
+      - 微博登录态实际由 **SUB** 决定，XSRF-TOKEN 只是 CSRF 令牌；
+      - 服务端 session 过期后 SUB 失效，所有数据接口返回 ok=-100 并跳转 login.php，
+        而 XSRF-TOKEN **仍残留在客户端 Cookie 里** → 旧逻辑据此判定「已登录」，
+        界面显示正常，实际抓取三种接口全败（与用户反馈现象完全一致）。
+
+    现在的判定顺序（任一环节拿到确定结论即返回）：
+      1) 结构性检查：Cookie 里没有 SUB → 必然未登录（直接 cookie_expired）；
+      2) 网页端 /ajax/profile/info：**与 Cookie 同源**，是唯一有权判定「已失效」的接口
+         （显式识别 ok=-100 / login.php 登录墙 / 风控）；
+      3) 移动端 /api/config：**只能做正向确认，绝不能否定登录态**
+         —— m.weibo.cn 与 weibo.com 不同源，Cookie 不跨域共享，它对一份全新有效的
+         网页端 Cookie 同样会回答「未登录」，若据以判失效必然误报；
+      4) 确有 SUB 但以上都判不出 → 返回 **unknown**（由上层用真实抓取探测裁决），
+         既不冒充「已登录」，也不冤枉成「已失效」。
+
+    返回统一带 `status`：ok / cookie_expired / risk_control / network_error / unknown，
+    并附 `steps` 逐步诊断信息（HTTP 状态码 + 响应片段），便于从运行日志定位问题。
     """
-    # 方式一：网页端个人信息接口（最权威，Cookie 本就来自 weibo.com）
+    steps = []
+
+    def _fail(status, error):
+        return {"ok": False, "login": False, "status": status, "error": error,
+                "steps": steps}
+
+    if not (cookie or "").strip():
+        return _fail("cookie_expired", "Cookie 为空，请先登录")
+
+    # 1) 结构性检查：登录凭证 SUB 缺失即未登录
+    if not _has_login_cookie(cookie):
+        return _fail("cookie_expired",
+                     "Cookie 缺少登录凭证 SUB（未登录或已失效），请重新登录")
+
+    # 2) 网页端个人信息接口（与 Cookie 同源，唯一有权判定失效）
+    net_err = ""
     try:
         s = _session(cookie, referer=f"{WEB_BASE}/")
-        s.headers.update({"X-Requested-With": "XMLHttpRequest"})
-        r = s.get(f"{WEB_BASE}/ajax/profile/info", timeout=15)
+        s.headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+        })
+        params = {"uid": uid} if uid else None
+        r = s.get(f"{WEB_BASE}/ajax/profile/info", params=params, timeout=15)
+        steps.append(f"web.ajax/profile/info → HTTP {r.status_code} · "
+                     f"{(r.text or '')[:100]!r}")
+        if _looks_risk_control(r.status_code, r.text):
+            return _fail("risk_control", f"被微博风控拦截（HTTP {r.status_code}）")
         j = _safe_json(r)
-        d = j.get("data") if isinstance(j, dict) else None
-        u = _find_user_obj(d)
+        if _looks_not_login(r.status_code, r.text, j):
+            return _fail("cookie_expired",
+                         "微博网页端接口返回未登录（ok=-100 / 登录页），Cookie 已失效，请重新登录")
+        u = _find_user_obj((j or {}).get("data"))
         if u:
+            steps.append("web.profile/info → 解析到用户对象")
             return {
-                "ok": True,
+                "ok": True, "login": True, "status": "ok",
                 "uid": str(u.get("id", "")),
                 "screen_name": u.get("name") or u.get("screen_name", ""),
-                "login": True,
+                "cookie": _merge_cookies(cookie, s),
+                "steps": steps,
             }
-    except Exception:
-        pass
-
-    # 方式二：移动端 /api/config（部分登录态下可用）
-    try:
-        s2 = _session(cookie)
-        r2 = s2.get(f"{M_BASE}/api/config", timeout=15)
-        data = r2.json().get("data", {})
-        if data.get("login") or data.get("uid"):
+        # 正向兜底：接口明确返回成功（ok=1 且 data 非空）即视为已登录，
+        # 即便昵称字段结构变化导致解析不出用户对象，也不该判成失效。
+        if isinstance(j, dict) and str(j.get("ok")) == "1" and j.get("data"):
+            steps.append("web.profile/info → ok=1 且 data 非空（昵称未解析出）")
             return {
-                "ok": True,
+                "ok": True, "login": True, "status": "ok",
+                "uid": uid or "", "screen_name": "",
+                "cookie": _merge_cookies(cookie, s),
+                "steps": steps,
+            }
+        steps.append("web.profile/info → 未解析到用户对象，转移动端确认")
+    except Exception as e:
+        net_err = str(e)
+        steps.append(f"web.profile/info 异常：{e}")
+
+    # 3) 移动端 /api/config —— 仅作正向确认
+    #    重要：m.weibo.cn 与 weibo.com 不同源，网页端 Cookie 不会自动带过去，
+    #    因此该接口的「未登录」是常态，**不能**用来否定网页端登录态。
+    try:
+        s2 = _session(cookie, mobile=True)
+        r2 = s2.get(f"{M_BASE}/api/config", timeout=15)
+        j2 = _safe_json(r2) or {}
+        data = j2.get("data") or {}
+        steps.append(f"m.api/config → HTTP {r2.status_code} · {(r2.text or '')[:100]!r}")
+        if data.get("login") or data.get("uid"):
+            steps.append("m.api/config → 确认已登录")
+            return {
+                "ok": True, "login": True, "status": "ok",
                 "uid": str(data.get("uid", "")),
                 "screen_name": data.get("nick", ""),
-                "login": True,
+                "cookie": _merge_cookies(cookie, s2),
+                "steps": steps,
             }
-    except Exception:
-        pass
+        steps.append("m.api/config → 未确认登录（跨域常态，不作失效依据）")
+    except Exception as e:
+        net_err = net_err or str(e)
+        steps.append(f"m.api/config 异常：{e}")
 
-    # 方式三：XSRF-TOKEN 存在即视为已登录
-    # （weibo.com 登录成功后写入，登出后被清除，是可靠的登录信号）
-    if re.search(r"XSRF-TOKEN=", cookie):
-        return {
-            "ok": True,
-            "uid": "",
-            "screen_name": "",
-            "login": True,
-            "message": "检测到网页端登录令牌 XSRF-TOKEN",
-        }
+    # 4) 网络异常优先于「未知」，避免把超时误报成 Cookie 失效
+    if net_err:
+        return _fail("network_error", f"登录检测网络异常：{net_err}")
 
-    return {"ok": False, "login": False, "error": "Cookie 已失效或未登录"}
+    # 5) 持有 SUB 却无法确认 → unknown，交给上层用真实抓取探测裁决
+    steps.append("所有接口均未确认登录态，但 Cookie 含 SUB 且无登录墙特征")
+    warn("登录态无法确认（未出现登录墙特征）· " + " ｜ ".join(steps), CAT_HTTP)
+    return {"ok": False, "login": False, "status": "unknown",
+            "uid": "", "screen_name": "",
+            "message": "无法确认登录态（接口未返回登录墙，但也未确认登录）",
+            "error": "无法确认登录态（接口未返回登录墙，但也未确认登录）",
+            "steps": steps}
 
 
 def check_repost_capability(cookie: str) -> dict:
@@ -808,29 +1139,90 @@ def check_repost_capability(cookie: str) -> dict:
     st = get_st(cookie)
     if st:
         return {"ok": True, "st": st[:8] + "…"}
-    return {"ok": False, "error": "无法获取转发令牌 st（可能 Cookie 已失效或无转发权限）"}
+    # 明确区分「未登录」与「无转发权限」，便于上层给出不同处置建议
+    if not _has_login_cookie(cookie):
+        return {"ok": False, "status": "cookie_expired",
+                "error": "Cookie 缺少登录凭证 SUB，无法获取转发令牌，请重新登录"}
+    return {"ok": False, "status": "no_repost_perm",
+            "error": "无法获取转发令牌 st（Cookie 可能已失效或无转发权限）"}
 
 
-def diagnose_account(cookie: str) -> dict:
-    """综合诊断账户：登录态 + 转发能力，返回统一状态与说明。
+def diagnose_account(cookie: str, probe_uid: str = "") -> dict:
+    """综合诊断账户：登录态 + **真实抓取能力** + 转发能力。
 
-    status: ok / cookie_expired / no_repost_perm / unknown
+    v1.1.1 关键修复：此前只校验「能否登录」「能否拿到 st 令牌」，而二者都可能因
+    XSRF-TOKEN 残留而假阳性；用户遇到的是「检测全部正常，但一个微博都抓不到」。
+    现在在登录校验通过后**追加一次真实抓取探测**（与轮询走完全相同的代码路径），
+    只有真正能取到数据才算 status=ok。
+
+    status: ok / cookie_expired / no_repost_perm / risk_control / network_error / unknown
     """
     login = check_login(cookie)
-    result = {"login": login, "repost": None,
-              "status": "unknown", "message": ""}
+    result = {"login": login, "repost": None, "probe": None,
+              "status": login.get("status") or "unknown", "message": ""}
+
     if not login.get("ok"):
-        result["status"] = "cookie_expired"
-        result["message"] = login.get("error", "Cookie 已失效")
-        return result
+        st = login.get("status") or "cookie_expired"
+        result["status"] = st
+        result["message"] = login.get("error") or "Cookie 已失效"
+        # 只有「确证失效 / 风控 / 网络异常」才在此收口；
+        # unknown 交由下面的真实抓取探测裁决 —— 能不能抓到数据才是最终标准，
+        # 避免接口形态变化导致误报「请重新登录」。
+        if st == "cookie_expired":
+            result["message"] += " · 请在「账户管理」删除该账户后重新登录"
+            return result
+        if st in ("risk_control", "network_error"):
+            return result
+
+    # 登录校验通过（或无法确认）→ 做一次与轮询同路径的真实抓取探测
+    uid = probe_uid or login.get("uid") or ""
+    if uid:
+        pr = get_latest_posts(uid, cookie, page=1, count=1)
+        result["probe"] = {"ok": pr.get("ok"), "status": pr.get("status", "ok"),
+                           "reason": pr.get("reason", "")}
+        if not pr.get("ok"):
+            st = pr.get("status") or "unknown"
+            # 「该用户暂无微博」不属于账户问题，仍按正常账户处理
+            if st != "empty":
+                result["status"] = st
+                if st == "cookie_expired":
+                    result["message"] = ("抓取被要求重新登录 · Cookie 已失效，"
+                                         "请在「账户管理」删除该账户后重新登录")
+                elif st == "risk_control":
+                    result["message"] = "抓取被微博风控拦截，请降低轮询频率或稍后重试"
+                elif st == "network_error":
+                    result["message"] = "抓取网络异常，请检查网络后重试"
+                else:
+                    result["message"] = pr.get("reason") or "抓取失败"
+                return result
+        # 探测成功：把续期后的 Cookie 带回，供上层回写保活
+        if pr.get("renewed_cookie"):
+            result["renewed_cookie"] = pr["renewed_cookie"]
+        if not login.get("ok") and pr.get("ok"):
+            # 登录接口未能确认，但真实抓取成功 → 以抓取结果为准判为正常
+            result["status"] = "ok"
+            result["message"] = "登录接口未能确认，但真实抓取正常，账户可用"
+            result["login"] = {"ok": True, "login": True, "status": "ok",
+                               "uid": login.get("uid", ""),
+                               "screen_name": login.get("screen_name", ""),
+                               "note": "由抓取探测确认"}
+            repost = check_repost_capability(cookie)
+            result["repost"] = repost
+            if not repost.get("ok"):
+                result["status"] = repost.get("status") or "no_repost_perm"
+                result["message"] = repost.get("error") or "可抓取，但无法获取转发令牌"
+            return result
+
     repost = check_repost_capability(cookie)
     result["repost"] = repost
     if repost.get("ok"):
         result["status"] = "ok"
-        result["message"] = "登录正常，已具备转发能力"
+        result["message"] = "登录正常，抓取与转发能力均正常"
     else:
-        result["status"] = "no_repost_perm"
-        result["message"] = "可登录，但无法获取转发令牌（可能无转发权限或 Cookie 部分失效）"
+        result["status"] = repost.get("status") or "no_repost_perm"
+        result["message"] = repost.get("error") or "可登录，但无法获取转发令牌"
+        if result["status"] == "cookie_expired":
+            result["message"] += " · 请在「账户管理」删除该账户后重新登录"
     return result
 
 
@@ -990,6 +1382,15 @@ def repost(post_id: str, comment: str, cookie: str, st: str = "", uid: str = "")
                      or str(code) == "100000")
             if is_ok:
                 return {"ok": True, "data": j.get("data")}
+            # v1.1.1：先判定「未登录 / 风控」，把失败性质结构化，避免一律报成「转发失败」
+            if _looks_not_login(r.status_code, r.text, j):
+                return {"ok": False, "status": "cookie_expired",
+                        "error": "转发接口要求重新登录：Cookie 已失效，请在「账户管理」重新登录",
+                        "raw": j}
+            if _looks_risk_control(r.status_code, r.text):
+                return {"ok": False, "status": "risk_control",
+                        "error": f"转发被微博风控拦截（HTTP {r.status_code}），请降低频率后重试",
+                        "raw": j}
             # 诊断：把微博真实回包带出来，避免吞掉原因
             last_err = (msg or j.get("error")
                         or f"未知响应(ok={ok_val!r}, code={code!r})")

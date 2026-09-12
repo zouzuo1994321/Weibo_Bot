@@ -11,5 +11,4 @@ PyInstaller>=6.0        # 打包为独立 exe
 #   pip install llama-cpp-python==0.3.35 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 llama-cpp-python==0.3.35
 numpy>=1.20             # llama-cpp-python 依赖
-# 可选：导出 XLSX 需要 openpyxl
-# openpyxl>=3.1
+openpyxl>=3.1            # 导出 XLSX（历史记录导出格式之一）

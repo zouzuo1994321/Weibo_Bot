@@ -166,13 +166,21 @@ async function refreshOverviewLive() {
 }
 
 /* ---------------- 账户 ---------------- */
+const ACC_STATUS_META = {
+  ok: { cls: "green", text: "正常" },
+  cookie_expired: { cls: "red", text: "Cookie失效" },
+  risk_control: { cls: "amber", text: "被风控" },
+  risk: { cls: "amber", text: "被风控" },
+  network_error: { cls: "blue", text: "网络异常" },
+  no_repost_perm: { cls: "yellow", text: "无转发权限" },
+  unknown: { cls: "blue", text: "未检测" },
+};
+
 function accountStatusTag(a) {
   const s = a.status || "unknown";
+  const meta = ACC_STATUS_META[s] || ACC_STATUS_META.unknown;
   const detail = a.check_detail ? ` title="${esc(a.check_detail)}"` : "";
-  if (s === "ok") return `<span class="tag green"${detail}>正常</span>`;
-  if (s === "cookie_expired") return `<span class="tag red"${detail}>Cookie失效</span>`;
-  if (s === "no_repost_perm") return `<span class="tag yellow"${detail}>无转发权限</span>`;
-  return `<span class="tag blue"${detail}>未检测</span>`;
+  return `<span class="tag ${meta.cls}"${detail}>${meta.text}</span>`;
 }
 
 function renderAccounts() {
@@ -192,11 +200,19 @@ function renderAccounts() {
 }
 
 async function checkAccount(id) {
-  toast("正在检测该账户…");
+  toast("正在检测该账户（登录态 + 真实抓取 + 转发能力）…");
   const r = await apiCall("check_account", id);
   if (!r.ok) { toast(r.error, "err"); return; }
-  const label = { ok: "登录正常，可转发", cookie_expired: "Cookie 已失效", no_repost_perm: "无转发权限", unknown: "未知" };
-  toast(`检测：${label[r.status] || r.status}（${r.message}）`, r.status === "ok" ? "ok" : "err");
+  const label = {
+    ok: "正常，抓取与转发均可用",
+    cookie_expired: "Cookie 已失效，请重新登录",
+    risk_control: "被微博风控拦截，请降低频率",
+    network_error: "网络异常",
+    no_repost_perm: "无转发权限",
+    unknown: "登录态未确认（以实际抓取为准）"
+  };
+  toast(`检测：${label[r.status] || r.status}（${r.message}）`,
+        r.status === "ok" ? "ok" : "err");
   await loadState();
 }
 async function checkAllAccounts() {
@@ -278,21 +294,51 @@ function renderMonitors() {
   renderMonPage();
 }
 
+/* v1.1.1：账户健康横幅 —— 抓取失败的根因（Cookie 失效 / 风控）直接暴露在监控页顶部，
+   避免用户只看到一排「异常」却不知道要重新登录。 */
+function accountHealthBanner() {
+  const accs = STATE.accounts || [];
+  if (!accs.length) {
+    return `<div class="mon-alert ghost">尚未添加微博账户，无法抓取任何监控对象。请先到「账户管理」登录并添加账户。</div>`;
+  }
+  const name = a => esc(a.display_name || a.remark || a.id);
+  const expired = accs.filter(a => a.status === "cookie_expired");
+  if (expired.length) {
+    return `<div class="mon-alert red">账户「${name(expired[0])}」Cookie 已失效 —— 所有监控对象都会抓取失败。
+      请到「账户管理」删除该账户后重新登录（重新登录会写入新的登录凭证 SUB）。</div>`;
+  }
+  const risk = accs.filter(a => a.status === "risk_control" || a.status === "risk");
+  if (risk.length) {
+    return `<div class="mon-alert amber">账户「${name(risk[0])}」被微博风控拦截（HTTP 432/418/403）。
+      建议调大轮询间隔、减少并发，稍后自动恢复。</div>`;
+  }
+  const net = accs.filter(a => a.status === "network_error");
+  if (net.length) {
+    return `<div class="mon-alert ghost">账户「${name(net[0])}」检测时网络异常，请检查本机网络后重试。</div>`;
+  }
+  const unknown = accs.filter(a => a.status === "unknown" || !a.status);
+  if (unknown.length === accs.length) {
+    return `<div class="mon-alert ghost">账户尚未完成检测（或登录态无法确认），可点击「账户管理 → 检测」确认。</div>`;
+  }
+  return "";
+}
+
 function renderMonPage() {
   const total = MON_FILTERED.length;
   const cEl = document.getElementById("monCount");
   if (cEl) cEl.textContent = total;
   const box = document.getElementById("monList");
+  const banner = accountHealthBanner();
   if (!total) {
     const isFilter = MON_FILTERS.keyword || MON_FILTERS.status !== "all" || MON_FILTERS.pinnedOnly;
-    box.innerHTML = `<div class="empty">${isFilter ? "没有符合筛选条件的监控对象" : "暂无监控对象，请在上方添加微博 UID"}</div>`;
+    box.innerHTML = banner + `<div class="empty">${isFilter ? "没有符合筛选条件的监控对象" : "暂无监控对象，请在上方添加微博 UID"}</div>`;
     renderMonPagination();
     return;
   }
   const start = (MON_PAGE - 1) * MON_PAGE_SIZE;
   const pageRows = MON_FILTERED.slice(start, start + MON_PAGE_SIZE);
   MON_PAGE_ROWS = pageRows;
-  box.innerHTML = pageRows.map(renderMonCard).join("");
+  box.innerHTML = banner + pageRows.map(renderMonCard).join("");
   loadMonitorAvatars(pageRows);
   renderMonPagination();
 }
@@ -772,27 +818,117 @@ async function deleteCustom(name) {
 
 /* ---------------- 黑名单 ---------------- */
 let blTemp = [];
+
+/* 支持：换行 / 逗号(中英) / 顿号 / 分号(中英) / 空格 多种分隔符，一次解析多个关键词 */
+function parseKeywords(text) {
+  return String(text || "")
+    .split(/[\r\n,，、;；\s]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
 function renderBlacklist() {
   blTemp = (STATE.config.blacklist || []).slice();
   drawChips();
 }
+
+function blIsDirty() {
+  const saved = (STATE.config && STATE.config.blacklist) || [];
+  if (saved.length !== blTemp.length) return true;
+  return blTemp.some((w, i) => w !== saved[i]);
+}
+
 function drawChips() {
   const box = document.getElementById("blChips");
-  box.innerHTML = blTemp.length ? blTemp.map((w, i) =>
-    `<span class="chip">${esc(w)}<button onclick="delBl(${i})">×</button></span>`).join("")
-    : '<span class="muted">暂无关键词</span>';
+  const searchEl = document.getElementById("blSearch");
+  const kw = (searchEl && searchEl.value || "").trim().toLowerCase();
+
+  const cnt = document.getElementById("blCount");
+  if (cnt) cnt.textContent = blTemp.length;
+  const dirty = blIsDirty();
+  const dEl = document.getElementById("blDirty");
+  if (dEl) dEl.style.display = dirty ? "inline" : "none";
+  const btn = document.getElementById("btnSaveBl");
+  if (btn) btn.classList.toggle("dirty", dirty);
+
+  if (!blTemp.length) {
+    box.innerHTML = '<span class="muted">暂无关键词 —— 添加后，包含这些词的微博会被自动跳过</span>';
+    return;
+  }
+  const list = blTemp.map((w, i) => ({ w, i }))
+    .filter(x => !kw || x.w.toLowerCase().includes(kw));
+  if (!list.length) {
+    box.innerHTML = `<span class="muted">没有匹配「${esc(kw)}」的关键词</span>`;
+    return;
+  }
+  box.innerHTML = list.map(({ w, i }) =>
+    `<span class="chip bl-chip"><span class="bl-chip-idx">${i + 1}</span>${esc(w)}<button title="删除" onclick="delBl(${i})">×</button></span>`
+  ).join("");
 }
+
+function onBlInputKey(e) {
+  if (e.key === "Enter") { e.preventDefault(); addBlacklist(); }
+}
+
 function addBlacklist() {
-  const v = document.getElementById("blInput").value.trim();
-  if (!v) return;
-  if (!blTemp.includes(v)) blTemp.push(v);
-  document.getElementById("blInput").value = "";
+  const input = document.getElementById("blInput");
+  const list = parseKeywords(input.value);
+  if (!list.length) return;
+  let added = 0, dup = 0;
+  for (const v of list) {
+    if (blTemp.includes(v)) { dup++; continue; }
+    blTemp.push(v);
+    added++;
+  }
+  input.value = "";
   drawChips();
+  if (added) toast(`已添加 ${added} 个关键词${dup ? `，${dup} 个已存在已跳过` : ""}`, "ok");
+  else toast("这些关键词都已存在", "err");
 }
+
 function delBl(i) { blTemp.splice(i, 1); drawChips(); }
+
+function clearBlacklist() {
+  if (!blTemp.length) { toast("列表已经是空的", "err"); return; }
+  if (!confirm(`确认清空全部 ${blTemp.length} 个关键词？\n（清空后需点击「保存黑名单」才会生效）`)) return;
+  blTemp = [];
+  drawChips();
+  toast("已清空列表，记得保存", "ok");
+}
+
+function toggleBlBulk() {
+  const box = document.getElementById("blBulkBox");
+  const open = box.style.display === "none";
+  box.style.display = open ? "block" : "none";
+  if (open) document.getElementById("blBulkText").value = blTemp.join("\n");
+}
+
+function submitBlBulk() {
+  const raw = document.getElementById("blBulkText").value;
+  const list = [];
+  const seen = new Set();
+  for (const v of parseKeywords(raw)) {
+    if (!seen.has(v)) { seen.add(v); list.push(v); }
+  }
+  blTemp = list;
+  drawChips();
+  toggleBlBulk();
+  toast(`已重建列表：共 ${list.length} 个关键词（记得保存）`, "ok");
+}
+
+async function exportBlacklist() {
+  if (!blTemp.length) { toast("列表为空，无需导出", "err"); return; }
+  const r = await apiCall("export_blacklist", JSON.stringify(blTemp));
+  if (r && r.ok) toast(`已导出 ${r.count} 个关键词：${r.path}`, "ok");
+  else toast((r && r.error) || "导出失败", "err");
+}
+
 async function saveBlacklist() {
-  await apiCall("save_config", JSON.stringify({ blacklist: blTemp }));
-  toast("黑名单已保存", "ok"); await loadState();
+  const r = await apiCall("save_config", JSON.stringify({ blacklist: blTemp }));
+  if (r && r.ok === false) { toast((r && r.error) || "保存失败", "err"); return; }
+  await loadState();
+  renderBlacklist();
+  toast(`黑名单已保存（${blTemp.length} 个关键词）`, "ok");
 }
 
 /* ---------------- 工作时间 ---------------- */
@@ -1323,30 +1459,44 @@ function closeImgPreview() {
   document.getElementById("imgPreviewBox").innerHTML = "";
 }
 
+/* 导出统一为「文件夹」形态：数据文件 + 引用到的图片副本 + README */
+const EXPORT_FMTS = ["csv", "json", "xlsx"];
+function pickExportFmt(title) {
+  const v = prompt(title, "csv");
+  if (!v) return "";
+  const f = String(v).trim().toLowerCase();
+  if (!EXPORT_FMTS.includes(f)) { toast("格式仅支持 csv / json / xlsx", "err"); return ""; }
+  return f;
+}
+function afterExport(r) {
+  const img = r.images ? `，含图片 ${r.images} 张` : "";
+  toast(`已导出 ${r.count != null ? r.count + " 条" : "全部数据"}${img}：${r.path}`, "ok");
+  apiCall("open_path", r.path);   // 自动打开导出目录，方便直接查看图片
+}
 async function exportFiltered() {
-  const fmt = prompt("导出格式：输入 csv / json / xlsx", "csv");
+  const fmt = pickExportFmt("导出当前筛选：输入 csv / json / xlsx");
   if (!fmt) return;
   _readHistFilters();
   const r = await apiCall("export_filtered", histKind, fmt, JSON.stringify(HIST_FILTERS));
-  if (r.ok) toast("已导出：" + r.path, "ok"); else toast(r.error || "导出失败", "err");
+  if (r.ok) afterExport(r); else toast(r.error || "导出失败", "err");
 }
 async function exportSelected() {
   if (HIST_SELECTED.size === 0) { toast("请先勾选要导出的记录", "err"); return; }
-  const fmt = prompt("导出选中记录：输入 csv / json / xlsx", "csv");
+  const fmt = pickExportFmt("导出选中记录：输入 csv / json / xlsx");
   if (!fmt) return;
   const ids = JSON.stringify([...HIST_SELECTED]);
   const r = await apiCall("export_selected", histKind, ids, fmt);
-  if (r.ok) toast(`已导出 ${r.count} 条：${r.path}`, "ok"); else toast(r.error || "导出失败", "err");
+  if (r.ok) afterExport(r); else toast(r.error || "导出失败", "err");
 }
 async function exportAll() {
   const r = await apiCall("export_all_data");
-  if (r.ok) toast("已导出全部数据：" + r.path, "ok"); else toast(r.error || "导出失败", "err");
+  if (r.ok) afterExport({ ...r, count: r.count }); else toast(r.error || "导出失败", "err");
 }
 async function exportKind(kind) {
-  const fmt = prompt("导出格式：输入 csv / json / xlsx", "csv");
+  const fmt = pickExportFmt("导出格式：输入 csv / json / xlsx");
   if (!fmt) return;
   const r = await apiCall("export_data", kind, fmt);
-  if (r.ok) toast("已导出：" + r.path, "ok"); else toast(r.error || "导出失败", "err");
+  if (r.ok) afterExport(r); else toast(r.error || "导出失败", "err");
 }
 
 /* ---------------- 数据总览 ---------------- */

@@ -151,6 +151,27 @@ class AccountManager:
                 return _decrypt(a.get("cookie", ""))
         return ""
 
+    def update_cookie(self, acc_id: str, new_cookie: str, reason: str = ""):
+        """回写续期后的 Cookie（v1.1.1 会话保活）。
+
+        微博在网页请求响应里会通过 Set-Cookie 续期 SUB / SUBP / XSRF-TOKEN / ALF，
+        把续期结果写回账户即等价于「滑动续期」，可显著延长 Cookie 寿命，
+        减少用户必须手动重新登录的次数。仅在 Cookie 确有变化时落盘。
+        """
+        if not new_cookie or not new_cookie.strip():
+            return False
+        for a in self.accounts:
+            if a["id"] != acc_id:
+                continue
+            if _decrypt(a.get("cookie", "")) == new_cookie.strip():
+                return False
+            a["cookie"] = _encrypt(new_cookie.strip())
+            if reason:
+                a["check_detail"] = reason
+            self.save()
+            return True
+        return False
+
     def mark_used(self, acc_id: str):
         for a in self.accounts:
             if a["id"] == acc_id:

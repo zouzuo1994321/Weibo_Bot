@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import random
+import sys
 import time
 import webbrowser
 from datetime import datetime
@@ -225,35 +226,67 @@ class Api:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _probe_uid(self):
+        """取一个用于「真实抓取探测」的 UID（优先监控列表首个对象）。
+
+        v1.1.1：账户检测必须包含真实抓取探测 —— 只有存在 XSRF-TOKEN 而 SUB 已失效时，
+        登录接口可能给出假阳性，唯有真正抓一次数据才能确认账户可用。
+        """
+        try:
+            mons = get_monitor_manager().list()
+            if mons:
+                return mons[0].get("uid", "")
+        except Exception:
+            pass
+        return ""
+
     def _run_check_all(self):
         am = get_account_manager()
+        probe_uid = self._probe_uid()
         for acc in am.list_accounts():
             cookie = am.get_cookie(acc["id"])
             if not cookie:
                 am.set_check_result(acc["id"], "unknown", "无 Cookie")
                 continue
-            diag = diagnose_account(cookie)
+            diag = diagnose_account(cookie, probe_uid=probe_uid)
             wb = ""
             login = diag.get("login")
             if isinstance(login, dict):
                 wb = login.get("screen_name", "")
             am.set_check_result(acc["id"], diag["status"], diag["message"], wb or None)
+            # 会话保活：把续期后的 Cookie 写回账户
+            if diag.get("renewed_cookie"):
+                if am.update_cookie(acc["id"], diag["renewed_cookie"],
+                                    "检测时已自动续期 Cookie（会话保活）"):
+                    debug(f"账户 {acc['id']} Cookie 已自动续期", CAT_CORE)
 
     def check_account(self, acc_id):
-        """手动检测单个账户：登录态 + 转发能力，并回填微博昵称。"""
+        """手动检测单个账户：登录态 + **真实抓取能力** + 转发能力，并回填微博昵称。
+
+        v1.1.1：新增真实抓取探测（与轮询同一代码路径），修复「检测正常却抓不到数据」
+        的假阳性 —— 此前仅凭 XSRF-TOKEN 存在就判定「登录正常、可转发」。
+        """
         am = get_account_manager()
         cookie = am.get_cookie(acc_id)
         if not cookie:
             return {"ok": False, "error": "该账户没有可用 Cookie"}
-        diag = diagnose_account(cookie)
+        diag = diagnose_account(cookie, probe_uid=self._probe_uid())
         wb = ""
         login = diag.get("login")
         if isinstance(login, dict):
             wb = login.get("screen_name", "")
         am.set_check_result(acc_id, diag["status"], diag["message"], wb or None)
+        if diag.get("renewed_cookie"):
+            if am.update_cookie(acc_id, diag["renewed_cookie"],
+                                "检测时已自动续期 Cookie（会话保活）"):
+                debug(f"账户 {acc_id} Cookie 已自动续期", CAT_CORE)
         info(f"账户检测 {acc_id}：{diag['status']} - {diag['message']}")
+        # 逐步诊断信息写入日志，便于在「运行日志」页定位判定依据（HTTP 状态码 + 响应片段）
+        for s in (diag.get("login") or {}).get("steps") or []:
+            debug(f"账户检测 {acc_id} 步骤 · {s}", CAT_CORE)
         return {"ok": True, "status": diag["status"], "message": diag["message"],
-                "login": diag["login"], "repost": diag["repost"]}
+                "login": diag["login"], "repost": diag["repost"],
+                "probe": diag.get("probe")}
 
     def check_all_accounts(self):
         """手动检测全部账户。"""
@@ -402,7 +435,8 @@ class Api:
         if not accs:
             return {"ok": False, "error": "需要至少一个账户 Cookie 才能刷新"}
         from account_manager import get_account_manager as gam
-        cookie = gam().get_cookie(accs[0]["id"])
+        acc_id = accs[0]["id"]
+        cookie = gam().get_cookie(acc_id)
         mon = get_monitor_manager()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         details = []
@@ -410,6 +444,12 @@ class Api:
         for it in mon.list():
             uid = it["uid"]
             resp = get_latest_posts(uid, cookie, page=1, count=5)
+            # v1.1.1 会话保活：抓取成功时可能带回续期后的 Cookie，写回并沿用
+            if resp.get("ok") and resp.get("renewed_cookie"):
+                if gam().update_cookie(acc_id, resp["renewed_cookie"],
+                                       "刷新监控时已自动续期 Cookie（会话保活）"):
+                    debug(f"账户 {acc_id} Cookie 已自动续期", CAT_CORE)
+                cookie = resp["renewed_cookie"]
             if resp.get("ok") and resp.get("posts"):
                 posts = resp["posts"]
                 # 昵称优先从用户信息取，其次用首条微博
@@ -444,8 +484,10 @@ class Api:
             else:
                 mon.update(uid, {"status": "error", "last_check": now})
                 err_count += 1
+                # v1.1.1：失败原因结构化，前端可直接给出「重新登录」等可操作提示
                 details.append({"uid": uid, "ok": False,
-                                "detail": resp.get("error", "拉取失败")})
+                                "status": resp.get("status", "error"),
+                                "detail": resp.get("reason") or resp.get("error", "拉取失败")})
         info(f"监控刷新完成：{ok_count} 在线 / {err_count} 异常")
         first_err = next((d for d in details if not d["ok"]), None)
         summary = (f"在线 {ok_count} / 异常 {err_count}" +
@@ -491,7 +533,11 @@ class Api:
         screen_name = target.get("screen_name", "")
         resp = get_latest_posts(uid, cookie, page=1, count=10)
         if not resp.get("ok") or not resp.get("posts"):
-            return {"ok": False, "error": f"拉取 UID {uid} 失败：{resp.get('error', '空')}"}
+            # v1.1.1：区分「Cookie 失效」「风控」「网络异常」，给出可操作提示
+            detail = resp.get("reason") or resp.get("error") or "空"
+            if resp.get("status") == "cookie_expired":
+                detail = "账户 Cookie 已失效，请在「账户管理」删除该账户后重新登录"
+            return {"ok": False, "error": f"拉取 UID {uid} 失败：{detail}"}
         posts = [p for p in resp["posts"] if not p.get("is_top")]
         if not posts:
             return {"ok": False, "error": f"UID {uid} 无非置顶微博可转发"}
@@ -802,19 +848,56 @@ class Api:
             return {"ok": False, "error": str(e), "path": ""}
 
     # ---------------- 导出 ----------------
-    def export_data(self, kind, fmt):
+    def export_blacklist(self, items_json):
+        """导出关键词黑名单为 txt（每行一个，可再粘回「批量编辑」导入）。"""
         import webview
-        # 通过文件对话框选择保存位置
-        suffix = {"csv": ".csv", "json": ".json", "xlsx": ".xlsx"}.get(fmt, ".txt")
-        default_name = f"weibobot_{kind}{suffix}"
+        try:
+            items = json.loads(items_json) if isinstance(items_json, str) else (items_json or [])
+        except Exception:
+            return {"ok": False, "error": "数据格式错误"}
+        items = [str(x).strip() for x in items if str(x).strip()]
+        if not items:
+            return {"ok": False, "error": "列表为空"}
         try:
             paths = webview.windows[0].create_file_dialog(
-                webview.SAVE_DIALOG, save_filename=default_name)
+                webview.SAVE_DIALOG, save_filename="weibobot_blacklist.txt")
         except Exception:
             paths = None
         if not paths:
             return {"ok": False, "error": "已取消保存"}
         dest = paths if isinstance(paths, str) else paths[0]
+        try:
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write("# 微博bot小助手 关键词黑名单\n")
+                f.write(f"# 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        f"　共 {len(items)} 个\n\n")
+                for w in items:
+                    f.write(w + "\n")
+            return {"ok": True, "path": dest, "count": len(items)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @staticmethod
+    def _pick_folder(title="选择导出位置"):
+        """弹出系统文件夹选择框，返回路径字符串；取消则返回 ''。"""
+        import webview
+        try:
+            folder = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+        except Exception:
+            try:
+                folder = webview.windows[0].create_file_dialog(
+                    webview.FOLDER_DIALOG, directory="")
+            except Exception:
+                folder = None
+        if not folder:
+            return ""
+        return folder if isinstance(folder, str) else folder[0]
+
+    def export_data(self, kind, fmt):
+        """导出某一类全部记录：选择**文件夹**，产出「数据文件 + 图片副本」。"""
+        dest = self._pick_folder("选择导出位置（将自动创建导出文件夹）")
+        if not dest:
+            return {"ok": False, "error": "已取消保存"}
         return export(kind, fmt, dest)
 
     def export_all_data(self):
@@ -830,27 +913,18 @@ class Api:
         return export_all(dest_dir)
 
     def export_filtered(self, kind, fmt, filters):
-        """按前端筛选条件导出历史记录。"""
-        import webview
+        """按前端筛选条件导出历史记录（数据文件 + 引用到的图片副本）。"""
         try:
             filters = json.loads(filters) if isinstance(filters, str) else filters
         except Exception:
             return {"ok": False, "error": "筛选条件格式错误"}
-        suffix = {"csv": ".csv", "json": ".json", "xlsx": ".xlsx"}.get(fmt, ".txt")
-        default_name = f"weibobot_{kind}_filtered{suffix}"
-        try:
-            paths = webview.windows[0].create_file_dialog(
-                webview.SAVE_DIALOG, save_filename=default_name)
-        except Exception:
-            paths = None
-        if not paths:
+        dest = self._pick_folder("选择导出位置（将自动创建「筛选导出」文件夹）")
+        if not dest:
             return {"ok": False, "error": "已取消保存"}
-        dest = paths if isinstance(paths, str) else paths[0]
         return export_filtered(kind, fmt, dest, filters)
 
     def export_selected(self, kind, ids_json, fmt):
-        """导出选中的若干条历史记录（单选/多选）。"""
-        import webview
+        """导出选中的若干条历史记录（数据文件 + 引用到的图片副本）。"""
         try:
             ids = json.loads(ids_json) if isinstance(ids_json, str) else ids_json
         except Exception:
@@ -866,17 +940,27 @@ class Api:
             return {"ok": False, "error": "未知类型"}
         if not rows:
             return {"ok": False, "error": "未找到对应记录"}
-        suffix = {"csv": ".csv", "json": ".json", "xlsx": ".xlsx"}.get(fmt, ".txt")
-        default_name = f"weibobot_{kind}_selected{suffix}"
-        try:
-            paths = webview.windows[0].create_file_dialog(
-                webview.SAVE_DIALOG, save_filename=default_name)
-        except Exception:
-            paths = None
-        if not paths:
+        dest = self._pick_folder("选择导出位置（将自动创建「选中导出」文件夹）")
+        if not dest:
             return {"ok": False, "error": "已取消保存"}
-        dest = paths if isinstance(paths, str) else paths[0]
         return export_rows(kind, rows, fmt, dest)
+
+    def open_path(self, path):
+        """在文件管理器中打开导出目录 / 文件。"""
+        try:
+            if not path or not os.path.exists(path):
+                return {"ok": False, "error": "路径不存在"}
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", path])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def load_image_base64(self, rel_path: str):
         """读取本地图片并返回 base64 Data URL，供前端预览。
