@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 
 import requests
 from logger import warn, debug, CAT_HTTP
@@ -166,7 +167,164 @@ def _merge_cookies(cookie: str, session) -> str:
     return _cookie_str(base) if changed else cookie
 
 
+# ---------------- Cookie 失效时间预测 ----------------
+# 微博登录态有效期主要由 ALF / SSOLoginState 决定，二者都是 Unix 秒级时间戳；
+# SUBP 里也嵌有该值。解析这些时间戳即可估算「若不再有活动请求，登录态何时失效」。
+# 注意：微博对活跃会话会滑动续期（每次网页端请求都会延长 ALF），因此这里给出的是
+# 「当前静止状态下」的预测失效点，真实失效会随软件实际使用而不断后延。
+def _humanize_delta(sec: int) -> str:
+    """把剩余秒数转成中文时长描述。"""
+    sec = int(sec)
+    if sec <= 0:
+        return "已过期"
+    days = sec // 86400
+    hours = (sec % 86400) // 3600
+    if days >= 1:
+        return f"剩 {days} 天" + (f"{hours} 小时" if hours else "")
+    minutes = sec // 60
+    if minutes >= 60:
+        return f"剩 {hours} 小时"
+    return f"剩 {minutes} 分钟"
+
+
+def _extract_subp_login_ts(cookie: str) -> int:
+    """从 SUBP 提取最早的时间戳，作为本次登录/会话起点。
+
+    微博 SUBP 内嵌多个 10 位 Unix 时间戳（注册、登录等），取最小者通常最接近
+    「本次登录时刻」，用于推算 7 天 SUB 会话窗口起点。
+    """
+    d = _cookie_dict(cookie)
+    subp = d.get("SUBP", "")
+    now = int(time.time())
+    cands = []
+    for m in re.finditer("([0-9]{10})", subp):
+        try:
+            ts = int(m.group(1))
+        except ValueError:
+            continue
+        # 合理性区间，且不能晚于现在
+        if 1_500_000_000 < ts < 4_000_000_000 and ts <= now + 60:
+            cands.append(ts)
+    return min(cands) if cands else 0
+
+
+def _build_expiry_result(expiry_ts: int, source: str) -> dict:
+    """根据失效时间戳构造统一返回结构。"""
+    now = int(time.time())
+    remaining = expiry_ts - now
+    expired = remaining <= 0
+    if expired:
+        level = "expired"
+    elif remaining <= 7 * 86400:
+        level = "warn"
+    else:
+        level = "safe"
+    try:
+        expiry_str = datetime.fromtimestamp(expiry_ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        expiry_str = ""
+    return {
+        "has_expiry": True,
+        "expired": expired,
+        "source": source,
+        "expiry_ts": expiry_ts,
+        "expiry_str": expiry_str,
+        "remaining_seconds": remaining,
+        "remaining_text": _humanize_delta(remaining),
+        "level": level,
+    }
+
+
+def predict_cookie_expiry(cookie: str, last_ok_at_ts: int = 0) -> dict:
+    """预测 Cookie（登录态）失效时间。
+
+    微博登录态存在两个相互独立的有效期：
+      1) ALF / SSOLoginState / ALF_SSOINFO —— 长期「自动登录」令牌，最长可达约 30 天；
+      2) SUB 会话 —— 真正的网页端登录态，约 7 天无活动即失效（每次成功请求滑动续期）。
+
+    旧实现只解析 ALF，给出「剩 22 天」的乐观预测，而真实 SUB 会话第 7 天已失效、
+    自动续期阈值（<=7 天）永远触发不到。
+
+    修正：优先以「会话起点(登录时间/最近一次成功活动) + 7 天」作为失效点；
+    仅当 ALF 过期更早时才退回 ALF 时间。这样自动续期能在第 7 天前及时触发。
+
+    参数：
+      cookie           Cookie 字符串
+      last_ok_at_ts    该账户最近一次「成功活动」的 Unix 时间戳（秒），来自账户字段
+                       last_ok_at（成功检测 / 成功续期 / 被使用时回写），用于把 7 天窗口
+                       随活跃使用不断后延（滑动续期语义）。
+    """
+    d = _cookie_dict(cookie)
+    # 1) 解析 ALF 系长期令牌
+    alf_ts = 0
+    alf_key = ""
+    for key in ("ALF", "SSOLoginState", "ALF_SSOINFO"):
+        v = d.get(key)
+        if not v:
+            continue
+        m = re.search("[0-9]{10,11}", v)
+        if not m:
+            continue
+        try:
+            ts = int(m.group(0))
+        except ValueError:
+            continue
+        if 1_500_000_000 < ts < 4_000_000_000:
+            alf_ts, alf_key = ts, key
+            break
+    # 2) 会话起点：SUBP 最早时间戳（登录时刻） 与 last_ok_at 取较晚者
+    login_ts = _extract_subp_login_ts(cookie)
+    session_start = 0
+    if login_ts and last_ok_at_ts:
+        session_start = max(login_ts, last_ok_at_ts)
+    elif login_ts:
+        session_start = login_ts
+    elif last_ok_at_ts:
+        session_start = last_ok_at_ts
+    # 3) 优先 SUB 7 天会话窗口
+    if session_start:
+        session_ts = session_start + 7 * 86400
+        if alf_ts == 0 or session_ts < alf_ts:
+            return _build_expiry_result(session_ts, "SUB_SESSION")
+    # 4) 兜底：ALF 长期令牌
+    if alf_ts:
+        return _build_expiry_result(alf_ts, alf_key)
+    return {"has_expiry": False, "expired": False, "level": "unknown"}
+
+# ---------------- CA 证书包自愈 ----------------
+# onefile 模式下 certifi 的 cacert.pem 解压在 %TEMP%\_MEIxxxxxx\，
+# 一旦该临时目录被存储感知 / 磁盘清理 / 杀软清掉，requests 会对**每个** HTTPS 请求抛
+# "Could not find a suitable TLS CA certificate bundle"，表现为全站 network_error。
+# 这里在每次建会话时做一次廉价的存在性检查，失效则切到 data/cacert.pem 备份。
+_ca_healed = False
+
+
+def _ensure_ca_bundle():
+    try:
+        import certifi
+        if certifi.where() and os.path.exists(certifi.where()):
+            return
+    except Exception:
+        return
+    global _ca_healed
+    if _ca_healed:      # 已切换到备份，requests 会一直沿用，无需重复处理
+        return
+    _ca_healed = True
+    try:
+        from ca_bundle import ensure_ca_bundle
+        status, path = ensure_ca_bundle()
+        if path:
+            warn(f"CA 证书包已自愈 · {status}", CAT_HTTP)
+        else:
+            error_msg = (f"CA 证书包失效且无备份，HTTPS 请求将持续失败 · {status}；"
+                         f"请重启本程序（会重新解压临时目录）")
+            warn(error_msg, CAT_HTTP)
+    except Exception as e:
+        debug(f"CA 证书包自愈失败：{e}", CAT_HTTP)
+
+
 def _session(cookie: str, referer: str = None, mobile: bool = False) -> requests.Session:
+    _ensure_ca_bundle()
     s = requests.Session()
     if referer is None:
         referer = f"{M_BASE}/" if mobile else f"{WEB_BASE}/"
@@ -601,6 +759,49 @@ def warm_session(cookie: str, uid: str = "") -> dict:
                 "error": f"会话预热异常：{e}"}
 
 
+# 从 weibo.com 首页内联配置中提取「当前登录账户自己的 UID」的常见写法。
+# 顺序按特异性从强到弱，避免误取到信息流里别人的 uid。
+_SELF_UID_PATTERNS = (
+    r"\$CONFIG\s*\[\s*['\"]uid['\"]\s*\]\s*=\s*['\"]?(\d{5,})",
+    r"CONFIG\s*\.\s*uid\s*=\s*['\"]?(\d{5,})",
+    r"['\"]uid['\"]\s*:\s*['\"]?(\d{5,})['\"]?\s*,\s*['\"]nick['\"]",
+    r"\$CONFIG\s*\[\s*['\"]oid['\"]\s*\]\s*=\s*['\"]?(\d{5,})",
+)
+
+
+def get_self_uid(cookie: str):
+    """从 weibo.com 首页 HTML 中解析「当前登录账户自己的 UID」。
+
+    背景：微博已把 `/ajax/profile/info` 改为**强制要求 uid 参数** —— 不带 uid 会直接返回
+    HTTP 400 `{"ok":0,"message":"缺少必要参数"}`（2026-09-14 日志实测）。而账户自身的
+    UID 无法从 Cookie 里读出（SUB 是加密串），因此只能从网页端首页的内联 JS 配置里取。
+
+    返回 (uid, 续期后的 cookie)；取不到时 uid 为空串。
+    """
+    try:
+        s = _session(cookie, referer=f"{WEB_BASE}/")
+        s.headers.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+        })
+        r = s.get(f"{WEB_BASE}/", timeout=15)
+        renewed = _merge_cookies(cookie, s)
+        if _looks_not_login(r.status_code, r.text):
+            return "", renewed
+        text = r.text or ""
+        for pat in _SELF_UID_PATTERNS:
+            m = re.search(pat, text)
+            if m:
+                debug(f"从首页解析到账户自身 UID={m.group(1)}", CAT_HTTP)
+                return m.group(1), renewed
+        debug("首页未解析到账户自身 UID（页面结构可能已变化）", CAT_HTTP)
+        return "", renewed
+    except Exception as e:
+        debug(f"解析账户自身 UID 失败：{e}", CAT_HTTP)
+        return "", cookie
+
+
 def _fetch_once(uid: str, cookie: str, page: int, count: int):
     """按「网页端 mymblog → getProfileFeed → 移动端 container」顺序尝试一次。
 
@@ -1013,15 +1214,24 @@ def get_st(cookie: str, uid: str = "") -> str:
     return ""
 
 
-def check_login(cookie: str, uid: str = "") -> dict:
+def check_login(cookie: str, uid: str = "", fallback_uid: str = "") -> dict:
     """检测 Cookie 是否仍处于**真实**登录态，并尝试取回自身 UID 与昵称。
+
+    uid          —— 已知的本账户 UID（有则直接用，省一次首页解析）
+    fallback_uid —— 兜底用的任意监控 UID；仅用于「确认登录」，
+                    不会把它的昵称误当成账户昵称（此时返回 probe_only=True）
 
     【v1.1.1 修复 · 消除「检测正常但抓取全挂」的假阳性】
     旧实现把「Cookie 中存在 XSRF-TOKEN」当作已登录的兜底证据，但：
       - 微博登录态实际由 **SUB** 决定，XSRF-TOKEN 只是 CSRF 令牌；
       - 服务端 session 过期后 SUB 失效，所有数据接口返回 ok=-100 并跳转 login.php，
         而 XSRF-TOKEN **仍残留在客户端 Cookie 里** → 旧逻辑据此判定「已登录」，
-        界面显示正常，实际抓取三种接口全败（与用户反馈现象完全一致）。
+        界面显示正常，实际抓取三种接口全败。
+
+    【v1.1.3 修复 · /ajax/profile/info 已强制要求 uid】
+    微博把该接口改为必须带 uid，不带会返回 HTTP 400
+    `{"ok":0,"message":"缺少必要参数"}`，导致账户检测永远走不到确认分支。
+    现在会先解析账户自身 UID（见 get_self_uid），再依次尝试 uid 候选。
 
     现在的判定顺序（任一环节拿到确定结论即返回）：
       1) 结构性检查：Cookie 里没有 SUB → 必然未登录（直接 cookie_expired）；
@@ -1051,47 +1261,73 @@ def check_login(cookie: str, uid: str = "") -> dict:
                      "Cookie 缺少登录凭证 SUB（未登录或已失效），请重新登录")
 
     # 2) 网页端个人信息接口（与 Cookie 同源，唯一有权判定失效）
+    #    该接口现已强制要求 uid：不带 uid 会返回 400「缺少必要参数」。
     net_err = ""
-    try:
-        s = _session(cookie, referer=f"{WEB_BASE}/")
-        s.headers.update({
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/plain, */*",
-        })
-        params = {"uid": uid} if uid else None
-        r = s.get(f"{WEB_BASE}/ajax/profile/info", params=params, timeout=15)
-        steps.append(f"web.ajax/profile/info → HTTP {r.status_code} · "
-                     f"{(r.text or '')[:100]!r}")
-        if _looks_risk_control(r.status_code, r.text):
-            return _fail("risk_control", f"被微博风控拦截（HTTP {r.status_code}）")
-        j = _safe_json(r)
-        if _looks_not_login(r.status_code, r.text, j):
-            return _fail("cookie_expired",
-                         "微博网页端接口返回未登录（ok=-100 / 登录页），Cookie 已失效，请重新登录")
-        u = _find_user_obj((j or {}).get("data"))
-        if u:
-            steps.append("web.profile/info → 解析到用户对象")
-            return {
-                "ok": True, "login": True, "status": "ok",
-                "uid": str(u.get("id", "")),
-                "screen_name": u.get("name") or u.get("screen_name", ""),
-                "cookie": _merge_cookies(cookie, s),
-                "steps": steps,
-            }
-        # 正向兜底：接口明确返回成功（ok=1 且 data 非空）即视为已登录，
-        # 即便昵称字段结构变化导致解析不出用户对象，也不该判成失效。
-        if isinstance(j, dict) and str(j.get("ok")) == "1" and j.get("data"):
-            steps.append("web.profile/info → ok=1 且 data 非空（昵称未解析出）")
-            return {
-                "ok": True, "login": True, "status": "ok",
-                "uid": uid or "", "screen_name": "",
-                "cookie": _merge_cookies(cookie, s),
-                "steps": steps,
-            }
-        steps.append("web.profile/info → 未解析到用户对象，转移动端确认")
-    except Exception as e:
-        net_err = str(e)
-        steps.append(f"web.profile/info 异常：{e}")
+    candidates = []
+    self_uid = uid
+    if not self_uid:
+        self_uid, cookie = get_self_uid(cookie)
+        if self_uid:
+            steps.append(f"首页解析到账户自身 UID={self_uid}")
+        else:
+            steps.append("首页未解析到账户自身 UID")
+    if self_uid:
+        candidates.append((self_uid, False))
+    if fallback_uid and fallback_uid not in [c[0] for c in candidates]:
+        candidates.append((fallback_uid, True))
+    if not candidates:
+        candidates.append(("", False))
+
+    for target_uid, probe_only in candidates:
+        try:
+            s = _session(cookie, referer=f"{WEB_BASE}/")
+            s.headers.update({
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/plain, */*",
+            })
+            params = {"uid": target_uid} if target_uid else None
+            r = s.get(f"{WEB_BASE}/ajax/profile/info", params=params, timeout=15)
+            steps.append(f"web.ajax/profile/info(uid={target_uid or '空'}"
+                         f"{'·探测' if probe_only else ''}) → HTTP {r.status_code} · "
+                         f"{(r.text or '')[:100]!r}")
+            if _looks_risk_control(r.status_code, r.text):
+                return _fail("risk_control", f"被微博风控拦截（HTTP {r.status_code}）")
+            j = _safe_json(r)
+            if _looks_not_login(r.status_code, r.text, j):
+                return _fail("cookie_expired",
+                             "微博网页端接口返回未登录（ok=-100 / 登录页），Cookie 已失效，请重新登录")
+            u = _find_user_obj((j or {}).get("data"))
+            if u:
+                steps.append("web.profile/info → 解析到用户对象")
+                return {
+                    "ok": True, "login": True, "status": "ok",
+                    # 用监控 UID 探测时，昵称属于对方，不能回填为账户昵称
+                    "uid": "" if probe_only else str(u.get("id", "")),
+                    "screen_name": "" if probe_only else (
+                        u.get("name") or u.get("screen_name", "")),
+                    "probe_only": probe_only,
+                    "self_uid": "" if probe_only else str(u.get("id", "")),
+                    "cookie": _merge_cookies(cookie, s),
+                    "steps": steps,
+                }
+            # 正向兜底：接口明确返回成功（ok=1 且 data 非空）即视为已登录，
+            # 即便昵称字段结构变化导致解析不出用户对象，也不该判成失效。
+            if isinstance(j, dict) and str(j.get("ok")) == "1" and j.get("data"):
+                steps.append("web.profile/info → ok=1 且 data 非空（昵称未解析出）")
+                return {
+                    "ok": True, "login": True, "status": "ok",
+                    "uid": "" if probe_only else (target_uid or ""),
+                    "screen_name": "",
+                    "probe_only": probe_only,
+                    "self_uid": "" if probe_only else (target_uid or ""),
+                    "cookie": _merge_cookies(cookie, s),
+                    "steps": steps,
+                }
+            steps.append("web.profile/info → 未解析到用户对象")
+        except Exception as e:
+            net_err = net_err or str(e)
+            steps.append(f"web.profile/info(uid={target_uid or '空'}) 异常：{e}")
+    steps.append("网页端所有候选 uid 均未确认，转移动端确认")
 
     # 3) 移动端 /api/config —— 仅作正向确认
     #    重要：m.weibo.cn 与 weibo.com 不同源，网页端 Cookie 不会自动带过去，
@@ -1147,8 +1383,11 @@ def check_repost_capability(cookie: str) -> dict:
             "error": "无法获取转发令牌 st（Cookie 可能已失效或无转发权限）"}
 
 
-def diagnose_account(cookie: str, probe_uid: str = "") -> dict:
+def diagnose_account(cookie: str, probe_uid: str = "", self_uid: str = "") -> dict:
     """综合诊断账户：登录态 + **真实抓取能力** + 转发能力。
+
+    probe_uid —— 用于真实抓取探测的 UID（通常取监控列表首个对象）
+    self_uid  —— 已知的本账户 UID（缓存后直接传入，可省掉一次首页解析）
 
     v1.1.1 关键修复：此前只校验「能否登录」「能否拿到 st 令牌」，而二者都可能因
     XSRF-TOKEN 残留而假阳性；用户遇到的是「检测全部正常，但一个微博都抓不到」。
@@ -1157,9 +1396,10 @@ def diagnose_account(cookie: str, probe_uid: str = "") -> dict:
 
     status: ok / cookie_expired / no_repost_perm / risk_control / network_error / unknown
     """
-    login = check_login(cookie)
+    login = check_login(cookie, uid=self_uid, fallback_uid=probe_uid)
     result = {"login": login, "repost": None, "probe": None,
-              "status": login.get("status") or "unknown", "message": ""}
+              "status": login.get("status") or "unknown", "message": "",
+              "self_uid": login.get("self_uid") or self_uid or ""}
 
     if not login.get("ok"):
         st = login.get("status") or "cookie_expired"

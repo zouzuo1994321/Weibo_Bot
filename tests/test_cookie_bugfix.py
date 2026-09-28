@@ -176,6 +176,82 @@ d = wc.diagnose_account(COOKIE, probe_uid="6996654711")
 check("unknown 时以真实抓取裁决 → ok", d.get("status") == "ok",
       f"status={d.get('status')} msg={d.get('message','')}")
 
+print("\n=== 5c. profile/info 强制要求 uid（2026-09-14 日志场景） ===")
+# 日志实测：web.ajax/profile/info → HTTP 400 · '{"ok":0,"message":"缺少必要参数"}'
+HOME_HTML = ('<html><script>var $CONFIG = {};'
+             "$CONFIG['uid']='6996654711';$CONFIG['nick']='茶涧三沫';</script></html>")
+NEED_UID = '{"ok":0,"message":"缺少必要参数"}'
+
+
+def make_uid_scene(self_uid_in_home=True, with_uid_ok=True):
+    def _get(self, url, params=None, timeout=None, **kw):
+        if url.rstrip("/") == "https://weibo.com":
+            return FakeResp(200, HOME_HTML if self_uid_in_home else "<html></html>", None)
+        if "profile/info" in url:
+            has_uid = bool(params and params.get("uid"))
+            if has_uid and with_uid_ok:
+                return FakeResp(200, '{"ok":1}', {
+                    "ok": 1, "data": {"user": {"id": "6996654711", "name": "茶涧三沫"}}})
+            return FakeResp(400, NEED_UID, {"ok": 0, "message": "缺少必要参数"})
+        if "api/config" in url:
+            return FakeResp(200, MOBILE_NOT_LOGIN, {"ok": 0, "data": {"login": False}})
+        if "mymblog" in url:
+            return FakeResp(200, '{"ok":1}', {"ok": 1, "data": {"list": [
+                {"mblog": {"id": "1", "text": "x"}}]}})
+        return FakeResp(200, "", {})
+    return _get
+
+
+requests.Session.get = make_uid_scene()
+r = wc.check_login(COOKIE)
+check("首页解析出自身 UID 后检测通过", r.get("status") == "ok", f"status={r.get('status')}")
+check("正确回填账户昵称", r.get("screen_name") == "茶涧三沫", f"name={r.get('screen_name')}")
+check("正确回填账户 UID", r.get("uid") == "6996654711")
+check("自愈步骤已记录", any("首页解析到账户自身" in s for s in r.get("steps", [])))
+
+# 不带 uid 时接口报 400；若只有监控 UID 兜底 → 能确认登录，但不能把对方昵称当账户昵称
+requests.Session.get = make_uid_scene(self_uid_in_home=False)
+r2 = wc.check_login(COOKIE, fallback_uid="1281071463")
+check("仅用监控 UID 也能确认登录", r2.get("status") == "ok", f"status={r2.get('status')}")
+check("探测模式不回填昵称", r2.get("screen_name") == "", f"name={r2.get('screen_name')!r}")
+check("探测模式标记 probe_only", r2.get("probe_only") is True)
+
+print("\n=== 5d. CA 证书包自愈 ===")
+import ca_bundle  # noqa: E402
+
+status_ok, path_ok = ca_bundle.ensure_ca_bundle()
+check("正常环境证书包可用", status_ok == "ok" and bool(path_ok), f"{status_ok} {path_ok}")
+
+# 模拟 certifi 路径失效（临时目录被清理）：应切到备份
+import tempfile  # noqa: E402
+tmpdir = tempfile.mkdtemp()
+backup = os.path.join(tmpdir, "cacert.pem")
+with open(os.path.join(tmpdir, "cacert.pem"), "w", encoding="utf-8") as f:
+    f.write("fake-ca")
+_orig_where = wc.__dict__.get("_orig_where")
+
+
+class _FakeCertifi:
+    @staticmethod
+    def where():
+        return os.path.join(tmpdir, "__missing__", "cacert.pem")
+
+
+import certifi as _real_certifi  # noqa: E402
+_bak = _real_certifi.where
+_real_certifi.where = _FakeCertifi.where
+try:
+    ca_bundle._backup_path = lambda: backup
+    st, p = ca_bundle.ensure_ca_bundle()
+    check("证书包失效时切到备份", st.startswith("已改用备份证书包"), st)
+    check("备份路径已写入环境变量",
+          os.environ.get("REQUESTS_CA_BUNDLE") == backup)
+finally:
+    _real_certifi.where = _bak
+    os.environ.pop("REQUESTS_CA_BUNDLE", None)
+    os.environ.pop("SSL_CERT_FILE", None)
+    os.environ.pop("CURL_CA_BUNDLE", None)
+
 print("\n=== 6b. Cookie 续期（会话保活） ===")
 
 

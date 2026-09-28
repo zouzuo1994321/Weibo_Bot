@@ -28,7 +28,7 @@ ACCOUNTS_PATH = os.path.join(DATA_DIR, "accounts.json")
 LOG_PATH = os.path.join(DATA_DIR, "app.log")
 
 # 大版本号
-MAJOR_VERSION = "v1.1.2"
+MAJOR_VERSION = "v1.1.3"
 
 # 应用元信息
 APP_NAME = "微博bot小助手"

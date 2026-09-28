@@ -221,6 +221,11 @@ class Api:
         def _worker():
             try:
                 self._run_check_all()
+                # v1.1.4：自动续期 —— 检测合格后，对临近失效的账户滑动续期（会话保活）
+                if get_config().get("auto_renew_cookie", True):
+                    renewed = self.auto_renew_accounts()
+                    if renewed:
+                        info(f"自动续期完成 · 已延长 {len(renewed)} 个账户", CAT_CORE)
             except Exception as e:
                 warn(f"自动账户检测异常：{e}")
 
@@ -240,6 +245,21 @@ class Api:
             pass
         return ""
 
+    def _persist_diag(self, am, acc_id, diag):
+        """把诊断结果（状态 / 昵称 / 自身 UID / 续期 Cookie）写回账户。"""
+        wb = ""
+        login = diag.get("login")
+        if isinstance(login, dict):
+            wb = login.get("screen_name", "")
+        am.set_check_result(acc_id, diag["status"], diag["message"],
+                            wb or None, diag.get("self_uid") or None)
+        # 会话保活：把续期后的 Cookie 写回账户
+        if diag.get("renewed_cookie"):
+            if am.update_cookie(acc_id, diag["renewed_cookie"],
+                                "检测时已自动续期 Cookie（会话保活）"):
+                debug(f"账户 {acc_id} Cookie 已自动续期", CAT_CORE)
+        return diag
+
     def _run_check_all(self):
         am = get_account_manager()
         probe_uid = self._probe_uid()
@@ -248,17 +268,10 @@ class Api:
             if not cookie:
                 am.set_check_result(acc["id"], "unknown", "无 Cookie")
                 continue
-            diag = diagnose_account(cookie, probe_uid=probe_uid)
-            wb = ""
-            login = diag.get("login")
-            if isinstance(login, dict):
-                wb = login.get("screen_name", "")
-            am.set_check_result(acc["id"], diag["status"], diag["message"], wb or None)
-            # 会话保活：把续期后的 Cookie 写回账户
-            if diag.get("renewed_cookie"):
-                if am.update_cookie(acc["id"], diag["renewed_cookie"],
-                                    "检测时已自动续期 Cookie（会话保活）"):
-                    debug(f"账户 {acc['id']} Cookie 已自动续期", CAT_CORE)
+            # v1.1.3：带上已缓存的账户自身 UID，省掉一次首页解析
+            diag = diagnose_account(cookie, probe_uid=probe_uid,
+                                    self_uid=acc.get("wb_uid", ""))
+            self._persist_diag(am, acc["id"], diag)
 
     def check_account(self, acc_id):
         """手动检测单个账户：登录态 + **真实抓取能力** + 转发能力，并回填微博昵称。
@@ -270,16 +283,10 @@ class Api:
         cookie = am.get_cookie(acc_id)
         if not cookie:
             return {"ok": False, "error": "该账户没有可用 Cookie"}
-        diag = diagnose_account(cookie, probe_uid=self._probe_uid())
-        wb = ""
-        login = diag.get("login")
-        if isinstance(login, dict):
-            wb = login.get("screen_name", "")
-        am.set_check_result(acc_id, diag["status"], diag["message"], wb or None)
-        if diag.get("renewed_cookie"):
-            if am.update_cookie(acc_id, diag["renewed_cookie"],
-                                "检测时已自动续期 Cookie（会话保活）"):
-                debug(f"账户 {acc_id} Cookie 已自动续期", CAT_CORE)
+        acc = next((a for a in am.list_accounts() if a["id"] == acc_id), None)
+        diag = diagnose_account(cookie, probe_uid=self._probe_uid(),
+                                self_uid=(acc or {}).get("wb_uid", ""))
+        self._persist_diag(am, acc_id, diag)
         info(f"账户检测 {acc_id}：{diag['status']} - {diag['message']}")
         # 逐步诊断信息写入日志，便于在「运行日志」页定位判定依据（HTTP 状态码 + 响应片段）
         for s in (diag.get("login") or {}).get("steps") or []:
@@ -295,6 +302,86 @@ class Api:
         summary = {a["display_name"]: a["status"] for a in accs}
         info(f"已检测全部账户：{summary}")
         return {"ok": True, "accounts": summary}
+
+    # ---------------- Cookie 续期（v1.1.4） ----------------
+    def _renew_account_cookie(self, am, acc):
+        """对单个账户做一次会话预热（滑动续期），成功则回写续期后的 Cookie。
+
+        返回 True 表示 Cookie 确有变化并已落盘；否则返回 False。
+        """
+        acc_id = acc["id"]
+        cookie = am.get_cookie(acc_id)
+        if not cookie:
+            return False
+        try:
+            from weibo_client import warm_session
+            w = warm_session(cookie, acc.get("wb_uid", ""))
+        except Exception as e:
+            warn(f"账户 {acc_id} 续期预热异常：{e}", CAT_CORE)
+            return False
+        if not w.get("ok"):
+            return False
+        # 只要预热成功就记录一次续期时间，避免短时内重复打扰微博接口
+        am.set_last_renew(acc_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if w.get("cookie") and w["cookie"] != cookie:
+            am.update_cookie(acc_id, w["cookie"],
+                             "会话预热滑动续期（Cookie 已自动延长）")
+            debug(f"账户 {acc_id} Cookie 已滑动续期", CAT_CORE)
+            return True
+        return False
+
+    def auto_renew_accounts(self):
+        """自动续期：对「预测剩余有效期 <= 7 天」且「距上次续期 > 12 小时」的账户滑动续期。
+
+        仅对仍处登录态（cookie 含 SUB）的账户生效；续期即访问一次网页端触发 Set-Cookie，
+        延长 ALF/SUBP，从而减少用户必须手动重新登录的次数。
+        """
+        am = get_account_manager()
+        renewed = []
+        threshold = 7 * 86400
+        min_interval = 12 * 3600
+        now = time.time()
+        for acc in am.list_accounts():
+            cookie = am.get_cookie(acc["id"])
+            if not cookie or "SUB=" not in cookie:
+                continue   # 缺少登录凭证，续期无意义
+            try:
+                from weibo_client import predict_cookie_expiry
+                from account_manager import _ts_from_str
+                exp = predict_cookie_expiry(cookie, last_ok_at_ts=_ts_from_str(acc.get("last_ok_at", "")))
+            except Exception:
+                continue
+            if not exp.get("has_expiry"):
+                continue
+            remaining = exp.get("remaining_seconds", 1e12)
+            if remaining > threshold:
+                continue   # 还很充裕，不必续期
+            # 节流：距上次续期不足 12 小时则跳过
+            last_renew = acc.get("last_renew", "")
+            if last_renew:
+                try:
+                    lr = datetime.strptime(last_renew,
+                                           "%Y-%m-%d %H:%M:%S").timestamp()
+                    if now - lr < min_interval:
+                        continue
+                except Exception:
+                    pass
+            if self._renew_account_cookie(am, acc):
+                renewed.append(acc["display_name"])
+        return renewed
+
+    def renew_account(self, acc_id):
+        """手动续期单个账户：做一次会话预热并回写续期后的 Cookie。"""
+        am = get_account_manager()
+        acc = next((a for a in am.list_accounts() if a["id"] == acc_id), None)
+        if not acc:
+            return {"ok": False, "error": "账户不存在"}
+        ok = self._renew_account_cookie(am, acc)
+        if ok:
+            info(f"账户手动续期成功：{acc['display_name']}")
+            return {"ok": True, "message": "续期成功，Cookie 已滑动延长"}
+        return {"ok": False,
+                "message": "本次未发生变化（或已是最新、续期失败）"}
 
     def add_account(self, remark, cookie):
         ok, msg = get_account_manager().add_account(remark, cookie)

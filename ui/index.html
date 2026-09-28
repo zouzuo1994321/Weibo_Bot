@@ -95,13 +95,18 @@
         <h3 data-page-node-id="2JqDtFX3VEJY2he3TC4LWj">已记录账户（<span id="accCount" data-page-node-id="JY1QOBingicmPADcLOI0jR">0</span>/5）</h3>
         <div class="row" style="margin-bottom:10px;" data-page-node-id="vnAPFfqEwDpXmjQQP8zJYC">
           <button class="ghost" onclick="checkAllAccounts()" data-page-node-id="texXyJBpV9okHQO5P4FjKC">检测全部账户</button>
+          <label class="switch" style="transform:scale(.85); margin:0 2px 0 6px;" data-page-node-id="autoRenewSwitchWrap">
+            <input type="checkbox" id="autoRenewSwitch" onchange="saveAutoRenew()" data-page-node-id="autoRenewSwitch">
+            <span class="slider" data-page-node-id="autoRenewSlider"></span>
+          </label>
+          <span class="muted" style="font-size:12px;" data-page-node-id="autoRenewLabel">自动续期 Cookie（临近失效自动滑动延长）</span>
           <span class="muted" style="font-size:12px;" data-page-node-id="ChdLXLSD3ilusV8UNmI4jv">手动或自动（每 5 分钟）检测：登录态 + 真实抓取 + 转发能力</span>
         </div>
         <p class="help" style="margin:0 0 10px;" data-page-node-id="accStatusHintNode">
-          状态说明：<b>正常</b>=能登录、能抓到微博、能转发；<b>Cookie失效</b>=登录态过期，需删除该账户后重新登录；<b>被风控</b>=请求被微博限流，请调大轮询间隔；<b>网络异常</b>=本机网络或接口超时。软件会在每次成功请求后自动续期 Cookie（会话保活），无需频繁重登。
+          状态说明：<b>正常</b>=能登录、能抓到微博、能转发；<b>Cookie失效</b>=登录态过期，需删除该账户后重新登录；<b>被风控</b>=请求被微博限流，请调大轮询间隔；<b>网络异常</b>=本机网络或接口超时。<b>Cookie 有效期</b>列由 Cookie 中的 ALF/SSOLoginState 时间戳预测「若不再活动，登录态何时失效」，临近（≤7 天）会标黄。<b>自动续期</b>开启后，软件会在每次成功请求时滑动延长 Cookie，并在临近失效时自动续期，无需频繁重登（亦可点「续期」手动触发）。
         </p>
         <table data-page-node-id="DCNzcDn9V9qPGigMWjB6Xz">
-          <thead data-page-node-id="shryF0UBPBXkTG2TOeTYGw"><tr data-page-node-id="1LSfnF8Gcvb5uiCOvU3njk"><th data-page-node-id="F5oBU0qB9CWkvmt2cuJILT">昵称（备注）</th><th data-page-node-id="8X8JmZFa69JNusz0TE8GR9">添加时间</th><th data-page-node-id="g3HWSMjqFxzzfhnzOuHxHQ">最近使用</th><th data-page-node-id="1U4Y1NgJrTEgmDrsAD3uHs">状态</th><th data-page-node-id="0VBGsv2Mk3Ycln8sGozWAx">检测时间</th><th data-page-node-id="kLcx52uqrQW5zEG5IdsbGO">操作</th></tr></thead>
+          <thead data-page-node-id="shryF0UBPBXkTG2TOeTYGw"><tr data-page-node-id="1LSfnF8Gcvb5uiCOvU3njk"><th data-page-node-id="F5oBU0qB9CWkvmt2cuJILT">昵称（备注）</th><th data-page-node-id="8X8JmZFa69JNusz0TE8GR9">添加时间</th><th data-page-node-id="g3HWSMjqFxzzfhnzOuHxHQ">最近使用</th><th data-page-node-id="1U4Y1NgJrTEgmDrsAD3uHs">状态</th><th data-page-node-id="expCol">Cookie 有效期</th><th data-page-node-id="0VBGsv2Mk3Ycln8sGozWAx">检测时间</th><th data-page-node-id="kLcx52uqrQW5zEG5IdsbGO">操作</th></tr></thead>
           <tbody id="accList" data-page-node-id="eGSa67wmw8KLQzXXUURM2r"></tbody>
         </table>
       </div>

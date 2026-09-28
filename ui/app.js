@@ -58,6 +58,7 @@ async function loadState() {
   copyLabel.onclick = () => apiCall("open_external", "https://github.com/zouzuo1994321/Weibo_Bot");
   renderOverview();
   renderAccounts();
+  syncAutoRenew();
   renderMonitors();
   renderForward();
   renderAI();
@@ -183,19 +184,35 @@ function accountStatusTag(a) {
   return `<span class="tag ${meta.cls}"${detail}>${meta.text}</span>`;
 }
 
+function cookieExpiryCell(a) {
+  const e = a.cookie_expiry;
+  if (!e || !e.has_expiry) {
+    return `<td><div class="cookie-exp none"><div class="ce-date">—</div><div class="ce-remain">无法预测</div></div></td>`;
+  }
+  if (e.expired) {
+    return `<td><div class="cookie-exp expired"><div class="ce-date">${esc(e.expiry_str)}</div><div class="ce-remain">已过期</div></div></td>`;
+  }
+  const lvl = e.level === "warn" ? "warn" : "safe";
+  return `<td><div class="cookie-exp ${lvl}" title="失效时间：${esc(e.expiry_str)}（来源 ${esc(e.source||"")}）">
+      <div class="ce-date">${esc(e.expiry_str)}</div>
+      <div class="ce-remain">${esc(e.remaining_text || "")}</div>
+    </div></td>`;
+}
+
 function renderAccounts() {
   const list = STATE.accounts;
   document.getElementById("accCount").textContent = list.length;
   const tb = document.getElementById("accList");
-  if (!list.length) { tb.innerHTML = `<tr><td colspan="6" class="empty">暂无账户，请先登录并添加</td></tr>`; return; }
+  if (!list.length) { tb.innerHTML = `<tr><td colspan="7" class="empty">暂无账户，请先登录并添加</td></tr>`; return; }
   tb.innerHTML = list.map(a => `
     <tr>
       <td>${esc(a.display_name || a.remark || "未命名账户")}</td>
       <td class="muted">${esc(a.created_at)}</td>
       <td class="muted">${esc(a.last_used || "—")}</td>
       <td>${accountStatusTag(a)}</td>
+      ${cookieExpiryCell(a)}
       <td class="muted">${esc(a.last_check || "—")}</td>
-      <td><button class="small" onclick="checkAccount('${a.id}')">检测</button> <button class="small danger" onclick="removeAccount('${a.id}')">删除</button></td>
+      <td><button class="small" onclick="checkAccount('${a.id}')">检测</button> <button class="small ghost" onclick="renewAccount('${a.id}')">续期</button> <button class="small danger" onclick="removeAccount('${a.id}')">删除</button></td>
     </tr>`).join("");
 }
 
@@ -234,6 +251,27 @@ async function addAccount() {
 async function removeAccount(id) {
   await apiCall("remove_account", id);
   toast("已删除账户"); await loadState();
+}
+
+async function renewAccount(id) {
+  toast("正在续期该账户 Cookie（会话预热）…");
+  const r = await apiCall("renew_account", id);
+  if (r.ok) toast(r.message || "续期成功", "ok");
+  else toast(r.message || r.error || "续期失败", "err");
+  await loadState();
+}
+
+/* 自动续期开关：从 STATE.config 同步 UI，并保存用户切换 */
+async function syncAutoRenew() {
+  const el = document.getElementById("autoRenewSwitch");
+  if (!el) return;
+  el.checked = !!(STATE && STATE.config && STATE.config.auto_renew_cookie);
+}
+async function saveAutoRenew() {
+  const el = document.getElementById("autoRenewSwitch");
+  const v = !!(el && el.checked);
+  await apiCall("save_config", JSON.stringify({ auto_renew_cookie: v }));
+  toast(v ? "已开启自动续期 Cookie" : "已关闭自动续期 Cookie", "ok");
 }
 
 async function openBuiltinLogin() {

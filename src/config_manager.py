@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
     "forward_time_jitter": True,     # 转发时间在工作时段内随机偏移（避免固定时刻批量转发）
     "poll_jitter_ratio": 0.15,       # 轮询间隔 / 转发延后 抖动比例（±15%）
     "max_accounts": 5,               # 最多记录账户数
+    "auto_renew_cookie": True,       # 自动续期 Cookie：临近失效时自动滑动延长（会话保活）
     "forward_mode": "random_one",    # 转发模式：random_one 随机一条
     "monitor_auto_refresh": {        # 监控列表自动刷新昵称/状态
         "enabled": False,

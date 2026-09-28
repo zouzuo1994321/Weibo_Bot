@@ -50,6 +50,34 @@ def _decrypt(token: str) -> str:
         return ""
 
 
+def _ts_from_str(s: str) -> int:
+    """把 'YYYY-MM-DD HH:MM:SS' 解析为 Unix 秒；失败返回 0。"""
+    if not s:
+        return 0
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
+    except Exception:
+        return 0
+
+
+def _predict_expiry(encrypted_cookie: str, last_ok_at_ts: int = 0) -> dict:
+    """解密后预测 Cookie 失效时间（供 list_accounts 脱敏输出）。
+
+    解析 / 续期相关逻辑在 weibo_client，这里只做安全封装：任何异常都返回空预测，
+    不影响账户列表正常渲染。
+    """
+    if not encrypted_cookie:
+        return {"has_expiry": False, "expired": False, "level": "unknown"}
+    try:
+        from weibo_client import predict_cookie_expiry
+        cookie = _decrypt(encrypted_cookie)
+        if not cookie:
+            return {"has_expiry": False, "expired": False, "level": "unknown"}
+        return predict_cookie_expiry(cookie, last_ok_at_ts=last_ok_at_ts)
+    except Exception:
+        return {"has_expiry": False, "expired": False, "level": "unknown"}
+
+
 class AccountManager:
     def __init__(self):
         self.accounts = []
@@ -62,6 +90,15 @@ class AccountManager:
                     self.accounts = json.load(f)
             except Exception:
                 self.accounts = []
+        # 迁移：补齐 last_ok_at 字段（旧数据没有）
+        changed = False
+        for a in self.accounts:
+            if "last_ok_at" not in a:
+                # 优先用最近续期/使用时间，最后退化为创建时间，作为「最近成功活动」估计
+                a["last_ok_at"] = a.get("last_renew") or a.get("last_used") or a.get("created_at", "")
+                changed = True
+        if changed:
+            self.save()
         return self.accounts
 
     def save(self):
@@ -85,6 +122,7 @@ class AccountManager:
             "id": uuid.uuid4().hex[:12],
             "remark": remark or f"账户{len(self.accounts)+1}",
             "wb_nickname": "",   # 从 Cookie 读取到的微博昵称（检测/登录后回填）
+            "wb_uid": "",        # 账户自身 UID（v1.1.3：profile/info 已强制要求 uid，缓存后免解析首页）
             "cookie": _encrypt(cookie.strip()),
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "last_used": "",
@@ -92,6 +130,8 @@ class AccountManager:
             "status": "unknown",        # unknown / ok / cookie_expired / no_repost_perm
             "last_check": "",
             "check_detail": "",
+            "last_renew": "",          # 最近一次 Cookie 续期时间（滑动续期/自动续期回写）
+            "last_ok_at": "",          # 最近一次「成功活动」时间（成功检测/续期/使用），用于 7 天窗口滑动
         }
         self.accounts.append(acc)
         self.save()
@@ -122,6 +162,7 @@ class AccountManager:
                 "id": a["id"],
                 "remark": remark,
                 "wb_nickname": wb,
+                "wb_uid": a.get("wb_uid", ""),
                 "display_name": display,
                 "created_at": a.get("created_at", ""),
                 "last_used": a.get("last_used", ""),
@@ -129,18 +170,26 @@ class AccountManager:
                 "status": a.get("status", "unknown"),
                 "last_check": a.get("last_check", ""),
                 "check_detail": a.get("check_detail", ""),
+                "last_renew": a.get("last_renew", ""),
+                "last_ok_at": a.get("last_ok_at", ""),
+                "cookie_expiry": _predict_expiry(a.get("cookie", ""), _ts_from_str(a.get("last_ok_at", ""))),
             })
         return out
 
-    def set_check_result(self, acc_id: str, status: str, detail: str, wb_nickname: str = None):
-        """记录账户健康检测结果，可选回填微博昵称。"""
+    def set_check_result(self, acc_id: str, status: str, detail: str,
+                         wb_nickname: str = None, wb_uid: str = None):
+        """记录账户健康检测结果，可选回填微博昵称与账户自身 UID。"""
         for a in self.accounts:
             if a["id"] == acc_id:
                 a["status"] = status
                 a["check_detail"] = detail
                 a["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if status == "ok":
+                    a["last_ok_at"] = a["last_check"]
                 if wb_nickname:
                     a["wb_nickname"] = wb_nickname
+                if wb_uid:
+                    a["wb_uid"] = wb_uid
                 self.save()
                 return True
         return False
@@ -166,6 +215,7 @@ class AccountManager:
             if _decrypt(a.get("cookie", "")) == new_cookie.strip():
                 return False
             a["cookie"] = _encrypt(new_cookie.strip())
+            a["last_ok_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if reason:
                 a["check_detail"] = reason
             self.save()
@@ -176,8 +226,18 @@ class AccountManager:
         for a in self.accounts:
             if a["id"] == acc_id:
                 a["last_used"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                a["last_ok_at"] = a["last_used"]
                 self.save()
                 return
+
+    def set_last_renew(self, acc_id: str, ts: str):
+        """记录该账户最近一次 Cookie 续期时间（自动/手动滑动续期回写）。"""
+        for a in self.accounts:
+            if a["id"] == acc_id:
+                a["last_renew"] = ts
+                self.save()
+                return True
+        return False
 
 
 _manager = None
