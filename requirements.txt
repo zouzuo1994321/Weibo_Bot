@@ -1,14 +1,26 @@
-# 微博bot小助手 运行与打包依赖
+# 微博bot小助手 运行时依赖（Python 3.13，Windows）
 # 安装：pip install -r requirements.txt
-pywebview>=6.0          # 原生窗口（Edge WebView2 内核），不依赖外部浏览器
-requests>=2.28          # HTTP 请求（微博接口）
-jieba>=0.42             # 中文分词（AI 轻量生成器关键词抽取 / 规则引擎）
-Pillow>=10.0            # 图片处理（历史存档）
-cryptography>=42.0      # Cookie 本地加密存储
-PyInstaller>=6.0        # 打包为独立 exe
-# 本地离线大模型引擎（AI 增强转发「主路线」）：llama.cpp 的 Python 绑定，全离线推理
-# 安装需从预编译 wheel 索引获取（避免源码编译）：
-#   pip install llama-cpp-python==0.3.35 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-llama-cpp-python==0.3.35
-numpy>=1.20             # llama-cpp-python 依赖
-openpyxl>=3.1            # 导出 XLSX（历史记录导出格式之一）
+# 说明：仅「自己打包 exe」才需要额外安装 PyInstaller（构建脚本默认调用项目 venv，已内置）。
+
+# —— 窗口 / 托盘 ——
+pywebview==6.2.1          # 原生窗口（Edge WebView2 内核）；Windows 后端依赖 pythonnet，pip 会自动带上
+pystray==0.19.5           # 系统托盘
+
+# —— 图像 / 导出 ——
+pillow==12.3.0            # 图片处理（缩略图 / 头像 / 图标）
+openpyxl==3.1.5           # 历史记录导出 XLSX
+
+# —— 网络 / 安全 ——
+requests==2.34.2          # 微博接口请求（本地回环走无代理通道）
+cryptography==50.0.1      # 账户 Cookie 本地加密存储
+certifi==2026.7.22        # CA 证书包（exe 内自愈，见 ca_bundle.py）
+
+# —— 内置离线 AI ——
+jieba==0.42.1             # 内置引擎分词 + 人格模板 + 意图识别
+
+# —— 本地 llama.cpp 引擎（仅当使用 local_gguf 主/备路线时需要；用不到可整行注释掉）——
+llama_cpp_python==0.3.35  # GGUF 模型推理（首次启用自动下载 Qwen2.5-1.5B，约 1GB）
+
+# —— 系统负载监控 ——
+psutil==7.2.2             # CPU / 内存 / 网络
+nvidia-ml-py==13.615.71   # NVIDIA 显卡占用与温度（模块名 pynvml；无 N 卡会自动跳过）
