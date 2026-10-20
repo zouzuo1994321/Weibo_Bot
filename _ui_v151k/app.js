@@ -412,29 +412,44 @@ function _openGroupOf(view) {
 }
 
 /* 【v1.4.12】侧栏高亮滑块：把 #navHighlight 平滑移动到目标行上。
-   · top / height 用目标行相对 #sidebar 内容盒的 offset 计算（含滚动补偿）；
-   · 平滑移动交给 CSS transition（transform: translateY + height）。
-   【v1.4.13】同时按目标行类型切换竖条位置：子项（.sub）竖条在 22px
-   （与缩进导轨线对齐），顶级项 / 分组标题在 x=0。用 #navHighlight.sub 承载。
+   · top / height 用目标行相对 #sidebar 内容盒的 offset 计算（含滚动补偿）。
+   【v1.5.5】「划动感」重写（参照 Win11 设置录屏：划过去、不是跳过去）：
+   · 横纵位移全部走 transform —— JS 传 translate(x, y)：顶级项/分组头 x=0，
+     子项 x=22（竖条与底块一起右移，与缩进导轨线对齐）。跨级切换时横向也平滑
+     滑移，不再瞬移；transform 走 GPU 合成，纵向往复滑动不掉帧。
+   · 时长随距离自适应（0.22s~0.52s）：微软 connected animation 手感——
+     跳得越远、滑得越久；缓动 cubic-bezier(.3,.05,.2,1) 先缓启后缓收，
+     读起来是「划」而非「弹」。
+   · 指示条（CSS ::before）为固定 16px 短条，随滑块整体滑移、大小恒定；
+     v1.5.3/v1.5.4 的 scaleY 生长与弹跳过冲已移除——那正是「跳过去」感的来源。
    首次定位（_navHiReady 为 false）时关掉过渡直接落位，避免从 y=0 滑过来。 */
 let _navHiReady = false;
+let _navHiX = 0, _navHiY = 0;   /* 滑块当前所在位置（供距离自适应时长计算） */
 function moveNavHighlight(el, animate) {
   const hi = document.getElementById("navHighlight");
   const side = document.getElementById("sidebar");
   if (!hi || !side || !el) return;
   const top = el.offsetTop;
   const h = el.offsetHeight;
+  const x = el.classList.contains("sub") ? 22 : 0;   /* 子项右移 22px 与导轨线对齐 */
   const first = !_navHiReady;
-  if (first || animate === false) hi.style.transition = "none";
-  hi.style.height = h + "px";
-  hi.style.transform = "translateY(" + top + "px)";
-  /* 竖条位置跟随行类型：子项 → 22px（导轨线处），其余 → 0 */
-  hi.classList.toggle("sub", el.classList.contains("sub"));
   if (first || animate === false) {
-    // 强制回流后再恢复过渡，确保「落位」这一帧不产生动画
-    void hi.offsetHeight;
-    hi.style.transition = "";
+    /* 落位：关过渡直接设定，避免首帧从原点滑入 */
+    hi.style.transition = "none";
+    hi.style.transform = "translate(" + x + "px," + top + "px)";
+    hi.style.height = h + "px";
+    void hi.offsetHeight;          /* 强制回流，使上面的「无过渡赋值」整批生效 */
+    hi.style.transition = "";      /* 恢复 CSS 过渡（属性/缓动/默认时长） */
+    _navHiX = x; _navHiY = top;
     _navHiReady = true;
+  } else {
+    /* 距离自适应时长：纵向差 + 横向差共同决定，近距离轻快、远距离舒展 */
+    const dist = Math.abs(top - _navHiY) + Math.abs(x - _navHiX);
+    const dur = Math.min(0.52, Math.max(0.22, 0.2 + dist * 0.0011));
+    hi.style.transitionDuration = dur.toFixed(3) + "s";
+    hi.style.transform = "translate(" + x + "px," + top + "px)";
+    hi.style.height = h + "px";
+    _navHiX = x; _navHiY = top;
   }
   hi.classList.add("on");
 }
@@ -3141,6 +3156,38 @@ function renderAbout() {
    数据内嵌于前端，保证离线可用（本软件为单机离线运行）。
    与 README.md「版本迭代记录」保持同步维护。 */
 const CHANGELOG = [
+  {
+    ver: "v1.5.5", internal: "2610160004", date: "2026-10-16",
+    title: "侧栏选中动效重做为「划动感」（参照 Win11 设置录屏）",
+    items: [
+      "【要划过去、不要跳过去】对照 Windows 11 设置应用录屏逐帧分析后重做：参考实现中左侧指示条是**大小恒定、连续滑移**到新行的。上两版的 scaleY 生长（v1.5.3）与弹跳过冲（v1.5.4）读起来就是「跳」，已全部移除——现在竖条为固定 16px 短条，随高亮块整体平滑滑到新行。",
+      "【位移全走 transform】横纵位移合并进 translate(x,y)：顶级项 x=0、子项 x=22（与缩进导轨线对齐），跨级切换时竖条与底块一起平滑右移，不再瞬移；transform 走 GPU 合成，滑动不掉帧。",
+      "【时长随距离自适应】0.22s~0.52s——跳得越远、滑得越久（微软 connected animation 手感）；缓动改 cubic-bezier(.3,.05,.2,1) 先缓启后缓收。行高有差的跨行切换还会平滑伸缩底块高度，不断裂。"
+    ]
+  },
+  {
+    ver: "v1.5.4", internal: "2610160003", date: "2026-10-16",
+    title: "侧栏选中动效流畅度优化（GPU 合成 + 指示条弹入）",
+    items: [
+      "【修复切换卡顿】上版把 height / left 也放进了 #navHighlight 的过渡——二者是布局属性，每帧触发重排，是「卡卡」的根因。现过渡只保留 transform / opacity（合成器属性、走 GPU 不掉帧），并加 will-change: transform；height / left 改由 JS 与类切换即时设定（同级切换时本就不变，纯 translateY 丝滑）。",
+      "【过渡更明显】指示条每次切换重放「弹入」动画（.pop：从中心 scaleY 生长、略带过冲后落定），配合 0.34s 的药丸滑动，切换反馈更清晰、更有微软 NavigationView 质感。"
+    ]
+  },
+  {
+    ver: "v1.5.3", internal: "2610160002", date: "2026-10-16",
+    title: "侧栏选中指示条改微软风（短条圆角居中 + 生长淡入）",
+    items: [
+      "【侧栏选中指示条改微软风】上版（v1.5.2）把左侧指示条改成通高、从中心生长，观感仍偏旧。现按 Windows 11 NavigationView 风格重做：指示条改为**短条（约 16px）、圆角、垂直居中**（不再通高实心竖线），落位时从中心生长 + 淡入；选中块为全圆角药丸，切换滑动用 Fluent ease-out（0.3s cubic-bezier(.2,0,0,1)），更贴近微软设置 / 资源管理器的导航动效。"
+    ]
+  },
+  {
+    ver: "v1.5.2", internal: "2610160001", date: "2026-10-16",
+    title: "首启向导选目录修复 + 侧栏动效微软化",
+    items: [
+      "【修复首启向导「浏览…」选完文件夹后路径不更新】根因：旧实现手搓 ctypes SHBrowseForFolderW，在 js_bridge 调用线程上同步弹模态框，部分机器上该线程已是 MTA / 被 WebView2 UI 线程占用，对话框虽能弹、能选、能确认，但函数返回后结果回传 JS 的链路被饿死，apiCall 的 Promise 永不 resolve，前端输入框 value 永远不被赋值——表现为「选完确认了但路径框不变」。现优先改用 pywebview 官方 create_file_dialog(FOLDER_DIALOG)（导出功能一直用它、线程模型由 pywebview 处理、且是现代 Windows 选择文件夹 UI），官方接口不可用时再回退 ctypes 实现；存储管理页「浏览…」一并受益。",
+      "【侧栏动效微软化】选中高亮块改为圆角药丸（不再直角），切换缓动换成 Fluent 的 ease-out（cubic-bezier(.2,0,0,1)，起步快、收尾缓）；左侧强调竖条改为独立伪元素、做「从中心生长」的入场动画（Windows 11 标志性 indicator grow）；顶级项悬停底色也收为圆角，整体更贴近微软设置 / 资源管理器的导航手感。"
+    ]
+  },
   {
     ver: "v1.5.1", internal: "2610140005", date: "2026-10-14",
     title: "修复转发卡进度环生长期高光 + 轮询进度条间歇不显示（两个偶发 BUG）",

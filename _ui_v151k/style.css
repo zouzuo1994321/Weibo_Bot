@@ -82,7 +82,7 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 /* 【v1.4.12】行内不再画 3px 选中竖条（改由 #navHighlight 滑块承担），
    因此 padding 左侧不再需要为 border 预留；各行宽度严格等于侧栏宽度，
    滑块 left:0/right:0 才能与目标行完全对齐。 */
-.nav-item:hover { background-color: rgba(255,130,0,.08); color: var(--text); border-radius: 0; }
+.nav-item:hover { background-color: rgba(255,130,0,.08); color: var(--text); border-radius: 6px; }
 .nav-item.active { color: var(--accent); border-radius: 0; }
 #sidebar .foot { margin-top: auto; padding: 12px 18px; color: var(--text-dim); font-size: 11px; line-height: 1.5; }
 /* v1.1.9k：侧栏底部的「最小化到托盘」已移动到「系统概览 → 调度状态」按钮行。
@@ -1366,37 +1366,45 @@ th.col-chk { text-align: center; }
    ================================================================== */
 /* 【v1.4.12】侧栏高亮滑块（滑动动效）：
    用一个绝对定位的 #navHighlight 充当所有行的「选中高亮块」，
-   切换时靠 transform: translateY 平滑移动 —— 高亮块整体从旧位置滑到新位置，
+   切换时靠 transform: translate(x,y) 平滑移动 —— 高亮块整体从旧位置滑到新位置，
    而不是旧块淡出、新块淡入。
-   【v1.4.13】竖条位置按行类型分置：
-   · 子项（.sub）—— 竖条画在 22px 处，与子项缩进导轨线重合（用户指定位置）；
-   · 顶级项 / 分组标题 —— 竖条仍在侧栏最左 x=0。
-   做法：竖条不用 border-left（border 会占进内容盒、且位置固定在左缘），
-   改用 background-image 渐变画在 --bar-x 处。
-   【v1.4.14】底块左边界也跟随 --bar-x —— 子项时底块从 22px 起铺到右缘
-   （原先从 x=0 起，竖条左侧会多出一块橙色，看起来像粘了块色斑）。
-   left: var(--bar-x) + right:0 让「竖条 + 底块」作为一个整体右移。 */
+   【v1.5.5】参照 Win11 设置录屏重做「划动感」（用户反馈：要划过去、不要跳过去）：
+   · 竖条（::before）为固定 16px 短条、圆角、垂直居中，随滑块整体滑移，
+     不做任何缩放/弹跳 —— 参考实现中竖条大小恒定、平滑滑到新行；
+     缩放过冲（v1.5.3 生长 / v1.5.4 弹入）正是「跳过去」感的来源，已全部移除；
+   · 横纵位移全部并入 transform（JS 传 translate(x,y)）：顶级项 x=0、子项 x=22，
+     跨级切换时竖条与底块一起平滑右移 22px（与缩进导轨线对齐），不再瞬移；
+   · 过渡时长由 JS 按移动距离自适应（0.22s~0.52s），缓动 cubic-bezier(.3,.05,.2,1)
+     先缓启、后缓收，复刻微软 connected animation「跳得越远、滑得越久」的手感。 */
 #navHighlight {
-  position: absolute; left: var(--bar-x, 0px); right: 0; top: 0;
-  height: 0;                                   /* 由 JS 按目标行高度设定 */
-  --bar-x: 0px;                                /* 竖条 / 底块左边界横向位置（子项 22px） */
+  position: absolute; left: 0; right: 0; top: 0;
+  height: 0;                                   /* 由 JS 按目标行高度设定（参与过渡，随行高差平滑伸缩） */
   background-color: rgba(255,130,0,.12);
-  background-image: linear-gradient(var(--accent), var(--accent));
-  background-size: 3px 100%;
-  background-position: 0 0;                    /* 竖条贴住底块左缘（底块自身已右移） */
-  background-repeat: no-repeat;
+  border-radius: 6px;                          /* 微软风：选中块做成圆角药丸，不再直角 */
   pointer-events: none;                        /* 不吃鼠标事件，点击穿透到行本身 */
   opacity: 0;
-  transform: translateY(0);
-  transition: transform .3s cubic-bezier(.22,.61,.36,1),
-              height .22s ease,
-              opacity .18s ease,
-              left .3s cubic-bezier(.22,.61,.36,1);
+  transform: translate(0, 0);
+  /* transform 走 GPU 合成不掉帧；height 虽是布局属性，但本元素绝对定位、无在流
+     子节点，每帧布局仅限自身，开销可忽略（三类行高有差，伸缩必须连续才不断裂）。
+     具体时长由 JS 按距离自适应覆盖（transitionDuration）。 */
+  transition: transform .32s cubic-bezier(.3,.05,.2,1),
+              height .32s cubic-bezier(.3,.05,.2,1),
+              opacity .16s ease;
+  will-change: transform, opacity;
   z-index: 0;
 }
-/* 子项选中：竖条与底块左边界一起移到缩进导轨线位置（22px），与子项文字缩进对齐 */
-#navHighlight.sub { --bar-x: 22px; }
-/* 滑块就绪（已定位到某行）后淡入，避免首帧从 y=0 滑过来 */
+/* Windows 11 风格选中指示条：固定 16px 短条、圆角、垂直居中（不再通高实心竖线）。
+   【v1.5.5】大小恒定，仅随滑块整体滑移 + 淡入；不做 scaleY 生长/弹跳。 */
+#navHighlight::before {
+  content: ""; position: absolute; left: 0; top: 50%;
+  width: 3px; height: 16px; background: var(--accent);
+  border-radius: 3px;
+  transform: translateY(-50%);
+  opacity: 0;
+  transition: opacity .2s ease;
+}
+#navHighlight.on::before { opacity: 1; }
+/* 滑块就绪（已定位到某行）后淡入，避免首帧从原点滑过来 */
 #navHighlight.on { opacity: 1; }
 /* 侧栏所有行必须浮在滑块之上，否则会被半透明底块盖住点击区域 */
 #sidebar .nav-item,

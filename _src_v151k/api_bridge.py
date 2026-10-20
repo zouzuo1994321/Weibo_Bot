@@ -2460,18 +2460,18 @@ class Api:
     def pick_storage_dir(self, which="image_dir"):
         """弹出系统文件夹选择框，让用户挑一个目录。
 
-        【v1.2.3 关键修复】原先用 tkinter.filedialog.askdirectory，
-        但本项目用的 managed Python 3.13 **没有编译 tkinter**，
-        一调就抛 `No module named 'tkinter'` → 前端只看到报错 toast，
-        永远弹不出选择框（用户实测反馈）。
+        【v1.5.2 修复 · 首启向导「浏览…」选完文件夹后路径不更新】
+          旧实现手搓 ctypes SHBrowseForFolderW：在 js_bridge 调用线程上同步
+          弹模态框，依赖手动 CoInitializeEx(STA)。在部分机器上该线程已是 MTA、
+          或被 WebView2 UI 线程占用，导致对话框虽能弹、能选、能点确定，但函数
+          返回后 pywebview 把结果回传 JS 的链路被饿死 → apiCall 的 Promise
+          永不 resolve → 前端 el.value 永远不被赋值，表现为「选完确认了但路径
+          框不变」。
 
-        改为直接调 Windows 原生 `SHBrowseForFolderW`（纯 ctypes，
-        零第三方依赖、零子进程、毫秒级），并带 BFFM_INITIALIZED
-        回调把初始目录定位到当前生效路径。为什么不改用 pywebview 的
-        `window.create_file_dialog(FOLDER_DIALOG)`：当前版本的
-        EdgeChromium 后端没有实现该方法（会直接 AttributeError），
-        且 js_bridge 调用本身跑在 WebView2 的 UI 线程上，在那里
-        再同步等一个模态对话框有死锁风险。
+          改为优先使用 pywebview 官方 create_file_dialog(FOLDER_DIALOG)：它走
+          WebView2 原生 IFileDialog，线程模型由 pywebview 自己处理（导出功能
+          一直用它、稳定可靠），且是现代 Windows 选择文件夹 UI（更贴近微软风格）。
+          官方接口不可用时（个别后端未实现 / 抛异常）再回退到 ctypes 实现。
         """
         try:
             from paths import (get_history_dir, get_image_dir,
@@ -2480,11 +2480,39 @@ class Api:
                 which = "image_dir"
             cur = {"image_dir": get_image_dir, "media_dir": get_media_dir,
                    "models_dir": get_models_dir, "history_dir": get_history_dir}[which]()
-            p = _native_pick_folder("选择目录", cur)
+            p = self._pick_save_dir(cur)
             return {"ok": True, "path": p or ""}
         except Exception as e:
             warn("pick_storage_dir 失败：%s" % e)
             return {"ok": False, "error": f"无法打开目录选择框：{e}"}
+
+    def _pick_save_dir(self, initial=""):
+        """选目录：优先 pywebview 官方对话框，失败回退 ctypes。
+
+        返回用户选中的绝对路径；取消 / 出错返回 ""。
+        """
+        init = ""
+        try:
+            if initial and os.path.isdir(initial):
+                init = os.path.abspath(initial)
+        except Exception:
+            init = ""
+        # 1) 官方 IFileDialog（线程安全、不阻塞 UI 线程、Windows 现代风格）
+        try:
+            import webview
+            dlg = getattr(webview.windows[0], "create_file_dialog", None) \
+                if webview.windows else None
+            if dlg is not None:
+                folder = dlg(webview.FOLDER_DIALOG, directory=(init or ""))
+                if folder:
+                    return folder if isinstance(folder, str) else folder[0]
+        except Exception as e:
+            warn("create_file_dialog 不可用，回退 SHBrowseForFolderW：%s" % e)
+        # 2) 回退：ctypes SHBrowseForFolderW
+        try:
+            return _native_pick_folder("选择目录", init)
+        except Exception:
+            return ""
 
     def open_storage_dir(self, which="image_dir"):
         """在资源管理器里打开某个目录。"""

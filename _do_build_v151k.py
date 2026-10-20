@@ -134,6 +134,7 @@ def write_spec():
                 return
     except FileNotFoundError:
         pass
+    os.makedirs(os.path.dirname(SPEC_PATH), exist_ok=True)
     with open(SPEC_PATH, "w", encoding="utf-8", newline="\n") as f:
         f.write(spec)
     print("wrote %s" % SPEC_PATH)
@@ -141,7 +142,7 @@ def write_spec():
 
 def main():
     internal = read_internal()
-    print("开始 v1.5.1 打包（UI=%s，修复两个偶发 BUG：进度环生长期高光 + 轮询进度条间歇不显示）…"
+    print("开始 v1.5.5 打包（UI=%s，侧栏选中动效重做：划动感——位移全走 transform + 时长距离自适应 + 去弹跳）…"
           % os.path.join(ROOT, "_ui_v151k"))
     sync_changelog(internal)
     write_spec()
