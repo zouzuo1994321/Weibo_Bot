@@ -27,6 +27,60 @@ MANIFEST = os.path.join(ROOT, "_manifest_v151j.xml")
 ICON = os.path.join(ROOT, "logo.ico")
 PY = r"C:\Users\zouzu\.workbuddy\binaries\python\envs\weibobot\Scripts\python.exe"
 
+# 【v1.5.8】构建期 JS 语法门禁。
+# 事故：v1.5.7 往 CHANGELOG 里写文档字符串时带了一个未转义的双引号，
+# app.js 整体解析失败 → 前端一行都不执行 → 永远停在「正在启动界面…」。
+# Python 侧编译、导入、29 项基准测试全部照常通过（没人检查 .js），
+# 于是错误一路进了 exe。这里在打包前强制 `node --check`。
+NODE_CANDIDATES = [
+    os.environ.get("NODE_EXE", ""),
+    r"C:\Users\zouzu\.workbuddy\binaries\node\versions\22.22.2-6\node.exe",
+    "node",
+]
+
+
+def _find_node():
+    for p in NODE_CANDIDATES:
+        if not p:
+            continue
+        if os.path.isabs(p):
+            if os.path.exists(p):
+                return p
+        else:
+            from shutil import which
+            hit = which(p)
+            if hit:
+                return hit
+    return None
+
+
+def check_ui_syntax():
+    """对 _ui_v151k 下所有 .js 做语法校验；失败直接中止构建。"""
+    node = _find_node()
+    if not node:
+        print("UI_SYNTAX_SKIP 未找到 node.exe —— 前端语法未经校验，存在构建出错风险")
+        return
+    targets = []
+    for root, _d, files in os.walk(os.path.join(ROOT, "_ui_v151k")):
+        for fn in files:
+            if fn.endswith(".js"):
+                targets.append(os.path.join(root, fn))
+    bad = []
+    for p in targets:
+        r = subprocess.run([node, "--check", p], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            bad.append((p, (r.stderr or "").strip().splitlines()[:6]))
+    if bad:
+        print("UI_SYNTAX_FAIL —— 前端语法错误，已中止打包：")
+        for p, lines in bad:
+            print("  · %s" % os.path.relpath(p, ROOT))
+            for l in lines:
+                print("      %s" % l)
+        sys.exit(2)
+    print("UI_SYNTAX_OK (%d 个 js 文件)" % len(targets))
+
+
 SPEC_TEMPLATE = '''# -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
@@ -142,8 +196,9 @@ def write_spec():
 
 def main():
     internal = read_internal()
-    print("开始 v1.5.5 打包（UI=%s，侧栏选中动效重做：划动感——位移全走 transform + 时长距离自适应 + 去弹跳）…"
+    print("开始 v1.6.4 打包（UI=%s，热力图铺满 + 深色自绘日历）…"
           % os.path.join(ROOT, "_ui_v151k"))
+    check_ui_syntax()
     sync_changelog(internal)
     write_spec()
     cmd = [PY, "-m", "PyInstaller", "--noconfirm", "--clean",

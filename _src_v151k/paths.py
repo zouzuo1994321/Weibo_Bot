@@ -478,7 +478,13 @@ def set_data_paths(image_dir=None, media_dir=None, models_dir=None,
 # 【v1.2.1 修正】此前一直停在 "v1.1.9k"，而 version.py 的 MAJOR 早已迭代到 v1.2.x，
 # 导致 api_bridge 暴露的 major_version（界面顶部显示）与 version.get_version() 不一致。
 # 单一事实源以 version.py 为准，这里与其保持同步。
-MAJOR_VERSION = "v1.3.2"
+# 【v1.5.7】不再在这里重复维护版本号 —— 单一来源是 version.py 的 MAJOR。
+# 原值写死 "v1.3.2"，从 v1.4.x 起就一直与真实版本不一致，导致「关于」页
+# 与 api_bridge 的兜底分支会显示过期版本号（版本四处同步永远对不上）。
+try:
+    from version import MAJOR as MAJOR_VERSION
+except Exception:                    # version 模块不可用时退回字面量
+    MAJOR_VERSION = "v1.5.7"
 
 # 应用元信息
 APP_NAME = "微博bot小助手"

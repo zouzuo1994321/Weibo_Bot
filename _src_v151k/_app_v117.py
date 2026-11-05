@@ -335,6 +335,22 @@ def main():
     if _HAS_TRAY:
         threading.Thread(target=_start_tray, args=(api,), daemon=True).start()
     diag("WEBVIEW_START", "blocking")
+    # 【v1.6.0 · PF-2】AI 分词词典预热。
+    # 内置引擎首次生成要 685ms，其中大头是 jieba 首次载入词典（约 500ms）。
+    # 这里等首屏稳定后在后台线程把它做掉，用户第一次点「生成文案」时就是热的。
+    # 失败一律吞掉：预热只是优化，缺了它也只是第一次慢一点。
+    def _prewarm_ai():
+        try:
+            import time as _t
+            _t.sleep(2.0)                      # 让首屏与状态渲染先跑完
+            import jieba
+            jieba.initialize()                 # 载入词典（耗时大头）
+            import jieba.posseg as _pseg       # noqa: F401  词性标注另有一份初始化
+            list(jieba.cut("预热完成"))         # 触发一次分词，建好缓存
+            sys.stderr.write("[AI] 分词词典预热完成\n")
+        except Exception as e:
+            sys.stderr.write("[AI] 分词预热跳过：%s\n" % e)
+    threading.Thread(target=_prewarm_ai, daemon=True, name="ai-prewarm").start()
     webview.start()
     # 【v1.5.0 Part2-B】窗口关闭（含托盘「退出」的 destroy 路径）后
     # 落盘收尾 + 硬退出，根治 ~12.5s 的 WebView2 拆环境拖尾。

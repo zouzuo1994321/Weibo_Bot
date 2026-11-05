@@ -136,13 +136,14 @@ class Scheduler:
         run_once 的 results 是「按 UID 聚合」的字典列表（action/detail/run_at
         由 _forward_one 的返回值合并进对应 UID 项），任一项带
         action=="scheduled" 且有 run_at 即视为本轮已排程。
+        【v1.6.1】一轮可能排程多条，进度环应对齐**最早**那一跳（真正的「下一次转发」）。
         """
         try:
-            for r in (res.get("results") or []):
-                if r.get("action") == "scheduled" and r.get("run_at"):
-                    with self._lock:
-                        self.next_forward_run = r.get("run_at")
-                    break
+            stamps = [r.get("run_at") for r in (res.get("results") or [])
+                      if r.get("action") == "scheduled" and r.get("run_at")]
+            if stamps:
+                with self._lock:
+                    self.next_forward_run = min(stamps)
         except Exception:
             pass
 

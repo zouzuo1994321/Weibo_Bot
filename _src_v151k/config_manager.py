@@ -24,6 +24,7 @@ DEFAULT_CONFIG = {
         "end": "23:00",
     },
     "forward_time_jitter": True,     # 转发时间在工作时段内随机偏移（避免固定时刻批量转发）
+    "forward_count": 1,              # 【v1.6.1】每轮轮询后排程发送的微博条数（1~10）
     "poll_jitter_ratio": 0.15,       # 轮询间隔 / 转发延后 抖动比例（±15%）
     "max_accounts": 5,               # 最多记录账户数
     "auto_renew_cookie": True,       # 自动续期 Cookie：临近失效时自动滑动延长（会话保活）

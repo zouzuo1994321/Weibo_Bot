@@ -15,7 +15,7 @@ import time
 
 from paths import DATA_DIR
 from config_manager import get_config
-from logger import info, warn, error
+from logger import info, warn, error, debug   # 【v1.5.7】补 debug：兜底分支原先 NameError
 
 # 【v1.2.2】模型目录可自定义。仍保留 MODELS_DIR / MODEL_PATH 两个模块常量
 # 以兼容既有引用（导出、api_bridge 等），但**所有真正使用的地方一律走
@@ -169,8 +169,11 @@ def load_model(n_ctx=2048, n_threads=None):
             from llama_cpp import Llama
             if n_threads is None:
                 n_threads = max(1, (os.cpu_count() or 4) // 2)
+            # 【v1.5.7】原写 model_path=_mp —— _mp 只是下载函数里的局部变量，
+            # 这里从未定义，local_gguf 引擎加载必抛 NameError（描述为「模型加载
+            # 失败」），用户看不到真实原因。改为调用 model_path() 取当前路径。
             _model = Llama(
-                model_path=_mp,
+                model_path=model_path(),
                 n_ctx=n_ctx,
                 n_threads=n_threads,
                 n_gpu_layers=0,      # CPU 推理；若有 GPU 可调高

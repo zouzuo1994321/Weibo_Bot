@@ -43,7 +43,10 @@ MAX_LOG_BYTES = 8 * 1024 * 1024
 
 # v1.1.9j：长期持有的写句柄（由后台写入线程使用）
 _file_fh = None
-_fh_lock = threading.Lock()
+# 【v1.5.7】必须用 RLock：_get_fh() 持锁 → _rotate_if_needed() → _close_fh()
+# 会再次抢同一把锁。普通 Lock 不可重入，日志一超过轮转阈值（8MB）就会在
+# 写入线程里死锁，表现为「日志不再更新、退出时卡住」。
+_fh_lock = threading.RLock()
 
 
 def _flush_fh():

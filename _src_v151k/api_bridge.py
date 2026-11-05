@@ -10,6 +10,7 @@ import random
 import subprocess
 import sys
 import time
+import urllib.request
 import webbrowser
 from datetime import datetime
 
@@ -28,8 +29,8 @@ from monitor_manager import get_monitor_manager
 from pathlib import Path
 from paths import (APP_NAME, COPYRIGHT, COPYRIGHT_FULL, VERSION_ARCHIVE_DIR,
                    MAJOR_VERSION, BASE_DIR, DATA_DIR,
-                   get_media_dir, get_image_dir, get_path_settings,
-                   set_data_paths, wizard_state)
+                   get_media_dir, get_image_dir, get_history_dir, get_models_dir,
+                   get_path_settings, set_data_paths, wizard_state)
 from licensemgr import (get_status, generate_feature_code, activate_license,
                       deactivate_license, can_forward, forward_block_reason,
                       FEATURE_CODE_VALID_DAYS)
@@ -37,7 +38,8 @@ from scheduler import get_scheduler
 from media_engine import (get_media_progress, start_media_download_async,
                           user_media_dir, maybe_run_scheduled_media_download)
 from weibo_client import (get_user_info, get_latest_posts, diagnose_account,
-                          repost, get_post_detail)
+                          repost, get_post_detail, get_hot_search,
+                          get_hot_topic_preview)
 import model_manager
 
 # ---------------- 系统负载采样（v1.4.0） ----------------
@@ -305,6 +307,169 @@ def _ensure_system_load_thread():
         _SYS_LOAD_THREAD_STARTED = True
         _thr.Thread(target=_system_load_worker, daemon=True).start()
 
+
+# ---------------- 微博实时热搜快照（v1.6.1） ----------------
+# 概览页右半新增「微博热搜」分栏，每分钟刷新。抓取一律放后台线程（TTL 60s 节流），
+# get_hot_search 桥接方法只读共享快照 —— pywebview 的桥调用在 WebView2 的 UI
+# 线程上同步执行，任何 HTTP 往返都不能放在那里，否则窗口直接卡住。
+_HOT = {"items": [], "pinned": [], "updated_at": 0.0, "error": "",
+        "source": "", "busy": False}
+_HOT_LOCK = _thr.Lock()
+_HOT_TTL = 60.0
+_HOT_THREAD_STARTED = False
+# 【v1.6.2】热搜历史保留期；【v1.6.4】热力点图改为展示近一年，保留期同步放宽到 400 天
+# （按日聚合后每天仅几百行，一年也就十几万行，SQLite 毫无压力）
+_HOT_KEEP_DAYS = 400
+_HOT_PRUNE_DONE = False
+
+
+def _prune_hot_once():
+    """进程内只跑一次的热搜历史清理（超过保留期的旧日子直接删掉）。"""
+    global _HOT_PRUNE_DONE
+    if _HOT_PRUNE_DONE:
+        return
+    _HOT_PRUNE_DONE = True
+    try:
+        n = get_history_db().prune_hot_search(_HOT_KEEP_DAYS)
+        if n:
+            debug(f"热搜历史已清理 {n} 条（保留最近 {_HOT_KEEP_DAYS} 天）")
+    except Exception:
+        pass
+
+
+def _hot_cookie():
+    """优先用首个账户的 Cookie 抓热搜（未登录也能抓，带 Cookie 成功率更高）。"""
+    try:
+        am = get_account_manager()
+        accs = am.list_accounts()
+        if accs:
+            return am.get_cookie(accs[0]["id"]) or ""
+    except Exception:
+        pass
+    return ""
+
+
+# ---------------- 热搜词条「原文预览」缓存（v1.6.3） ----------------
+# 悬停某条热搜时，前端先秒出本地留档卡片，再调 get_hot_preview 补「原文」。
+# 抓取必然要联网（微博搜索还要登录态），所以桥方法一律只读缓存：
+#   · 未缓存 → 起一个后台线程去抓，立刻返回 {"state":"loading"}；
+#   · 前端 1~2 秒后再调一次，命中缓存就换成原文卡片；
+#   · 抓失败也写进缓存（err），避免用户反复悬停反复打网络。
+_HOT_PREV = {}                 # word -> {"ts", "state", "data"}
+_HOT_PREV_LOCK = _thr.Lock()
+_HOT_PREV_INFLIGHT = set()
+_HOT_PREV_TTL = 6 * 3600.0     # 原文变动不频繁，6 小时内复用
+_HOT_PREV_MAX = 80             # 超过就丢最旧的，防止长时间运行内存膨胀
+_PREV_IMG_LIMIT = 2            # 浮层里最多两张缩略图
+_PREV_IMG_BYTES = 400 * 1024   # 单张上限，超了直接放弃（不清真图床的大图）
+
+
+def _fetch_prev_image(url, timeout=8):
+    """下载一张缩略图并转成 data URI —— 前端直接 <img src> 用，不落盘。"""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+            "Referer": "https://weibo.com/",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read(_PREV_IMG_BYTES + 1)
+        if not data or len(data) > _PREV_IMG_BYTES:
+            return ""
+        return "data:image/jpeg;base64," + base64.b64encode(data).decode()
+    except Exception:
+        return ""
+
+
+def _fetch_hot_preview(word):
+    """后台线程：抓一条该话题下的微博 + 缩略图，写进 _HOT_PREV。"""
+    entry = {"ts": time.time(), "state": "err", "data": {"error": "原文预览不可用"}}
+    try:
+        res = get_hot_topic_preview(word, _hot_cookie(), 1)
+        if res.get("ok"):
+            post = res.get("post") or {}
+            imgs = []
+            for u in (post.get("images") or [])[:_PREV_IMG_LIMIT]:
+                b64 = _fetch_prev_image(u)
+                if b64:
+                    imgs.append(b64)
+            entry = {"ts": time.time(), "state": "ok", "data": {
+                "author": post.get("author") or "",
+                "text": post.get("text") or "",
+                "created_at": post.get("created_at") or "",
+                "post_url": post.get("url") or "",
+                "search_url": res.get("search_url") or "",
+                "images": imgs,
+            }}
+        else:
+            entry = {"ts": time.time(), "state": "err",
+                     "data": {"error": res.get("error") or "原文预览不可用"}}
+    except Exception as e:
+        entry = {"ts": time.time(), "state": "err", "data": {"error": str(e)}}
+    with _HOT_PREV_LOCK:
+        _HOT_PREV[word] = entry
+        _HOT_PREV_INFLIGHT.discard(word)
+        if len(_HOT_PREV) > _HOT_PREV_MAX:
+            for k in sorted(_HOT_PREV, key=lambda x: _HOT_PREV[x]["ts"])[:len(_HOT_PREV) - _HOT_PREV_MAX]:
+                _HOT_PREV.pop(k, None)
+
+
+def _refresh_hot_search(force=False):
+    """抓一次热搜并写入快照。失败也推进 updated_at，避免接口挂掉时反复打网络。"""
+    now = time.time()
+    with _HOT_LOCK:
+        if _HOT["busy"]:
+            return
+        if not force and _HOT["updated_at"] and (now - _HOT["updated_at"]) < _HOT_TTL:
+            return
+        _HOT["busy"] = True
+    try:
+        res = get_hot_search(_hot_cookie(), 20)
+    except Exception as e:
+        res = {"ok": False, "items": [], "error": str(e)}
+    # 【v1.6.2】抓到的榜单落进历史库（按「日 + 词条」聚合，置顶要闻 pinned=1）。
+    # 写库放在 _HOT_LOCK 之外：SQLite 有自己的写锁，不能和快照锁互相拖住。
+    if res.get("ok"):
+        try:
+            get_history_db().record_hot_search(res.get("items") or [],
+                                               res.get("pinned") or [])
+            _prune_hot_once()
+        except Exception as e:
+            debug(f"热搜历史写入失败：{e}")
+    with _HOT_LOCK:
+        _HOT["busy"] = False
+        _HOT["updated_at"] = time.time()
+        prev_err = _HOT["error"]
+        if res.get("ok"):
+            _HOT["items"] = res.get("items") or []
+            _HOT["pinned"] = res.get("pinned") or []
+            _HOT["source"] = res.get("source") or ""
+            _HOT["error"] = ""
+        else:
+            _HOT["error"] = res.get("error") or "获取失败"
+        err_now = _HOT["error"]
+    # 只在「状态翻转」时记一条，避免接口长期不可用时每 60s 刷一行日志
+    if err_now and err_now != prev_err:
+        warn(f"微博热搜获取失败（将保留上一份榜单）：{err_now}", CAT_CORE)
+    elif not err_now and prev_err:
+        info("微博热搜已恢复正常", CAT_CORE)
+
+
+def _hot_search_worker():
+    while True:
+        try:
+            _refresh_hot_search()
+        except Exception:
+            pass
+        time.sleep(5.0)
+
+
+def _ensure_hot_search_thread():
+    global _HOT_THREAD_STARTED
+    if not _HOT_THREAD_STARTED:
+        _HOT_THREAD_STARTED = True
+        _thr.Thread(target=_hot_search_worker, daemon=True, name="hot-search").start()
+
 # ---------------- 异步 / 缓存辅助（v1.1.8） ----------------
 import ctypes
 import winctl  # 窗口控制：Win32 ctypes 直驱，绕过 pywebview 代理（修复 #19 拖动/磁吸、#20 托盘）
@@ -426,7 +591,87 @@ def _ver():
         from version import get_version
         return get_version()
     except Exception:
-        return {"major": MAJOR_VERSION, "internal": "2609040001"}
+        # 【v1.5.7】原硬编码 internal="2609040001"（v1.5.0 之前的旧号）。一旦
+        # version 模块不可用，「关于」页会显示一个假的历史版本号；改为从
+        # version.json 现读，读不到才降级为 unknown。
+        internal = "unknown"
+        try:
+            import json as _json
+            with open(os.path.join(BASE_DIR, "version.json"), "r", encoding="utf-8") as f:
+                s = _json.load(f)
+            internal = "%s%04d" % (s["date"], s["seq"])
+        except Exception:
+            pass
+        return {"major": MAJOR_VERSION, "internal": internal,
+                "display": "%s (内部 %s)" % (MAJOR_VERSION, internal)}
+
+
+# --------------------------------------------------------------------------- #
+# 【v1.6.0】路径安全：桥接方法的所有「外部传入路径」都必须钳制在数据目录内。
+#
+# 事故（全量核查实证）：load_image_base64 / load_media_base64 直接
+# os.path.abspath(os.path.join(DATA_DIR, rel)) —— 当 rel 是绝对路径时
+# os.path.join 会**丢弃前缀**，于是传 C:\Windows\win.ini 就能把任意文件
+# 读成 base64 回传给前端；open_path 更直接，传 .exe 就给执行了。
+# 修法：commonpath 判定 + 扩展名白名单，双保险。
+# --------------------------------------------------------------------------- #
+def _allowed_roots():
+    """允许桥接读写的根目录（用户可自定义的四个大目录 + 程序自身目录）。"""
+    roots = []
+    for r in (DATA_DIR, BASE_DIR, get_image_dir(), get_media_dir(),
+              get_history_dir(), get_models_dir()):
+        try:
+            roots.append(os.path.abspath(r))
+        except Exception:
+            continue
+    return roots
+
+
+def _in_roots(p):
+    """路径是否落在允许的根目录之内（防绝对路径 / .. 穿越 / 跨盘）。"""
+    if not p:
+        return False
+    try:
+        ap = os.path.abspath(p)
+    except Exception:
+        return False
+    for ra in _allowed_roots():
+        try:
+            if os.path.commonpath([ap, ra]) == ra:
+                return True
+        except ValueError:          # 不同盘符时 commonpath 抛错
+            continue
+    return False
+
+
+def _safe_join(root, rel):
+    """把 rel 拼到 root 下；越界返回 None。"""
+    try:
+        ra = os.path.abspath(root)
+        p = os.path.abspath(os.path.join(ra, str(rel)))
+        if os.path.commonpath([p, ra]) != ra:
+            return None
+        return p
+    except Exception:
+        return None
+
+
+# 可直接读取并转 base64 的扩展名（不再对未知类型兜底成 image/jpeg，
+# 否则任意文本文件都能被伪造成「图片」读出来）。
+_READ_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".m4v": "video/mp4",
+    ".webm": "video/webm",
+}
+
+# open_path 明确拒绝的「可执行 / 可加载」类型：这些交给系统就等于任意代码执行。
+_OPEN_DENY_EXT = {
+    ".exe", ".com", ".bat", ".cmd", ".msi", ".scr", ".pif", ".cpl",
+    ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
+    ".hta", ".jar", ".reg", ".inf", ".lnk", ".url", ".py", ".pyw",
+    ".sh", ".appref-ms", ".application", ".gadget",
+}
 
 
 def _ai_engines_state():
@@ -1166,9 +1411,121 @@ class Api:
         return {"ok": True, "message": "已打开系统浏览器，请登录后复制 Cookie 粘贴到输入框"}
 
     def open_external(self, url):
+        """用系统默认浏览器打开外链。
+
+        【v1.6.1 安全加固】只放行 http / https。加固前任意字符串都会直接交给
+        webbrowser → ShellExecute，`file:///`、`javascript:`、`ms-msdt:` 之类的
+        伪协议同样会被系统当作「执行」处理，等于给前端开了一个任意本地打开入口。
+        """
         try:
-            webbrowser.open(url)
+            u = (url or "").strip()
+            low = u.lower()
+            if not (low.startswith("http://") or low.startswith("https://")):
+                warn(f"拒绝打开非 http(s) 链接：{u[:120]}")
+                return {"ok": False, "error": "只允许打开 http / https 链接"}
+            webbrowser.open(u)
             return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ---------------- 微博实时热搜（v1.6.1） ----------------
+    def get_hot_search(self):
+        """返回微博实时热搜快照（后台线程每 60s 刷新，本方法只读缓存，零阻塞）。
+
+        items  —— 实时榜 20 条；pinned —— 榜单顶部的「置顶要闻」（hotgov）。
+        """
+        _ensure_hot_search_thread()
+        with _HOT_LOCK:
+            items = [dict(it) for it in (_HOT["items"] or [])]
+            pinned = [dict(it) for it in (_HOT["pinned"] or [])]
+            ts = float(_HOT["updated_at"] or 0.0)
+            source = _HOT["source"] or ""
+            err = _HOT["error"] or ""
+        return {
+            "ok": True,
+            "items": items,
+            "pinned": pinned,
+            "updated_at": ts,
+            "updated_text": (datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else ""),
+            "source": source,
+            "error": err,
+            "stale": bool(ts and (time.time() - ts) > _HOT_TTL * 3),
+        }
+
+    def refresh_hot_search(self):
+        """手动刷新热搜：只触发后台强制抓取并立即返回（前端稍后再拉快照）。"""
+        _ensure_hot_search_thread()
+        _thr.Thread(target=_refresh_hot_search, kwargs={"force": True},
+                    daemon=True).start()
+        return {"ok": True}
+
+    # ---------------- 热搜历史（v1.6.2） ----------------
+    def list_hot_days(self, limit=90):
+        """有热搜记录的日期列表（倒序），供「热搜管理」日期下拉。"""
+        try:
+            return get_history_db().hot_search_days(limit)
+        except Exception as e:
+            return {"error": str(e)}
+
+    def hot_search_heatmap(self, days=190):
+        """按日「峰值热度合计」，供热搜管理页的橙色热力点图（v1.6.3）。
+
+        返回 [{"day","total","heat","pinned"}]，只含有记录的日子。
+        """
+        try:
+            return get_history_db().hot_search_heatmap(days)
+        except Exception as e:
+            return []
+
+    def get_hot_preview(self, word=""):
+        """悬停某条热搜时取「原文预览」（本地缓存只读，抓取在后台线程）。
+
+        返回 {"state": "ok"/"err"/"loading", ...}：
+          · loading —— 已发起后台抓取，前端 1~2 秒后再调一次即可；
+          · ok      —— author/text/created_at/images(data URI)/post_url；
+          · err     —— error 文案（例如需要登录微博）。
+        绝不在本方法里发起网络请求（桥方法跑在 WebView2 的 UI 线程上）。
+        """
+        w = (word or "").strip()
+        if not w:
+            return {"state": "err", "error": "词条为空"}
+        now = time.time()
+        with _HOT_PREV_LOCK:
+            e = _HOT_PREV.get(w)
+            if e and (now - e["ts"]) < _HOT_PREV_TTL:
+                out = {"state": e["state"]}
+                out.update(e.get("data") or {})
+                return out
+            if w in _HOT_PREV_INFLIGHT:
+                return {"state": "loading"}
+            _HOT_PREV_INFLIGHT.add(w)
+        _thr.Thread(target=_fetch_hot_preview, args=(w,), daemon=True).start()
+        return {"state": "loading"}
+
+    def list_hot_search(self, day="", keyword="", pinned_only=False,
+                        page=1, page_size=200):
+        """按日查询热搜历史（可分页 / 关键词 / 只看置顶）。"""
+        try:
+            page = max(1, int(page))
+            page_size = max(1, min(int(page_size), 500))
+        except Exception:
+            page, page_size = 1, 200
+        try:
+            res = get_history_db().hot_search_list(
+                day or "", keyword or "", bool(pinned_only),
+                page_size, (page - 1) * page_size)
+        except Exception as e:
+            return {"total": 0, "rows": [], "error": str(e)}
+        res["page"] = page
+        res["page_size"] = page_size
+        return res
+
+    def clear_hot_search(self, day=""):
+        """删除某一天的热搜历史；day 传空则清空全部。"""
+        try:
+            n = get_history_db().clear_hot_search(day or None)
+            info(f"热搜历史已删除 {n} 条" + (f"（{day}）" if day else "（全部）"), CAT_CORE)
+            return {"ok": True, "removed": n}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -1539,6 +1896,9 @@ class Api:
         cfg.set("custom_personas", cp)
         info(f"已删除自定义人格：{name}")
         _state_dirty()   # 【v1.4.3】
+        # 【v1.5.7】补 return：原成功路径返回 None，前端拿到 undefined 后
+        # 判定 r.ok 为假，明明删成功却弹「删除失败」。
+        return {"ok": True, "name": name}
 
     # ------- 旧版二引擎 API（v1.1.x）—— 保留为兼容层，内部映射到三引擎 -------
     # v1.2.0 起引擎标识统一为 builtin / local / local_gguf / cloud；
@@ -1962,18 +2322,35 @@ class Api:
         return export_rows(kind, rows, fmt, dest)
 
     def open_path(self, path):
-        """在文件管理器中打开导出目录 / 文件。"""
+        """在文件管理器中打开导出目录 / 文件。
+
+        【v1.6.0 安全加固】两道闸：
+          ① 目录一律放行（资源管理器打开，无执行风险）；
+          ② 文件必须在允许的根目录内，且不在可执行/可加载类型黑名单里。
+        加固前传任意 .exe 都会真的被执行（实证：calc.exe 直接被拉起）。
+        """
         try:
             if not path or not os.path.exists(path):
                 return {"ok": False, "error": "路径不存在"}
+            target = os.path.abspath(path)
+            if not os.path.isdir(target):
+                if not _in_roots(target):
+                    warn(f"拒绝打开数据目录之外的路径：{target}")
+                    return {"ok": False,
+                            "error": "出于安全考虑，只能打开数据目录内的文件"}
+                ext = os.path.splitext(target)[1].lower()
+                if ext in _OPEN_DENY_EXT:
+                    warn(f"拒绝用系统打开可执行文件：{target}")
+                    return {"ok": False,
+                            "error": "出于安全考虑，不能直接运行该类型的文件"}
             if sys.platform.startswith("win"):
-                os.startfile(path)
+                os.startfile(target)
             elif sys.platform == "darwin":
                 import subprocess
-                subprocess.Popen(["open", path])
+                subprocess.Popen(["open", target])
             else:
                 import subprocess
-                subprocess.Popen(["xdg-open", path])
+                subprocess.Popen(["xdg-open", target])
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -1984,31 +2361,33 @@ class Api:
         图片统一存储为相对 DATA_DIR 的 ``images\\...``，兼容旧版 ``data\\images\\...``。
         """
         try:
-            rel = os.path.normpath(rel_path.replace("/", os.sep))
+            rel = os.path.normpath(str(rel_path).replace("/", os.sep))
             # 兼容旧版：data\images\... → images\...
             if rel.lower().startswith("data" + os.sep):
                 rel = rel[len("data" + os.sep):]
-            candidates = [
-                os.path.abspath(os.path.join(DATA_DIR, rel)),
-                os.path.abspath(os.path.join(BASE_DIR, rel)),
-            ]
+            # 【v1.6.0】用 _safe_join 而非 os.path.join：后者遇到绝对路径会
+            # 丢弃前缀，等于把读盘权限直接交给调用方（已实证可读 win.ini）。
+            candidates = []
+            for root in (DATA_DIR, BASE_DIR):
+                p = _safe_join(root, rel)
+                if p:
+                    candidates.append(p)
+            if not candidates:
+                return {"ok": False, "error": f"非法路径：{rel_path}"}
             for p in candidates:
-                if os.path.isfile(p):
-                    with open(p, "rb") as f:
-                        data = f.read()
-                    ext = os.path.splitext(p)[1].lower()
-                    mime_map = {
-                        ".png": "image/png", ".jpg": "image/jpeg",
-                        ".jpeg": "image/jpeg", ".gif": "image/gif",
-                        ".webp": "image/webp",
-                    }
-                    mime = mime_map.get(ext, "image/jpeg")
-                    return {"ok": True,
-                            "data_url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}
+                if not os.path.isfile(p):
+                    continue
+                ext = os.path.splitext(p)[1].lower()
+                mime = _READ_MIME.get(ext)
+                if not mime or not mime.startswith("image/"):
+                    continue          # 非图片扩展名一律不读，避免被当成图片外泄
+                with open(p, "rb") as f:
+                    data = f.read()
+                return {"ok": True,
+                        "data_url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}
             return {"ok": False, "error": f"图片文件不存在：{rel_path}"}
         except Exception as e:
             return {"ok": False, "error": f"读取图片失败：{e}"}
-
     # ---------------- 视频 / 相册 ----------------
     def get_media_config(self):
         """获取视频/相册下载设置。"""
@@ -2166,19 +2545,18 @@ class Api:
         """读取媒体文件并返回 base64 Data URL（图片预览用）。"""
         try:
             rel = os.path.normpath(str(rel_path).replace("/", os.sep))
-            p = os.path.abspath(os.path.join(get_media_dir(), rel))
+            # 【v1.6.0】_safe_join 内做 commonpath 校验，越界返回 None
+            p = _safe_join(get_media_dir(), rel)
+            if not p:
+                return {"ok": False, "error": "非法路径"}
             if not os.path.isfile(p):
                 return {"ok": False, "error": f"文件不存在：{rel_path}"}
+            ext = os.path.splitext(p)[1].lower()
+            mime = _READ_MIME.get(ext)
+            if not mime:
+                return {"ok": False, "error": "不支持的文件类型"}
             with open(p, "rb") as f:
                 data = f.read()
-            ext = os.path.splitext(p)[1].lower()
-            mime_map = {
-                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-                ".mp4": "video/mp4", ".mov": "video/quicktime",
-                ".m4v": "video/mp4", ".webm": "video/webm",
-            }
-            mime = mime_map.get(ext, "application/octet-stream")
             return {"ok": True,
                     "data_url": f"data:{mime};base64,{base64.b64encode(data).decode()}",
                     "size": len(data)}
@@ -2189,7 +2567,9 @@ class Api:
         """返回媒体文件的 file:// URL（视频预览用，避免 base64 过大卡界面）。"""
         try:
             rel = os.path.normpath(str(rel_path).replace("/", os.sep))
-            p = os.path.abspath(os.path.join(get_media_dir(), rel))
+            p = _safe_join(get_media_dir(), rel)      # 【v1.6.0】越界即拒
+            if not p:
+                return {"ok": False, "error": "非法路径"}
             if not os.path.isfile(p):
                 return {"ok": False, "error": "文件不存在"}
             return {"ok": True, "url": Path(p).as_uri(),

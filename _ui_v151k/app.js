@@ -90,7 +90,8 @@ function decorateNumberInput(inp) {
      且用户实际习惯直接键入。用原生 number 输入 + 隐藏 spin 按钮即可。
      · 分页相关：自定义每页条数（页码跳转框已于 v1.4.23 移除）
      · 间隔 / 页数类：监控刷新间隔、转发间隔、相册间隔、扫描页数 */
-  var NO_STEP = ["pageSizeNum", "monRefreshMin", "intervalMin", "mediaInterval", "mediaPages"];
+  var NO_STEP = ["pageSizeNum", "monRefreshMin", "intervalMin", "forwardCount",
+                 "mediaInterval", "mediaPages"];
   if (NO_STEP.indexOf(inp.id) >= 0) {
     inp.dataset.numDecorated = "1";   // 标记为已处理，MutationObserver 不再重复进入
     inp.classList.add("no-step");
@@ -160,6 +161,7 @@ async function init() {
   setInterval(checkAccountHealth, 60000);  // 【v1.4.0】账户健康轮询（后端缓存，1h 才真重算）
   setInterval(updateOverviewClock, 1000);  // 概览时钟每秒刷新（纯前端）
   setInterval(refreshAccountsLive, 1000);  // 【v1.4.18】账户管理页秒级刷新（仅激活时拉取）
+  setInterval(function () { refreshHotSearch(false); }, 30000);  // 【v1.6.1】热搜快照（后 60s 抓一次）
   tickForwardRing();   // 【v1.4.18】启动本日转发进度环动画循环
 
   // 【v1.4.0】数字输入框自定义上下按钮：先装饰已存在的，再用 MutationObserver 覆盖动态渲染的
@@ -181,6 +183,8 @@ async function init() {
   // 【v1.4.0】账户健康：首屏先拉一次（后端未就绪时由 60s 轮询兜底）
   bootProgress(30, "正在检测账户状态…");
   checkAccountHealth();
+  /* 【v1.6.1】首屏就绪后立即拉一次热搜快照（后台线程此时开始抓取） */
+  refreshHotSearch(true);
   // 【v1.4.4】开屏兜底：任何异常路径下 8s 后强制淡出，绝不让开屏卡死
   setTimeout(hideBootLoading, 8000);
 
@@ -337,8 +341,13 @@ function showBootLoading() {
    以前只有一个「正在加载数据…」的静态文案，卡住时无法判断卡在哪一步。
    现在每个关键节点调用 bootProgress(百分比, 阶段文案)，
    百分比驱动进度条长度（CSS 变量 --bs-pct），阶段文案显示在下方。 */
-let _bootPct = 0;
+/* 【v1.6.0】接上 index.html 里那段「开屏自我推进」的进度：
+   桥还没挂载时进度条已经在缓动爬升，这里必须从当前值接着走，
+   否则第一个真实阶段（15%）会把进度条拽回去，看起来像倒退。 */
+let _bootPct = (typeof window.__bsPct === "number" ? Math.round(window.__bsPct) : 0);
 function bootProgress(pct, stage) {
+  /* 真实阶段接管后立刻停掉内联脚本的爬升，避免两边抢着写 DOM */
+  try { if (window.__bsCrawlStop) window.__bsCrawlStop(); } catch (e) {}
   const n = Math.max(0, Math.min(100, Math.round(pct)));
   // 单调递增，避免各阶段乱序调用导致进度条回退
   if (n > _bootPct) _bootPct = n;
@@ -437,6 +446,7 @@ function moveNavHighlight(el, animate) {
     /* 落位：关过渡直接设定，避免首帧从原点滑入 */
     hi.style.transition = "none";
     hi.style.transform = "translate(" + x + "px," + top + "px)";
+    hi.style.right = x + "px";     /* 盒子右边界内收，横移后右缘仍贴容器右缘（不溢出） */
     hi.style.height = h + "px";
     void hi.offsetHeight;          /* 强制回流，使上面的「无过渡赋值」整批生效 */
     hi.style.transition = "";      /* 恢复 CSS 过渡（属性/缓动/默认时长） */
@@ -448,6 +458,7 @@ function moveNavHighlight(el, animate) {
     const dur = Math.min(0.52, Math.max(0.22, 0.2 + dist * 0.0011));
     hi.style.transitionDuration = dur.toFixed(3) + "s";
     hi.style.transform = "translate(" + x + "px," + top + "px)";
+    hi.style.right = x + "px";     /* 与 transform 同曲率过渡，右缘全程贴容器右缘 */
     hi.style.height = h + "px";
     _navHiX = x; _navHiY = top;
   }
@@ -483,6 +494,8 @@ function bindNav() {
       moveNavHighlight(el);
       setTimeout(() => moveNavHighlight(el, false), 240);
       if (el.dataset.view === "history") switchHist("monitored");
+      /* 【v1.6.2】热搜管理：进入时拉日期列表 + 当日榜单 */
+      if (el.dataset.view === "hotsearch") loadHotSearchPage(1);
       if (el.dataset.view === "dataoverview") loadDataOverview();
       /* 【v1.2.2】进入「存储管理」时刷新路径设置 + 发起后台占用扫描 */
       if (el.dataset.view === "storage") { loadDataPaths(); refreshStorage(false); }
@@ -492,6 +505,8 @@ function bindNav() {
       if (el.dataset.view === "media") loadMediaPage();
       /* 【v1.2.2】AI 部署独立成页：进入时刷新引擎状态与部署进度 */
       if (el.dataset.view === "aideploy") loadAiSettings();
+      /* 【v1.6.1】回到概览时补拉一次热搜快照（后台已有缓存，返回极快） */
+      if (el.dataset.view === "overview") refreshHotSearch(true);
     };
   });
 
@@ -525,10 +540,12 @@ function renderOverview() {
   const tag = document.getElementById("schedState");
   tag.textContent = sch.running ? "运行中" : "未运行";
   tag.className = "tag " + (sch.running ? "green" : "blue");
+  /* 【v1.6.1】排程数量可配置，文案随之动态化（原写死「仅…随机转发 1 条」） */
+  const _fcn = Math.max(1, Math.min(10, parseInt((STATE.config || {}).forward_count, 10) || 1));
   document.getElementById("schedInfo").textContent =
     `间隔 ${sch.interval_minutes} 分钟 · 当前${sch.in_working_hours ? "在工作时间内" : "不在工作时间"}` +
     (sch.last_run ? ` · 上次运行 ${sch.last_run}` : "") +
-    " · 每轮仅从新微博中随机转发 1 条";
+    ` · 每轮从新微博中随机排程 ${_fcn} 条`;
   const lic = STATE.license || {};
   const licLine = document.getElementById("licLine");
   if (licLine) {
@@ -685,7 +702,11 @@ function formatLastResult(res, ts) {
   const hasNew = results.reduce((s, r) => s + (r.new_count || 0), 0);
   lines.push(`[${t}][INFO] 本轮轮询结束 · 监控 ${total} 个对象 · 共 ${hasNew} 条新微博 · 转发 ${res.forwarded || 0} 条`);
   if (res.message) lines.push(`[${t}][INFO] ${res.message}`);
-  const order = { forwarded: 0, failed: 1, error: 2, skipped: 3, none: 4 };
+  /* 【v1.6.1】order 表漏了 scheduled —— 排程转发（后台抖动延迟发送）的动作名是
+     「scheduled」，取不到就落到 ?? 5 排到最末，表现为「已排程转发（预计 …执行）」
+     被 100+ 行「本轮随机未选中」淹没在列表最底部。现在把 scheduled 与 forwarded
+     并列放最前，紧跟在「本轮排程转发 N 条」汇总行之后。 */
+  const order = { scheduled: 0, forwarded: 0, failed: 1, error: 2, skipped: 3, none: 4 };
   results.sort((a, b) => (order[a.action] ?? 5) - (order[b.action] ?? 5));
   for (const r of results) {
     const lv = r.action === "forwarded" ? "INFO" : r.action === "failed" || r.action === "error" ? "ERROR" : "INFO";
@@ -699,6 +720,600 @@ function _fmtLogTs(d) {
   const pad = n => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
+
+/* ================= 【v1.6.1】微博实时热搜 ================= */
+/* 后端由独立线程每 60s 抓一次榜单并缓存，这里只拉快照（毫秒级返回），
+   因此 30s 轮询一次也不会给界面或微博带来压力。点击词条 → 系统默认浏览器。 */
+let _HOT_LAST_POLL = 0;
+let _HOT_LOADING = false;
+let _HOT_RETRY = false;
+
+function _fmtHotNum(n) {
+  n = Number(n) || 0;
+  if (n >= 100000000) return (n / 100000000).toFixed(1) + " 亿";
+  if (n >= 10000) return (n / 10000).toFixed(1) + " 万";
+  return n ? String(n) : "";
+}
+
+function renderHotSearch(d) {
+  const box = document.getElementById("hotList");
+  if (!box) return;
+  const meta = document.getElementById("hotUpdated");
+  const items = (d && d.items) || [];
+  /* 【v1.6.2】榜单顶部的「置顶要闻」（hotgov）单独渲染在最上方，带「置顶」徽章 */
+  const pinned = (d && d.pinned) || [];
+  if (!items.length && !pinned.length) {
+    let msg = "正在获取微博实时热搜…";
+    if (d && d.error) msg = "热搜获取失败：" + d.error;
+    else if (d && d.updated_at) msg = "暂无热搜数据，稍后自动重试…";
+    box.innerHTML = `<div class="hot-empty">${esc(msg)}</div>`;
+    if (meta) meta.textContent = "每分钟更新";
+    return;
+  }
+  const pinHtml = pinned.map(function (it) {
+    return `<div class="hot-item pinned" data-url="${esc(it.url || "")}" title="${esc(it.word || "")}">`
+      + `<span class="hot-pin">置顶</span>`
+      + `<span class="hot-word">${esc(it.word || "")}</span>`
+      + (it.label ? `<span class="hot-tag">${esc(it.label)}</span>` : `<span class="hot-tag hot-tag-empty"></span>`)
+      + `<span class="hot-num"></span>`
+      + `</div>`;
+  }).join("");
+  box.innerHTML = pinHtml + items.map(function (it, i) {
+    const rank = i + 1;
+    const cls = "hot-item" + (rank <= 3 ? " top" : "");
+    const tag = it.label ? `<span class="hot-tag">${esc(it.label)}</span>` : `<span class="hot-tag hot-tag-empty"></span>`;
+    const num = _fmtHotNum(it.hot);
+    return `<div class="${cls}" data-url="${esc(it.url || "")}" title="${esc(it.word || "")}">`
+      + `<span class="hot-rank">${rank}</span>`
+      + `<span class="hot-word">${esc(it.word || "")}</span>`
+      + tag
+      + `<span class="hot-num">${num}</span>`
+      + `</div>`;
+  }).join("");
+  /* 事件委托：innerHTML 每次重建，逐个绑定会随刷新次数泄漏监听器 */
+  if (!box.dataset.bound) {
+    box.dataset.bound = "1";
+    box.addEventListener("click", function (e) {
+      const row = e.target && e.target.closest ? e.target.closest(".hot-item") : null;
+      if (!row) return;
+      const url = row.getAttribute("data-url");
+      if (url) openExternal(url);
+    });
+  }
+  if (meta) {
+    meta.textContent = (d.updated_text ? "更新于 " + d.updated_text : "每分钟更新")
+      + (d.stale ? " · 可能已过期" : "");
+  }
+}
+
+async function refreshHotSearch(skipThrottle) {
+  if (!API) return;
+  if (document.hidden) return;
+  const ov = document.getElementById("view-overview");
+  if (!ov || !ov.classList.contains("active")) return;
+  if (_HOT_LOADING) return;
+  const now = Date.now();
+  if (!skipThrottle && now - _HOT_LAST_POLL < 30000) return;
+  _HOT_LOADING = true;
+  _HOT_LAST_POLL = now;
+  try {
+    const d = await apiCall("get_hot_search");
+    if (d && d.ok) {
+      renderHotSearch(d);
+      /* 首次进入时后台线程可能还没抓到榜单：3s 后补拉一次，避免要干等 30s */
+      if (!(d.items || []).length && !d.error && !_HOT_RETRY) {
+        _HOT_RETRY = true;
+        setTimeout(function () {
+          _HOT_RETRY = false;
+          _HOT_LAST_POLL = 0;
+          refreshHotSearch(true);
+        }, 3000);
+      }
+    }
+  } catch (e) { /* 忽略瞬时错误，下一轮重试 */ }
+  finally { _HOT_LOADING = false; }
+}
+
+/* 手动刷新：先触发后端强制抓取，稍后再拉快照 */
+async function refreshHotSearchNow() {
+  const meta = document.getElementById("hotUpdated");
+  if (meta) meta.textContent = "正在刷新…";
+  try {
+    await apiCall("refresh_hot_search");
+    setTimeout(function () { _HOT_LAST_POLL = 0; refreshHotSearch(true); }, 2500);
+  } catch (e) {
+    toast("刷新热搜失败", "err");
+  }
+}
+
+/* ================= 【v1.6.2】热搜管理（按日留档） ================= */
+let HOT_DAY = "";          // 当前选中的日期 YYYY-MM-DD
+let HOT_PAGE = 1;
+let HOT_PAGE_SIZE = 200;
+let HOT_DAYS = [];         // [{day,total,pinned,first_at,last_at}]
+let HOT_ROWS = [];         // 当前页行数据（悬停浮层按 data-idx 取用）
+let HOT_HEAT = [];         // [{day,total,heat,pinned}] 近 6 个月按日聚合
+let _HOT_KW_TIMER = null;
+
+function _todayStr() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function _ymd(d) {
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/* 进入页面：先取日期列表（决定默认选中哪一天），再拉当日榜单 + 热力图。
+   resetDay=1 → 强制回到最近一天；resetDay=0 → 保持用户当前选的日期。 */
+async function loadHotSearchPage(resetDay) {
+  if (!window._hotCalBound) {          // 点空白处收起日历（一次性绑定）
+    window._hotCalBound = true;
+    document.addEventListener("click", function () { closeHotCal(); });
+  }
+  await loadHotDays(resetDay);
+  await loadHotPage(1);
+  loadHotHeat();
+}
+
+/* 【v1.6.3】日期不再用下拉：数据攒几个月后下拉会长到几十项，改成日期按钮 +
+   前后一天 + 今天按钮；【v1.6.4】弹层改为自绘深色日历（系统原生 date picker
+   是白底弹窗，和本软件的暗色主题完全不搭）。热力点图也是第三种选日期的方式。 */
+async function loadHotDays(resetDay) {
+  let days = await apiCall("list_hot_days", 400);
+  if (!Array.isArray(days)) days = [];
+  HOT_DAYS = days;
+  const today = _todayStr();
+  if (resetDay || !HOT_DAY) HOT_DAY = days.length ? days[0].day : today;
+  updateHotDayUI();
+}
+
+function updateHotDayUI() {
+  const el = document.getElementById("hotDayText");
+  if (el && HOT_DAY) {
+    const isToday = HOT_DAY === _todayStr();
+    el.textContent = HOT_DAY.replace(/-/g, "/") + (isToday ? "（今天）" : "");
+  }
+  renderHotCal();
+}
+
+function setHotDay(day) {
+  if (!day) return;
+  HOT_DAY = day;
+  updateHotDayUI();
+  loadHotPage(1);
+  renderHotHeat();       // 只重画选中描边，不再打网络
+}
+
+function stepHotDay(delta) {
+  const base = HOT_DAY || _todayStr();
+  const d = new Date(base + "T00:00:00");
+  if (isNaN(d.getTime())) return;
+  d.setDate(d.getDate() + delta);
+  setHotDay(_ymd(d));
+}
+
+function jumpHotToday() {
+  setHotDay(_todayStr());
+  closeHotCal();
+}
+
+/* ---------------- 自绘深色日历弹层（v1.6.4） ---------------- */
+let HOT_CAL_Y = 0, HOT_CAL_M = 0;      // 当前展示的年 / 月（0-11）
+
+function toggleHotCal(e) {
+  if (e && e.stopPropagation) e.stopPropagation();
+  const box = document.getElementById("hotCal");
+  const btn = document.getElementById("hotDayBtn");
+  if (!box) return;
+  if (!box.hidden) { closeHotCal(); return; }
+  const d = new Date((HOT_DAY || _todayStr()) + "T00:00:00");
+  HOT_CAL_Y = d.getFullYear();
+  HOT_CAL_M = d.getMonth();
+  box.hidden = false;
+  if (btn) btn.classList.add("open");
+  renderHotCal();
+}
+
+function closeHotCal() {
+  const box = document.getElementById("hotCal");
+  const btn = document.getElementById("hotDayBtn");
+  if (box) box.hidden = true;
+  if (btn) btn.classList.remove("open");
+}
+
+function calShift(delta) {
+  HOT_CAL_M += delta;
+  if (HOT_CAL_M < 0) { HOT_CAL_M = 11; HOT_CAL_Y -= 1; }
+  if (HOT_CAL_M > 11) { HOT_CAL_M = 0; HOT_CAL_Y += 1; }
+  renderHotCal();
+}
+
+function calPick(day) {
+  setHotDay(day);
+  closeHotCal();
+}
+
+function renderHotCal() {
+  const box = document.getElementById("hotCal");
+  if (!box || box.hidden) return;
+  const has = {};
+  HOT_HEAT.forEach(d => { has[d.day] = true; });
+  const today = _todayStr();
+  const first = new Date(HOT_CAL_Y, HOT_CAL_M, 1);
+  const lead = (first.getDay() + 6) % 7;          // 周一起始
+  const start = new Date(HOT_CAL_Y, HOT_CAL_M, 1 - lead);
+  const wd = ["一", "二", "三", "四", "五", "六", "日"];
+  let cells = wd.map(w => `<div class="hsm-cal-wd">${w}</div>`).join("");
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+    const key = _ymd(d);
+    const cls = ["hsm-cal-d"];
+    if (d.getMonth() !== HOT_CAL_M) cls.push("dim");
+    if (has[key]) cls.push("has");
+    if (key === today) cls.push("today");
+    if (key === HOT_DAY) cls.push("sel");
+    cells += `<div class="${cls.join(" ")}" data-day="${key}">${d.getDate()}</div>`;
+  }
+  box.innerHTML = `<div class="hsm-cal-head">`
+    + `<button onclick="event.stopPropagation();calShift(-1)" title="上一月">‹</button>`
+    + `<span class="m">${HOT_CAL_Y} 年 ${HOT_CAL_M + 1} 月</span>`
+    + `<button onclick="event.stopPropagation();calShift(1)" title="下一月">›</button></div>`
+    + `<div class="hsm-cal-grid">${cells}</div>`
+    + `<div class="hsm-cal-foot"><button onclick="event.stopPropagation();jumpHotToday()">今天</button>`
+    + `<span class="hint">带圆点＝当天有记录</span></div>`;
+}
+
+
+
+/* 关键词输入防抖：别每敲一个字都打一次数据库 */
+function onHotKeywordInput() {
+  if (_HOT_KW_TIMER) clearTimeout(_HOT_KW_TIMER);
+  _HOT_KW_TIMER = setTimeout(() => loadHotPage(1), 260);
+}
+
+async function loadHotPage(page) {
+  if (page) HOT_PAGE = page;
+  if (!HOT_DAY) HOT_DAY = _todayStr();
+  const kwEl = document.getElementById("hotKeyword");
+  const poEl = document.getElementById("hotPinnedOnly");
+  const kw = kwEl ? kwEl.value.trim() : "";
+  const pinnedOnly = !!(poEl && poEl.checked);
+
+  const res = await apiCall("list_hot_search", HOT_DAY, kw, pinnedOnly, HOT_PAGE, HOT_PAGE_SIZE);
+  const rows = (res && res.rows) || [];
+  const total = (res && res.total) || 0;
+  const realPageSize = (res && res.page_size) || HOT_PAGE_SIZE;
+
+  renderHotRows(rows, kw, pinnedOnly);
+  setText("hotTotal", total);
+  renderHotPagination(total, realPageSize);
+  renderHotStat(total);
+}
+
+function renderHotStat(total) {
+  const box = document.getElementById("hotStat");
+  if (!box) return;
+  const meta = HOT_DAYS.find(d => d.day === HOT_DAY);
+  if (!meta || !total) {
+    box.textContent = meta
+      ? `当日共 ${meta.total} 条记录${meta.total ? "" : "（软件运行期间每分钟自动抓取一次，尚未产生数据）"}`
+      : "该日暂无记录";
+    return;
+  }
+  /* 记录时段：取首次与最后一次抓到的时刻（只要时分秒） */
+  const short = s => (s && s.length >= 19 ? s.slice(11, 19) : (s || "—"));
+  box.innerHTML = `当日共 <b>${meta.total}</b> 条词条 · 其中置顶 <b>${meta.pinned || 0}</b> 条`
+    + ` · 记录时段 ${esc(short(meta.first_at))} ~ ${esc(short(meta.last_at))}`;
+}
+
+function renderHotRows(rows, kw, pinnedOnly) {
+  const box = document.getElementById("hotBody");
+  if (!box) return;
+  HOT_ROWS = rows || [];
+  if (!rows.length) {
+    const why = kw ? `没有匹配「${esc(kw)}」的词条` :
+      (pinnedOnly ? "该日没有置顶记录" : "该日暂无热搜记录 —— 软件运行期间每分钟会自动抓取一次");
+    box.innerHTML = `<div class="hsm-empty">${why}</div>`;
+    return;
+  }
+  const head = `<div class="hsm-row hsm-head">`
+    + `<span>排名</span><span>词条</span><span>标签</span><span>峰值热度</span>`
+    + `<span>当日出现</span><span>出现时段</span></div>`;
+  const body = rows.map((r, i) => {
+    const pin = !!r.pinned;
+    const rank = pin ? `<span class="hsm-pin">置顶</span>`
+      : (r.rank_best || r.rank_first || "—");
+    const num = _fmtHotNum(r.hot_peak);
+    const t1 = (r.first_seen || "").slice(11, 16);
+    const t2 = (r.last_seen || "").slice(11, 16);
+    const span = t1 && t2 ? (t1 === t2 ? t1 : `${t1} → ${t2}`) : "—";
+    return `<div class="hsm-row${pin ? " hsm-pinned" : ""}" data-url="${esc(r.url || "")}"`
+      + ` data-idx="${i}" title="${esc(r.word || "")}">`
+      + `<span class="hsm-rank">${rank}</span>`
+      + `<span class="hsm-word">${esc(r.word || "")}</span>`
+      + `<span>${r.label ? `<span class="hsm-tag">${esc(r.label)}</span>` : ""}</span>`
+      + `<span class="hsm-num">${num || "—"}</span>`
+      + `<span class="hsm-times">${(r.seen_count || 1)} 次</span>`
+      + `<span class="hsm-time">${esc(span)}</span>`
+      + `</div>`;
+  }).join("");
+  box.innerHTML = head + body;
+  /* 事件委托：每次重建 innerHTML，逐个绑会累积监听器 */
+  if (!box.dataset.bound) {
+    box.dataset.bound = "1";
+    box.addEventListener("click", function (e) {
+      const row = e.target && e.target.closest ? e.target.closest(".hsm-row") : null;
+      if (!row || row.classList.contains("hsm-head")) return;
+      const url = row.getAttribute("data-url");
+      if (url) openExternal(url);
+    });
+  }
+  bindHotTipOnce();
+}
+
+function renderHotPagination(total, pageSize) {
+  const box = document.getElementById("hotPagination");
+  if (!box) return;
+  const size = Math.max(1, pageSize || HOT_PAGE_SIZE);
+  const pages = Math.max(1, Math.ceil(total / size));
+  if (HOT_PAGE > pages) HOT_PAGE = pages;
+  if (!total) { box.innerHTML = ""; return; }
+  const start = (HOT_PAGE - 1) * size + 1;
+  const end = Math.min(HOT_PAGE * size, total);
+  box.innerHTML = `
+    <button class="small ghost" onclick="changeHotPage(-1)" ${HOT_PAGE <= 1 ? "disabled" : ""}>上一页</button>
+    <span class="muted page-info">${HOT_PAGE} / ${pages}（${start}-${end} / ${total}）</span>
+    <button class="small ghost" onclick="changeHotPage(1)" ${HOT_PAGE >= pages ? "disabled" : ""}>下一页</button>
+  `;
+}
+
+function changeHotPage(delta) {
+  const next = HOT_PAGE + delta;
+  if (next < 1) return;
+  loadHotPage(next);
+}
+
+async function clearHotDay() {
+  const day = HOT_DAY || _todayStr();
+  if (!confirm(`确定删除 ${day} 的热搜记录？此操作不可恢复。`)) return;
+  const res = await apiCall("clear_hot_search", day);
+  if (res && res.ok) {
+    toast(`已删除 ${day} 的 ${res.removed || 0} 条热搜记录`, "ok");
+    await loadHotSearchPage(0);
+  } else {
+    toast("删除失败：" + ((res && res.error) || "未知错误"), "err");
+  }
+}
+
+/* ---------------- 【v1.6.3】热力点图（v1.6.4 铺满面板宽度） ---------------- */
+let HOT_HEAT_DAYS = 371;       // 53 周 × 7 = 371 天，正好铺满一行
+
+async function loadHotHeat() {
+  const box = document.getElementById("hotHeat");
+  if (!box) return;
+  const data = await apiCall("hot_search_heatmap", HOT_HEAT_DAYS);
+  HOT_HEAT = Array.isArray(data) ? data : [];
+  renderHotHeat();
+}
+
+function renderHotHeat() {
+  const box = document.getElementById("hotHeat");
+  if (!box) return;
+  if (!HOT_HEAT.length) {
+    box.innerHTML = `<div class="hsm-heat-empty">近一年还没有热搜记录 —— `
+      + `软件运行期间每分钟抓取一次，明天起这里就会长出格子</div>`;
+    return;
+  }
+  const map = {};
+  let max = 0;
+  HOT_HEAT.forEach(d => { map[d.day] = d; if ((d.heat || 0) > max) max = d.heat || 0; });
+
+  /* 网格范围：371 天前所在周的周一 → 今天；每列一周、每行一天（周一在上） */
+  const end = new Date(); end.setHours(0, 0, 0, 0);
+  const start = new Date(end); start.setDate(start.getDate() - (HOT_HEAT_DAYS - 1));
+  start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
+  const days = [];
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) days.push(new Date(d));
+  const cols = Math.ceil(days.length / 7);
+
+  const cells = [];
+  const monthCols = {};          // 每个月的列区间，用于排月份标签
+  days.forEach((dt, i) => {
+    const col = Math.floor(i / 7) + 1;
+    const row = (i % 7) + 1;
+    const mk = dt.getFullYear() * 12 + dt.getMonth();
+    if (!monthCols[mk]) monthCols[mk] = { first: col, last: col, label: dt.getMonth() + 1 };
+    monthCols[mk].last = col;
+
+    const key = _ymd(dt);
+    const rec = map[key];
+    const heat = rec ? (rec.heat || 0) : 0;
+    /* 用 √ 归一：早期数据少、数值跨度大，线性分档会把零星几天全压成最浅一档 */
+    const lv = heat > 0 ? Math.min(4, Math.max(1, Math.ceil(Math.sqrt(heat / max) * 4))) : 0;
+    const sel = key === HOT_DAY ? " sel" : "";
+    const tip = rec
+      ? `${key} · ${rec.total} 条 · 峰值合计 ${_fmtHotNum(rec.heat) || "—"}`
+      : `${key} · 无记录`;
+    cells.push(`<div class="hsm-heat-cell lv${lv}${sel}" style="grid-column:${col};grid-row:${row}"`
+      + ` data-day="${key}" title="${esc(tip)}"></div>`);
+  });
+
+  /* 月份标签：只给「宽度 ≥ 2 列」的月份打（网格两端那半个月不打，否则会挤掉相邻月份），
+     并且与上一个标签至少隔 3 列（标签本身占 3 列宽）。 */
+  const months = [];
+  let lastLabelCol = -3;
+  Object.keys(monthCols).map(Number).sort((a, b) => a - b).forEach(k => {
+    const m = monthCols[k];
+    if (m.last - m.first + 1 < 2) return;
+    const col = Math.max(m.first, lastLabelCol + 3);
+    if (col > m.last) return;
+    lastLabelCol = col;
+    months.push(`<span style="grid-column:${col} / span 3">${m.label}月</span>`);
+  });
+
+  box.innerHTML =
+    `<div class="hsm-heat-head">`
+    + `<div class="hsm-heat-title">近一年热度分布 · <b>${HOT_HEAT.length}</b> 天有记录 · 点格子跳到那天</div>`
+    + `<div class="hsm-heat-legend">更少`
+    + `<i class="lv0"></i><i class="lv1"></i><i class="lv2"></i><i class="lv3"></i><i class="lv4"></i>`
+    + `更多</div></div>`
+    + `<div class="hsm-heat-wrap">`
+    + `<div class="hsm-heat-wd"><span></span><span>一</span><span></span><span>三</span>`
+    + `<span></span><span>五</span><span></span></div>`
+    + `<div class="hsm-heat-main" style="--cols:${cols}">`
+    + `<div class="hsm-heat-months">${months.join("")}</div>`
+    + `<div class="hsm-heat-grid">${cells.join("")}</div>`
+    + `</div></div>`;
+
+  if (!box.dataset.bound) {
+    box.dataset.bound = "1";
+    box.addEventListener("click", function (e) {
+      const c = e.target && e.target.closest ? e.target.closest(".hsm-heat-cell") : null;
+      if (!c) return;
+      const day = c.getAttribute("data-day");
+      if (day && day !== HOT_DAY) setHotDay(day);
+    });
+  }
+}
+
+/* ---------------- 【v1.6.3】热搜悬停浮层 ----------------
+   本地留档数据是同步就有的，先秒出卡片；「原文」（作者/摘要/配图）要联网抓，
+   由后端后台线程负责，抓到后前端再补进去 —— 拿不到就只显示一句原因，不影响卡片。 */
+let _TIP_TIMER = null, _TIP_RETRY = null, _TIP_ROW = null, _TIP_WORD = "";
+
+function _tipEl() { return document.getElementById("hotTip"); }
+
+function bindHotTipOnce() {
+  const body = document.getElementById("hotBody");
+  const tip = _tipEl();
+  if (!body || !tip || body.dataset.tipBound) return;
+  body.dataset.tipBound = "1";
+
+  body.addEventListener("mouseover", function (e) {
+    const row = e.target && e.target.closest ? e.target.closest(".hsm-row") : null;
+    if (!row || row.classList.contains("hsm-head") || row === _TIP_ROW) return;
+    _TIP_ROW = row;
+    clearTimeout(_TIP_TIMER);
+    _TIP_TIMER = setTimeout(function () { showHotTip(row); }, 220);
+  });
+  body.addEventListener("mouseleave", function () { hideHotTipSoon(); });
+
+  tip.addEventListener("mouseenter", function () { clearTimeout(_TIP_TIMER); });
+  tip.addEventListener("mouseleave", function () { hideHotTipSoon(); });
+  tip.addEventListener("click", function (e) {
+    const b = e.target && e.target.closest ? e.target.closest("[data-open]") : null;
+    if (!b) return;
+    const url = b.getAttribute("data-open");
+    if (url) openExternal(url);
+  });
+}
+
+function hideHotTipSoon() {
+  const tip = _tipEl();
+  clearTimeout(_TIP_TIMER);
+  clearTimeout(_TIP_RETRY);
+  _TIP_TIMER = setTimeout(function () {
+    if (tip) { tip.classList.remove("show"); tip.hidden = true; }
+    _TIP_ROW = null;
+    _TIP_WORD = "";
+  }, 160);
+}
+
+function showHotTip(row) {
+  const tip = _tipEl();
+  const r = HOT_ROWS[Number(row.dataset.idx)];
+  if (!tip || !r) return;
+  _TIP_ROW = row;
+  _TIP_WORD = r.word || "";
+  clearTimeout(_TIP_RETRY);
+  tip.innerHTML = tipLocalHtml(r)
+    + `<div class="hot-tip-post" id="hotTipPost"><div class="hot-tip-note">正在获取微博原文…</div></div>`
+    + `<div class="hot-tip-actions">`
+    + `<button class="ghost" data-open="${esc(r.url || "")}">打开微博</button></div>`;
+  tip.hidden = false;
+  tip.classList.add("show");
+  positionHotTip(row);
+  fetchHotTipPost(_TIP_WORD, 0);
+}
+
+function positionHotTip(row) {
+  const tip = _tipEl();
+  if (!tip || !row) return;
+  const rect = row.getBoundingClientRect();
+  const w = tip.offsetWidth || 344;
+  const h = tip.offsetHeight || 240;
+  let x = rect.right + 14;
+  if (x + w > window.innerWidth - 10) x = rect.left - w - 14;
+  if (x < 10) x = Math.min(window.innerWidth - w - 10, 10);
+  let y = rect.top + rect.height / 2 - h / 2;
+  y = Math.max(10, Math.min(y, window.innerHeight - h - 10));
+  tip.style.left = Math.round(x) + "px";
+  tip.style.top = Math.round(y) + "px";
+}
+
+async function fetchHotTipPost(word, tries) {
+  if (!word) return;
+  const res = await apiCall("get_hot_preview", word);
+  if (word !== _TIP_WORD) return;          // 鼠标已经移到别的行了，丢弃这次结果
+  if (res && res.state === "loading") {
+    if (tries < 6) _TIP_RETRY = setTimeout(function () { fetchHotTipPost(word, tries + 1); }, 900);
+    return;
+  }
+  const box = document.getElementById("hotTipPost");
+  if (!box) return;
+  if (res && res.state === "ok") {
+    box.innerHTML = tipPostHtml(res);
+    /* 图片是异步加载的，加载完高度会变，得再贴一次边（否则底部会被窗口裁掉） */
+    box.querySelectorAll("img").forEach(function (im) {
+      im.addEventListener("load", function () { positionHotTip(_TIP_ROW); });
+    });
+    /* 抓到原文后补一个「查看原博」按钮（点开的是那条微博，不是搜索页） */
+    const act = _tipEl().querySelector(".hot-tip-actions");
+    if (act && res.post_url && !act.querySelector("[data-post]")) {
+      const b = document.createElement("button");
+      b.className = "ghost";
+      b.textContent = "查看原博";
+      b.setAttribute("data-open", res.post_url);
+      b.setAttribute("data-post", "1");
+      act.insertBefore(b, act.firstChild);
+    }
+  } else {
+    box.innerHTML = `<div class="hot-tip-note">原文预览不可用：`
+      + `${esc((res && res.error) || "未知原因")}</div>`;
+  }
+  positionHotTip(_TIP_ROW);                // 高度变了，重新贴一次边
+}
+
+function tipLocalHtml(r) {
+  const badges = [];
+  if (r.pinned) badges.push(`<span class="pin">置顶</span>`);
+  if (r.label) badges.push(`<span>${esc(r.label)}</span>`);
+  const rank = r.pinned ? "置顶" : (r.rank_best || r.rank_first || "—");
+  const num = _fmtHotNum(r.hot_peak) || "—";
+  const t1 = (r.first_seen || "").slice(11, 16);
+  const t2 = (r.last_seen || "").slice(11, 16);
+  const span = t1 && t2 ? (t1 === t2 ? t1 : `${t1} → ${t2}`) : "—";
+  return `<div class="hot-tip-word">${esc(r.word || "")}</div>`
+    + (badges.length ? `<div class="hot-tip-badges">${badges.join("")}</div>` : "")
+    + `<div class="hot-tip-grid">`
+    + `<div>当日最好排名 <b>${esc(String(rank))}</b></div>`
+    + `<div>峰值热度 <b>${num}</b></div>`
+    + `<div>上榜次数 <b>${r.seen_count || 1} 次</b></div>`
+    + `<div>出现时段 <b>${esc(span)}</b></div>`
+    + `</div>`;
+}
+
+function tipPostHtml(d) {
+  const imgs = (d.images || []).map(s => `<img src="${s}" alt="">`).join("");
+  const head = `<div class="hot-tip-post-head"><b>${esc(d.author || "微博原文")}</b>`
+    + `<span>${esc(d.created_at || "")}</span></div>`;
+  const body = d.text ? `<div class="hot-tip-text">${esc(d.text)}</div>` : "";
+  return head + body + (imgs ? `<div class="hot-tip-imgs">${imgs}</div>` : "");
+}
+
 
 /* 概览界面每秒自动刷新：仅当概览页处于激活态时拉取最新状态并重渲染，
    避免手动点击刷新；不影响其它页面（不会重置输入/滚动）。 */
@@ -1262,6 +1877,12 @@ function monAutoTick() {
 function renderForward() {
   const c = STATE.config;
   document.getElementById("intervalMin").value = c.interval_minutes;
+  /* 【v1.6.1】每轮排程数量（后端缺省/非法值一律按 1 显示） */
+  const fc = document.getElementById("forwardCount");
+  if (fc) {
+    const n = parseInt(c.forward_count, 10);
+    fc.value = (isNaN(n) || n < 1) ? 1 : Math.min(10, n);
+  }
   document.getElementById("aiSwitch").checked = !!c.ai_enabled;
   const normal = document.getElementById("normalSwitch");
   if (normal) normal.checked = !c.ai_enabled;   // 两种转发方式互斥
@@ -1271,8 +1892,13 @@ function renderForward() {
 async function saveInterval() {
   const v = parseInt(document.getElementById("intervalMin").value, 10);
   if (!v || v < 1) { toast("间隔需大于0", "err"); return; }
-  await apiCall("save_config", JSON.stringify({ interval_minutes: v }));
-  toast("间隔已保存", "ok"); await refreshStateFresh();
+  const fcEl = document.getElementById("forwardCount");
+  let n = parseInt(fcEl ? fcEl.value : 1, 10);
+  if (isNaN(n) || n < 1) n = 1;
+  if (n > 10) n = 10;
+  if (fcEl) fcEl.value = n;
+  await apiCall("save_config", JSON.stringify({ interval_minutes: v, forward_count: n }));
+  toast("间隔与排程数量已保存", "ok"); await refreshStateFresh();
 }
 /* 转发方式互斥切换：开启其一自动关闭另一种，且至少保留一种 */
 async function onForwardModeChange(which) {
@@ -2521,6 +3147,48 @@ function renderDataOverview() {
 
   // 趋势图
   renderDataOverviewChart();
+  /* 【v1.6.0 · P3-4】转发队列 */
+  renderForwardQueue();
+}
+
+/* 【v1.6.0 · P3-4】转发队列视图：最近 60 条记录 + 今日状态计数。
+   数据来自 get_data_overview 的 queue / status_counts（同一接口，不额外轮询）。 */
+function renderForwardQueue() {
+  const body = document.getElementById("fwdQueueBody");
+  const cnt = document.getElementById("fwdQueueCounts");
+  if (!body) return;
+  const d = DATA_OVERVIEW || {};
+  const q = d.queue || [];
+  const sc = ((d.status_counts || {}).today) || {};
+
+  if (cnt) {
+    const rows = [["成功", sc.success || 0, "ok"],
+                  ["跳过", sc.skipped || 0, "dim"],
+                  ["失败", sc.failed || 0, "bad"]];
+    cnt.innerHTML = rows.map(r =>
+      `<span class="q-count ${r[2]}">${r[0]}<b>${r[1]}</b></span>`).join("");
+  }
+
+  if (!q.length) {
+    body.innerHTML = `<tr><td colspan="6" class="muted">暂无转发记录 —— 队列在每次轮询执行转发后产生；` +
+      `若历史数据仍在旧版数据目录里，可用后续版本的数据迁移功能导入。</td></tr>`;
+    return;
+  }
+  const stText = { success: "成功", skipped: "跳过", failed: "失败" };
+  const stCls = { success: "ok", skipped: "dim", failed: "bad" };
+  body.innerHTML = q.map(it => {
+    const st = stText[it.status] || it.status || "未知";
+    const cls = stCls[it.status] || "dim";
+    const detail = it.reason || it.excerpt || "";
+    return `<tr>
+      <td class="q-time">${esc((it.at || "").slice(5, 16))}</td>
+      <td>${esc(it.account_name || "—")}</td>
+      <td>${esc(it.screen_name || "—")}</td>
+      <td>${it.type === "ai" ? "AI" : "普通"}</td>
+      <td><span class="q-badge ${cls}">${esc(st)}</span></td>
+      <td class="q-detail" title="${esc(detail)}">${esc(detail) || "—"}</td>
+    </tr>`;
+  }).join("");
 }
 
 function renderDataOverviewChart() {
@@ -2541,15 +3209,30 @@ function renderDataOverviewChart() {
   if (!svg || svg.tagName !== "svg") {
     wrap.innerHTML = `<svg id="dataOverviewChart" class="data-chart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>`;
   }
-  drawLineChart("dataOverviewChart", series, "monitored", "forwarded", "label");
+  /* 【v1.6.0 · P3-2】后端新增 skipped / failed 拆分；这里合成一条「异常」线，
+     兼容旧接口（无该字段时按 0 处理），并顺手算区间汇总与成功率。 */
+  const data = series.map(d => Object.assign({}, d, {
+    bad: (typeof d.bad === "number") ? d.bad : ((d.skipped || 0) + (d.failed || 0))
+  }));
+  const totMon = data.reduce((s, d) => s + (d.monitored || 0), 0);
+  const totOk = data.reduce((s, d) => s + (d.forwarded || 0), 0);
+  const totBad = data.reduce((s, d) => s + (d.bad || 0), 0);
+  const rate = (totOk + totBad) > 0 ? (totOk / (totOk + totBad) * 100).toFixed(1) + "%" : "—";
+  const sum = document.getElementById("dovSeriesSummary");
+  if (sum) {
+    sum.innerHTML = `本区间：抓取 <b>${totMon}</b> · 转发成功 <b>${totOk}</b>` +
+      ` · 跳过/失败 <b class="bad">${totBad}</b> · 成功率 <b>${rate}</b>`;
+  }
+  drawLineChart("dataOverviewChart", data, "monitored", "forwarded", "label", "bad");
 }
 
-function drawLineChart(svgId, data, keyA, keyB, labelKey) {
+function drawLineChart(svgId, data, keyA, keyB, labelKey, keyC) {
   const svg = document.getElementById(svgId);
   if (!svg) return;
   const W = 800, H = 260, pad = { top: 20, right: 20, bottom: 36, left: 44 };
   const labels = data.map(d => d[labelKey]);
-  const maxV = Math.max(1, ...data.map(d => Math.max(d[keyA] || 0, d[keyB] || 0)));
+  const maxV = Math.max(1, ...data.map(d => Math.max(d[keyA] || 0, d[keyB] || 0,
+    keyC ? (d[keyC] || 0) : 0)));
   const chartW = W - pad.left - pad.right;
   const chartH = H - pad.top - pad.bottom;
   const step = data.length > 1 ? chartW / (data.length - 1) : chartW;
@@ -2563,6 +3246,7 @@ function drawLineChart(svgId, data, keyA, keyB, labelKey) {
 
   const pathD = (pts) => pts.map((p, i) => (i ? "L" : "M") + `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
   const ptsA = points(keyA), ptsB = points(keyB);
+  const ptsC = keyC ? points(keyC) : null;   // 【v1.6.0】跳过 / 失败线（虚线，不画点，避免抢视线）
 
   // 网格线 + Y 轴文字
   let gridLines = "";
@@ -2589,6 +3273,7 @@ function drawLineChart(svgId, data, keyA, keyB, labelKey) {
     ${gridLines}${yLabels}${xLabels}
     <path d="${pathD(ptsA)}" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
     <path d="${pathD(ptsB)}" fill="none" stroke="var(--green)" stroke-width="2.5"/>
+    ${ptsC ? `<path d="${pathD(ptsC)}" fill="none" stroke="var(--red)" stroke-width="1.8" stroke-dasharray="5 4" opacity=".9"/>` : ""}
     ${ptsA.map(p => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3" fill="var(--accent)"/>`).join("")}
     ${ptsB.map(p => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3" fill="var(--green)"/>`).join("")}
   `;
@@ -3156,6 +3841,94 @@ function renderAbout() {
    数据内嵌于前端，保证离线可用（本软件为单机离线运行）。
    与 README.md「版本迭代记录」保持同步维护。 */
 const CHANGELOG = [
+  {
+    ver: "v1.6.4", internal: "2611050004", date: "2026-11-05",
+    title: "热力点图铺满面板 + 日期选择改成深色自绘日历",
+    items: [
+      "【热力点图铺满宽度】上一版固定 11px 小格子，面板右侧空着一大片。现在格子改为**按容器等比分**：列宽 `1fr` + 正方形比例，窗口越宽格子越大，整张图横向铺满面板、不再有横向滚动条。为了让格子不至于被拉成大方块，统计跨度同步从 6 个月扩到**近一年**（53 周），历史保留期也从 180 天放宽到 400 天——否则一年里有一半是空的。",
+      "【月份标签排布修正】原来是「换月就打标签、太近就跳过」，结果网络两端那半个月会占掉标签位、把紧邻的正月挤没（出现过「10月 → 12月」跳月）。现在先算出每个月的列区间，只给宽度 ≥ 2 列的月份打标签，且与上一个标签至少隔 3 列，标签连续不重叠。",
+      "【深色自绘日历】系统原生的 `<input type=date>` 弹层是**纯白底**，和本软件的暗色主题完全冲突（截图里像个白补丁）。现在换成自绘日历：头部月份切换、周一起始、日期格、底部「今天」，配色全部走主题变量（`--bg-card` / `--border` / `--accent`），选中日是橙色实心、今天有橙色描边；**有记录的日子下面带一个橙色小圆点**，一眼看出哪天有数据、可直接点选。点空白处自动收起。",
+      "【日期按钮】触发按钮显示 `2026/11/05（今天）` 并带日历图标，配合两侧 `‹ ›` 逐日前后翻。"
+    ]
+  },
+  {
+    ver: "v1.6.3", internal: "2611050003", date: "2026-11-05",
+    title: "热搜页三改：日期任选、橙色热力点图、悬停看原文",
+    items: [
+      "【日期不再只有一个下拉】原来用一个下拉列「有记录的日期」，攒上几个月就会变成几十上百项，翻起来很难受。现在改成**原生日期框 + 前后一天按钮 + 今天按钮**：任意一天都能直接选（没记录的那天会明确告诉你「该日暂无记录」），按 ← → 可逐日回看。",
+      "【新增·近 6 个月热力点图】「当日热搜」面板上方加了一条橙色点阵：一列一周、一行一天，**格子的深浅 = 当日所有词条的峰值热度合计**（不是取最大值——单个爆款会把整天的颜色带偏，用合计才代表这一天整体有多热）。鼠标悬停看该日条数与热度合计，**点格子直接跳到那一天**，等于第三种选日期的方式。颜色按 √ 归一分成 5 档，数据少的日子也不会全糊成一片。",
+      "【新增·悬停看原文】鼠标停在任意一条热搜上，浮层**立刻**给出本地留档信息：当日最好排名、峰值热度、上榜次数、出现时段、标签与置顶标记；随后后台去抓该话题下的微博原文，抓到就把**作者、正文摘要、配图缩略图**补进浮层，底部可「查看原博」。",
+      "【原文抓取的现实约束】微博的搜索接口对匿名访客已关闭（移动端返回 432、网页端直接落到 Sina Visitor System 访客校验页），只有带着有效登录 Cookie 才拿得到原文。所以这一块是**尽力而为**：没登录 / 抓取失败时浮层只保留本地卡片，并写明原因，绝不影响使用。",
+      "【工程约束】抓取全部放在后台线程，桥方法只读缓存（6 小时有效、最多 80 条）：pywebview 的桥调用跑在 WebView2 的 UI 线程上，一经网络往返窗口就会假死。配图下载后转成 data URI 直接内联，不落盘、不新增临时文件。",
+      "【测试】基准测试 42 → 45 项：新增热力图按日聚合（置顶不抬热度 / 超出 6 个月的旧日子不入图）、搜索结果页解析（作者 / 正文 / 配图缩略图 / 时间去噪）、原文预览空值守卫。"
+    ]
+  },
+  {
+    ver: "v1.6.2", internal: "2611050002", date: "2026-11-05",
+    title: "新增「热搜管理」：按日留档微博热搜，含置顶要闻",
+    items: [
+      "【新增·热搜管理】「数据管理」组在「历史记录」之后新增「热搜管理」页。每抓到一次热搜榜就按「日期 + 词条」落库，同一天同一个词条只占一行（不再每分钟 × 20 条地灌），留存字段包括：首次排名、当日最好排名、峰值热度、首次/最近出现时间、被看到次数——想回看「某一天热搜上都有什么、最高冲到第几」直接选日期即可。",
+      "【置顶要闻一并留档】微博榜单最上面的「置顶」要闻走的是 `data.hotgov` 字段，不在实时榜数组里、也没有热度值。本次把它单独采集并标 `pinned=1`、排名记 0，在历史列表里固定排在最前，并支持「只看置顶」筛选——这类要闻往往是最值得回溯的内容，以前刷新一次就没了。",
+      "【查询与清理】日期下拉只列有记录的日期（附当天词条数与置顶数）；支持关键词模糊搜索 + 分页；「清空当日」可单独删掉某一天的记录。历史默认保留 180 天，后台每天自动裁掉超期数据，不会无限增长。",
+      "【概览热搜卡同步】概览页「微博热搜」卡顶部也单独渲染置顶要闻（带虚线与普通排名分隔），并对齐了「序号 / 词条 / 沸·热·新 / 热度」四列宽度——没有标签的行用占位符，热度数字不再左右跳动。",
+      "【数据源容错】置顶要闻解析兼容 `hotgov` 对象与 `hotgovs` 数组两种结构，并把 `http://` 链接统一升到 `https://`。",
+      "【测试】基准测试 39 → 42 项：新增热搜落库聚合（同词条合并 / 排名取优 / 热度取峰 / 计数累加）、置顶排序与筛选、日期汇总与按日清理 3 项。"
+    ]
+  },
+  {
+    ver: "v1.6.1", internal: "2611050001", date: "2026-11-05",
+    title: "每轮排程数量可配置 + 概览右半分栏接入微博实时热搜",
+    items: [
+      "【排程明细不再沉底】上一版 `scheduled`（排程转发）这个动作名没有登记进「最近一次轮询结果」的排序表，取不到序号就落到默认值 5，被排到 100 多行「本轮随机未选中」的最后一行——用户得滚到底才能看见「已排程转发（预计 xx:xx:xx 执行）：纯转发」。现在 `scheduled` 与 `forwarded` 并列最前，紧跟「本轮排程转发 N 条」汇总行。",
+      "【新增·每轮排程数量】「转发设置 → 轮询间隔」卡新增「排程数量（条/轮）」设置（1~10，默认 1，改动即时生效）。轮询后从新微博候选池里挑取多条，**优先一条分配一个监控对象**，候选不足时才回到同一对象补，避免同一条微博下连发多条；同一对象被选中多条时日志里用「；」串接，状态取更重要的一条。进度环对齐最早那一跳的执行时刻。",
+      "【新增·微博实时热搜】概览页下半区改为左右分栏：左半保留「最近一次轮询结果」，右半新增「微博热搜」——显示实时榜前 20 条（序号 / 词条 / 沸·热·新标签 / 热度），**每分钟自动刷新**，点任意词条用系统默认浏览器打开对应搜索页。抓取在独立后台线程里按 60 秒节流执行，桥接口只读快照，不会卡住界面；接口异常时保留上一份榜单并标注，不会突然清空。",
+      "【数据源】主用 `weibo.com/ajax/side/hotSearch`（JSON，带账户 Cookie 更稳），失败回退 `s.weibo.com/top/summary` 页 HTML 解析；两路都失败才报错。",
+      "【安全加固·外链协议】`open_external` 原先来者不拒，`file:///`、`javascript:`、`ms-msdt:` 这类伪协议同样会被系统当作执行处理。现在只放行 http / https，其余一律拒绝并记日志。",
+      "【测试】基准测试 35 → 39 项：新增排程数量钳制、候选挑选分散性、热搜链接构造、外链协议闸门 4 项。"
+    ]
+  },
+  {
+    ver: "v1.6.0", internal: "2610260004", date: "2026-10-26",
+    title: "安全加固 + 启动观感优化 + 数据大盘（失败率趋势 / 转发队列）",
+    items: [
+      "【安全加固·任意读盘】`load_image_base64` / `load_media_base64` 原先直接把外部传入的路径拼在数据目录后面，而拼接函数遇到绝对路径会丢弃前缀——传入系统目录里的文件就能被读成 base64 回传（已实测能读出 win.ini）。现在所有读图 / 读媒资 / 取文件 URL 都先过 `_safe_path` 校验（`commonpath` 钳制在数据目录内），并且只放行图片 / 视频扩展名，未知类型不再兜底成 image/jpeg。",
+      "【安全加固·任意执行】`open_path` 原来不做任何限制，传入一个可执行文件就会被系统真的拉起来（实测计算器被启动）。现在目录仍然放行（只会在资源管理器里打开），文件则必须同时满足「在数据目录内」+「不在可执行黑名单里」（exe / bat / cmd / ps1 / vbs / js / msi / scr / lnk / reg 等一律拒绝，并记一条 warn 日志）。",
+      "【启动观感·进度条自我推进】实测窗口出现后到桥挂载之间有 3.5~4 秒，这段桥还不存在，`bootProgress()` 一行都跑不到，进度条死死停在 4%、文字一直是「正在启动界面…」，观感就是卡死。现在开屏页自带一段不依赖桥的内联脚本，DOM 一解析完就缓动推进到 62% 并轮换阶段文案，真实阶段接管后自动停下、只增不减。",
+      "【启动性能·分词预热】内置引擎首次生成要 685ms，大头是 `jieba` 首次载入词典。首屏稳定后由后台线程提前 `initialize()`，用户第一次点生成时词典已是热的。",
+      "【数据大盘·失败率进趋势图】趋势图原先只有「抓取 / 转发成功」两条线，看不出失败。后端按日 / 小时 / 月把 `skipped`（命中去重等）与 `failed` 拆出来，前端合成第三条虚线「跳过 / 失败」，并在图上方给出区间汇总：抓取合计、转发成功、异常数、**成功率**。",
+      "【数据大盘·转发队列视图】数据总览新增「转发队列」卡：最近 60 条转发记录（时间 / 账号 / 对象 / 类型 / 状态 / 原因或摘要），今日成功·跳过·失败计数在右上角，失败原因直接可读，不用再翻日志。",
+      "【测试】基准测试从 29 项扩到 35 项：新增 `appjs_syntax`（`node --check` 全部前端 js）、4 项路径安全探针、1 项数据大盘聚合校验。"
+    ]
+  },
+  {
+    ver: "v1.5.8", internal: "2610260003", date: "2026-10-26",
+    title: "修复 v1.5.7 启动卡在「正在启动界面…」（前端语法错误）+ 加构建期 JS 门禁",
+    items: [
+      "【启动卡死根因】v1.5.7 往本更新日志里写说明文字时，带了一个**未转义的双引号**（`splitext('history.db-wal')` 写成了双引号形式）。整个 app.js 在第一个引号处就提前闭合、后面全被当成语法错误，浏览器拒绝执行 → 界面停在启动遮罩，永远到不了主界面。现改用单引号，并已通过 node --check 校验。",
+      "【为什么没被拦住】Python 侧的语法编译、模块导入、29 项基准测试全部照常通过——没有一项检查 .js 文件，于是错误一路进了 exe。现在 `_do_build_v151k.py` 打包前会先对 `_ui_v151k` 下所有 js 执行 `node --check`，**不通过直接中止构建**；基准测试也新增了 `appjs_syntax` 这一项。",
+      "【自查】更新日志属于纯文本，但位于 JS 字符串里：以后写这一段只用中文引号「」或单引号，不要出现裸双引号。"
+    ]
+  },
+  {
+    ver: "v1.5.7", internal: "2610260002", date: "2026-10-26",
+    title: "全量代码核查 + 5 轮基准测试，批量修复 7 处 P0 缺陷",
+    items: [
+      "【授权可被篡改】有效期原先读 `license.json` 里的**明文** `exp`，而 `exp == 0` 又代表永久版直接放行——把该字段改成 0 就能白嫖永久授权（改密钥会校验失败、改 exp 却生效，等于签名形同虚设）。现只认 HMAC 校验过的密钥体内解出的 exp，明文篡改不再有任何效果。",
+      "【本地大模型必失败】`model_manager.load_model()` 里写的是 `model_path=_mp`，而 `_mp` 只是下载函数里的局部变量——选 local_gguf 引擎必然 `NameError`，用户只看到「模型加载失败」。已改为调用 `model_path()`；同时补上缺失的 `debug` 导入，老配置兜底分支不再抛异常。",
+      "【Cookie 续期静默崩溃】`weibo_client` 续期成功分支调用了 `info()`，但该模块只导入了 `warn/debug`——一旦会话真的续期成功就抛 `NameError`，抓取流程中断且日志里查不到原因。已补导入。",
+      "【日志超过 8MB 会死锁】`_fh_lock` 原是普通 `Lock`，而 `_get_fh()` 持锁后会经 `_rotate_if_needed()` → `_close_fh()` 再抢同一把锁（不可重入）→ 写入线程永久阻塞，表现为「日志不再更新、退出时卡住」。改为 `RLock`。",
+      "【清缓存会删掉 1GB 模型 / 活库 WAL】`_PRESERVE_EXT` 缺 `.gguf`，清理 models 目录会把模型删掉；又因 `splitext('history.db-wal')` 得到 `.db-wal`、旁挂文件按扩展名匹配永远对不上，`-wal`/`-shm` 会被当缓存删除（未落盘事务直接丢失）。现补全后缀白名单并按后缀匹配旁挂文件。",
+      "【删人格报错】`delete_custom_persona` 成功路径没有 `return`，桥接返回 `None` → 前端判定 `r.ok` 为假，明明删成功却弹「删除失败」。已补返回值。",
+      "【首启向导背景透明 / 版本号长期错位】CSS 里 `var(--card)` 这个变量不存在（主题里只有 `--bg-card`），首次启动向导整块透明地浮在遮罩上；`paths.MAJOR_VERSION` 写死 `v1.3.2`、桥接兜底 internal 写死 `2609040001`，版本号从 v1.4.x 起就一直对不上。现统一以 `version.py` / `version.json` 为单一来源。"
+    ]
+  },
+  {
+    ver: "v1.5.6", internal: "2610260001", date: "2026-10-26",
+    title: "修复子项选中时侧栏底部出现横向滚动条",
+    items: [
+      "【修复横向滚动条】v1.5.5 把横向位移并入了 `transform: translateX(22px)`，但高亮块的盒子仍是满宽（`left:0; right:0`）——平移后右侧越出侧栏 22px，侧栏只有 `overflow-y:auto`，于是多出一条横向滚动条，看起来像「列宽多了一块」。现把盒子右边界改为随横移同步内收（`right: 0/22px`，与 transform 同曲率过渡，右缘全程贴容器右缘），并给侧栏加 `overflow-x: hidden` 兜底。headless 实测：修复前 scrollWidth 222 vs clientWidth 200（溢出 22px），修复后 200 = 200。"
+    ]
+  },
   {
     ver: "v1.5.5", internal: "2610160004", date: "2026-10-16",
     title: "侧栏选中动效重做为「划动感」（参照 Win11 设置录屏）",

@@ -215,21 +215,27 @@ def get_status() -> dict:
     now = int(time.time())
     machine_mismatch = False
     if lic:
-        exp = lic.get("exp", 0)
-        active = (exp == 0) or (exp > now)
-        if active:
-            # 运行时重新校验机器绑定（防止复制 data/ 把激活状态复制走）
-            parsed = parse_license_key(lic.get("key", ""))
-            if parsed and parsed.get("mid_ok"):
+        # 【v1.5.7】有效期只认**密钥签名内**的 exp，不再读明文 lic["exp"]。
+        # 旧实现取 lic.get("exp", 0)，而 exp==0 又代表永久版直接放行 ——
+        # 于是把 license.json 里的 "exp" 改成 0 就能白嫖永久授权（改 key
+        # 会校验失败，改 exp 却生效，等于签名形同虚设）。改后：exp 由
+        # HMAC 校验过的 body 解出，明文篡改不再有任何效果。
+        parsed = parse_license_key(lic.get("key", ""))
+        if parsed:
+            exp = int(parsed.get("exp", 0))
+            active = (exp == 0) or (exp > now)
+            if active and parsed.get("mid_ok"):
                 return {
                     "licensed": True,
                     "trial": False,
-                    "type_name": lic.get("type_name", KEY_TYPES.get(lic.get("type"), "未知")),
-                    "type": lic.get("type"),
+                    "type_name": KEY_TYPES.get(parsed.get("type"),
+                                               KEY_TYPES.get(lic.get("type"), "未知")),
+                    "type": parsed.get("type"),
                     "exp": exp,
                     "exp_str": _fmt_exp(exp),
                 }
-            machine_mismatch = True  # 密钥有效但机器不匹配：复制 data/ 导致
+            if active:
+                machine_mismatch = True  # 密钥有效但机器不匹配：复制 data/ 导致
     t = trial_info()
     return {
         "licensed": False,

@@ -10,9 +10,10 @@ import os
 import re
 import time
 from datetime import datetime
+from urllib.parse import quote
 
 import requests
-from logger import warn, debug, CAT_HTTP
+from logger import warn, debug, info, CAT_HTTP   # 【v1.5.7】补 info：续期成功分支原先 NameError
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -1759,3 +1760,251 @@ def repost(post_id: str, comment: str, cookie: str, st: str = "", uid: str = "")
                 continue
             return {"ok": False, "error": last_err}
     return {"ok": False, "error": last_err}
+
+
+# ---------------------------------------------------------------------------
+# 实时热搜（v1.6.1）
+# ---------------------------------------------------------------------------
+# 概览页新增「微博热搜」分栏，每分钟刷新一次。两条数据源：
+#   ① weibo.com/ajax/side/hotSearch —— 网页版右侧栏榜单的 JSON 接口，字段
+#      word / num / label_name / word_scheme 稳定，无需登录态即可取（带 Cookie 更稳）；
+#   ② s.weibo.com/top/summary —— 热搜页 HTML，作为接口改版时的兜底解析。
+# 两者都失败时返回 ok=False，由调用方保留上一份快照，用户不会看到榜单突然清空。
+HOT_AJAX_URL = "https://weibo.com/ajax/side/hotSearch"
+HOT_WEB_URL = "https://s.weibo.com/top/summary"
+
+# <td class="td-02"><a href="/weibo?q=...">词条</a><span>1234567</span></td>
+_HOT_ITEM_RE = re.compile(r'<td class="td-02">\s*<a href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+_HOT_TAIL_RE = re.compile(r'</a>(.*?)</td>', re.S)
+_HOT_NUM_RE = re.compile(r"<span>\s*([\d,]+)\s*</span>")
+
+
+def hot_search_url(word: str, word_scheme: str = "") -> str:
+    """构造热搜词条的搜索页地址（优先用微博给出的 word_scheme，自带 #话题# 包裹）。"""
+    q = (word_scheme or "").strip() or (word or "").strip()
+    if not q:
+        return HOT_WEB_URL
+    if "#" not in q and "%23" not in q:
+        q = f"#{q}#"
+    return "https://s.weibo.com/weibo?q=" + quote(q, safe="")
+
+
+def _hot_pinned(data: dict) -> list:
+    """从榜单 data 里取「置顶要闻」（hotgov / hotgovs）。
+
+    网页版热搜榜顶部那条带「置顶」标识的内容就是它：is_gov=1，pos=1，指向一条
+    官方微博。它不进 realtime 列表、也没有热度值，所以单独拎出来 —— 用户明确
+    要求「置顶的热搜信息要保留」，历史库里用 pinned=1 长期留档。
+    """
+    out, seen = [], set()
+    cands = []
+    for key in ("hotgov", "hotgovs"):
+        v = data.get(key)
+        if isinstance(v, dict):
+            cands.append(v)
+        elif isinstance(v, list):
+            cands.extend([x for x in v if isinstance(x, dict)])
+    for it in cands:
+        word = (it.get("word") or it.get("name") or "").strip()
+        if not word or word in seen:
+            continue
+        seen.add(word)
+        url = (it.get("url") or "").strip()
+        # hotgov 指给的是那条官方微博的地址；取不到就退回该词条的搜索结果页
+        if not url.startswith("http"):
+            url = hot_search_url(word)
+        elif url.startswith("http://"):
+            url = "https://" + url[7:]
+        out.append({
+            "word": word,
+            "hot": 0,
+            "label": (it.get("icon_desc") or it.get("small_icon_desc") or "").strip(),
+            "url": url,
+            "pinned": True,
+        })
+    return out
+
+
+def get_hot_search(cookie: str = "", limit: int = 20) -> dict:
+    """抓取微博「实时热搜」榜前 N 条 + 置顶要闻。
+
+    返回 ``{"ok": bool, "items": [{"word","hot","label","url"}...],
+    "pinned": [同上但 pinned=True], "source": "ajax"/"html"}``。
+    只做一次网络往返（每个数据源一次），失败即降级，绝不在调用线程里重试多次 ——
+    这个函数由 api_bridge 的后台线程驱动，不能拖慢界面。
+    """
+    try:
+        limit = max(1, min(int(limit or 20), 50))
+    except Exception:
+        limit = 20
+    errs = []
+
+    # ① 网页版 ajax 榜单
+    try:
+        s = _session(cookie or "", referer=f"{WEB_BASE}/")
+        r = s.get(HOT_AJAX_URL, timeout=10)
+        if r.status_code == 200:
+            j = _safe_json(r) or {}
+            data = j.get("data") if isinstance(j, dict) else None
+            realtime = (data or {}).get("realtime") or []
+            items = []
+            for it in realtime:
+                if not isinstance(it, dict):
+                    continue
+                word = (it.get("word") or "").strip()
+                if not word:
+                    continue
+                try:
+                    hot = int(it.get("num") or 0)
+                except Exception:
+                    hot = 0
+                items.append({
+                    "word": word,
+                    "hot": hot,
+                    "label": (it.get("label_name") or "").strip(),
+                    "url": hot_search_url(word, it.get("word_scheme") or ""),
+                })
+                if len(items) >= limit:
+                    break
+            if items:
+                return {"ok": True, "items": items,
+                        "pinned": _hot_pinned(data or {}), "source": "ajax"}
+            errs.append("ajax 榜单为空")
+        else:
+            errs.append(f"ajax HTTP {r.status_code}")
+    except Exception as e:
+        errs.append(f"ajax 异常：{e}")
+
+    # ② 热搜页 HTML 兜底
+    try:
+        s = _session(cookie or "", referer=f"{WEB_BASE}/")
+        r = s.get(HOT_WEB_URL, timeout=10)
+        text = r.text or ""
+        items = []
+        for m in _HOT_ITEM_RE.finditer(text):
+            href, body = m.group(1), m.group(2)
+            word = clean_text(body)
+            if not word:
+                continue
+            # 热度数字在同一个 <td> 里、</a> 之后
+            tail = _HOT_TAIL_RE.search(text, m.end())
+            hot = 0
+            if tail:
+                mn = _HOT_NUM_RE.search(tail.group(1) or "")
+                if mn:
+                    try:
+                        hot = int(mn.group(1).replace(",", ""))
+                    except Exception:
+                        hot = 0
+            if href.startswith("http"):
+                url = href
+            else:
+                url = "https://s.weibo.com" + href
+            items.append({"word": word, "hot": hot, "label": "", "url": url})
+            if len(items) >= limit:
+                break
+        if items:
+            return {"ok": True, "items": items, "pinned": [], "source": "html"}
+        errs.append("HTML 未解析到条目")
+    except Exception as e:
+        errs.append(f"HTML 异常：{e}")
+
+    return {"ok": False, "items": [], "pinned": [],
+            "error": "；".join(errs) or "获取热搜失败"}
+
+
+# --------------------------------------------------------------------------- #
+#  热搜词条「原文预览」（v1.6.3）
+#  热搜管理页悬停某条热搜时，除了本地留档数据，还尽量带出该话题下首条微博的
+#  作者 / 正文摘要 / 配图缩略图。微博搜索接口对匿名访客已关闭（m.weibo.cn 返回
+#  432、s.weibo.com 落到 Sina Visitor System），只有带着有效登录 Cookie 才拿得到，
+#  所以这里一律「尽力而为」：拿不到就返回 ok=False，由前端退回纯本地卡片。
+# --------------------------------------------------------------------------- #
+SEARCH_URL = "https://s.weibo.com/weibo?q={q}"
+
+# 搜索结果页里每条微博是一个 <div class="card-wrap" ... mid="...">，用下一条的开头
+# 作为边界切块（微博的 HTML 没有换行缩进，只能靠这个办法分块）。
+_SEARCH_CARD_RE = re.compile(r'<div class="card-wrap"[^>]*?\smid="(\d+)"(.*?)(?=<div class="card-wrap"|\Z)', re.S)
+_SEARCH_TXT_RE = re.compile(r'<p[^>]*node-type="feed_list_content"[^>]*>(.*?)</p>', re.S)
+_SEARCH_NICK_RE = re.compile(r'nick-name="([^"]*)"')
+_SEARCH_NAME_RE = re.compile(r'<a[^>]+class="name"[^>]*>([^<]{1,40})</a>')
+_SEARCH_TIME_RE = re.compile(r'<div class="from">(.*?)</div>', re.S)
+_SEARCH_IMG_RE = re.compile(r'src="((?:https?:)?//(?:wx|ww)\d\.sinaimg\.cn/[^"]+)"')
+_THUMB_SEG_RE = re.compile(r"/(large|orj360|mw2000|mw690|bmiddle)/")
+
+
+def _thumb_url(url: str) -> str:
+    """把微博图床原图地址换成 thumb150 缩略图 —— 悬停浮层里只要看得清就行，
+    少下几十倍字节，避免每次悬停都拉几百 KB 的图。"""
+    u = _normalize_image_url(url)
+    if not u:
+        return ""
+    return _THUMB_SEG_RE.sub("/thumb150/", u)
+
+
+def parse_search_html(text: str, limit: int = 1) -> list:
+    """解析 s.weibo.com 搜索结果页，取出前 N 条微博的元信息。
+
+    抽成独立函数是为了能拿固定 HTML 片段做单元测试（真实页面需要登录态，
+    测试环境拿不到，不能把解析逻辑和网络耦合在一起）。
+    """
+    out = []
+    try:
+        limit = max(1, int(limit))
+    except Exception:
+        limit = 1
+    for m in _SEARCH_CARD_RE.finditer(text or ""):
+        mid, block = m.group(1), m.group(2)
+        tm = _SEARCH_TXT_RE.search(block)
+        body = clean_text(tm.group(1)) if tm else ""
+        if not body:
+            continue
+        nick = _SEARCH_NICK_RE.search(block)
+        author = (nick.group(1) if nick else "").strip()
+        if not author:
+            nm = _SEARCH_NAME_RE.search(block)
+            author = clean_text(nm.group(1)) if nm else ""
+        images = []
+        for im in _SEARCH_IMG_RE.finditer(block):
+            u = _thumb_url(im.group(1))
+            if u and u not in images:
+                images.append(u)
+            if len(images) >= 3:
+                break
+        cm = _SEARCH_TIME_RE.search(block)
+        created = ""
+        if cm:
+            # .from 里同时有「作者名」和「发布时间」两个 <a>，取最后一个才是时间
+            parts = [clean_text(x) for x in re.findall(r"<a[^>]*>(.*?)</a>", cm.group(1), re.S)]
+            parts = [x for x in parts if x]
+            created = parts[-1] if parts else clean_text(cm.group(1))
+        out.append({"mid": mid, "author": author, "text": body,
+                    "images": images, "created_at": created,
+                    "url": "https://weibo.com/%s" % mid})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def get_hot_topic_preview(word: str, cookie: str = "", limit: int = 1) -> dict:
+    """按热搜词条去搜一条微博，作为悬停浮层的「原文预览」。
+
+    返回 ``{"ok": True, "post": {...}, "source": "search"}``；
+    需要登录 / 解析不到时 ``{"ok": False, "error": "..."}`` —— 调用方据此降级。
+    """
+    word = (word or "").strip()
+    if not word:
+        return {"ok": False, "error": "词条为空"}
+    url = hot_search_url(word)
+    try:
+        s = _session(cookie or "", referer="https://s.weibo.com/")
+        r = s.get(url, timeout=12)
+        text = r.text or ""
+        if "Sina Visitor System" in text:
+            return {"ok": False, "error": "需要登录微博才能预览原文"}
+        posts = parse_search_html(text, limit)
+        if not posts:
+            return {"ok": False, "error": "没有解析到原文（可能需登录微博）"}
+        return {"ok": True, "source": "search", "search_url": url, "post": posts[0]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}

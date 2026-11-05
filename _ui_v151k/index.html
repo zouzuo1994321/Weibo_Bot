@@ -25,6 +25,38 @@
     <div class="bs-stage" id="bsStage">正在启动界面…</div>
   </div>
 </div>
+<!-- 【v1.6.0 · PF-1】开屏进度自我推进。
+     实测：窗口出现后到 pywebview 桥挂载要 3.5~4s（WebView2 初始化 + 页面装载），
+     这段时间桥还不存在，app.js 里的 bootProgress() 一行都跑不到，于是进度条
+     死死停在 4%、文字一直是「正在启动界面…」——用户观感就是「卡住了」。
+     这里放一段**不依赖桥**的内联脚本：DOM 一解析完就开始缓动推进到 62%，
+     并轮换阶段文案；app.js 的 bootProgress() 生效后会回调 __bsCrawlStop 停下，
+     进度只增不减，不会回退。 -->
+<script>
+(function () {
+  var pct = 4, stopped = false, t0 = Date.now();
+  var stages = ["正在启动界面…", "正在装载界面组件…", "正在初始化浏览器内核…", "正在连接后端服务…"];
+  window.__bsPct = pct;
+  function el(id) { return document.getElementById(id); }
+  function stop() { stopped = true; }
+  window.__bsCrawlStop = stop;
+  var timer = setInterval(function () {
+    if (stopped) { clearInterval(timer); return; }
+    var ms = Date.now() - t0;
+    // 缓动逼近 62%：前 1s 快、之后越来越慢（渐近曲线，永不越界）
+    var target = 4 + 58 * (1 - Math.exp(-ms / 2200));
+    if (target > pct) pct = Math.min(62, target);
+    window.__bsPct = pct;
+    var bar = document.querySelector("#bootSplash .bs-bar i");
+    if (bar) bar.style.setProperty("--bs-pct", pct.toFixed(1) + "%");
+    var pv = el("bsPct");
+    if (pv) pv.textContent = Math.round(pct) + "%";
+    var sv = el("bsStage");
+    if (sv) sv.textContent = stages[Math.min(stages.length - 1, Math.floor(ms / 900))];
+    if (!el("bootSplash")) { clearInterval(timer); }   // 开屏已被移除
+  }, 120);
+})();
+</script>
 <div id="app" data-page-node-id="Nr2Ww3z5dZVHijyfflfzjJ">
   <!-- v1.1.9i：放弃无边框自绘标题栏，改用 Windows 原生标题栏（拖动/缩放/最小化/
        最大化/关闭/Aero Snap 全由系统提供），故此处标题栏整体移除。 -->
@@ -75,6 +107,7 @@
       <div class="nav-group-body">
         <div class="nav-item sub" data-view="storage" data-page-node-id="ngStorage">存储管理</div>
         <div class="nav-item sub" data-view="history" data-page-node-id="TL6KOLIqrVs8SJQDtEvAb4">历史记录</div>
+        <div class="nav-item sub" data-view="hotsearch">热搜管理</div>
         <div class="nav-item sub" data-view="dataoverview" data-page-node-id="n60dhX8eleUUIjpe1mNDDI">数据总览</div>
         <div class="nav-item sub" data-view="logs" data-page-node-id="uzqsaYj21VLwiAfGFTDPrg">运行日志</div>
       </div>
@@ -171,9 +204,22 @@
           <span id="pollProgressLabel" class="poll-progress-label" data-page-node-id="M0xwUE0XuhTheGPt4WLPnN"></span>
         </div>
       </div>
-      <div class="card" data-page-node-id="Yhh5sDL3AuAhO6iKLPWAf6">
-        <h3 data-page-node-id="JufYtlVLnzWGZID4CA20Hv">最近一次轮询结果</h3>
-        <div id="lastResult" class="log-box last-result-box" data-page-node-id="DZi1s7yrjmVrgjhW2CvYjH">尚未运行</div>
+      <!-- 【v1.6.1】下半区左右分栏：左＝最近一次轮询结果，右＝微博实时热搜（每分钟刷新，点击用系统浏览器打开） -->
+      <div class="ov-split">
+        <div class="card" data-page-node-id="Yhh5sDL3AuAhO6iKLPWAf6">
+          <h3 data-page-node-id="JufYtlVLnzWGZID4CA20Hv">最近一次轮询结果</h3>
+          <div id="lastResult" class="log-box last-result-box" data-page-node-id="DZi1s7yrjmVrgjhW2CvYjH">尚未运行</div>
+        </div>
+        <div class="card" id="hotCard">
+          <div class="ov-card-head">
+            <h3>微博热搜</h3>
+            <span class="ov-card-meta" id="hotUpdated">加载中…</span>
+            <button class="ghost small ov-hot-refresh" onclick="refreshHotSearchNow()" title="立即刷新热搜榜">刷新</button>
+          </div>
+          <div id="hotList" class="hot-list">
+            <div class="hot-empty">正在获取微博实时热搜…</div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -314,12 +360,21 @@
                   实际间隔在设定值 <b>±15%</b> 内随机抖动（30 分钟 → 约 25.5–34.5 分钟），转发也在「设定间隔 ±15%」内随机延后（至多 4.5 分钟），避免固定节奏被识别为机器人。
                 </p>
                 <div class="row align-end" style="margin-top:4px;">
-                  <label class="field" style="width:200px;">
+                  <label class="field" style="flex:1 1 130px; min-width:110px;">
                     间隔（分钟）
                     <input id="intervalMin" type="number" min="1" value="30">
                   </label>
+                  <!-- 【v1.6.1】每轮排程数量：控制「每轮轮询后排程发送的微博条数」 -->
+                  <label class="field" style="flex:1 1 130px; min-width:110px;">
+                    排程数量（条/轮）
+                    <input id="forwardCount" type="number" min="1" max="10" value="1">
+                  </label>
                   <button onclick="saveInterval()">保存间隔</button>
                 </div>
+                <p class="help" style="margin:12px 0 0;">
+                  排程数量 = 每轮轮询后最多挑多少条新微博去转发（1~10 条）。挑取时优先
+                  <b>一条分配一个监控对象</b>，候选不足时才回到同一对象里补，避免同一条微博下连发多条。
+                </p>
               </div>
             </div>
 
@@ -686,6 +741,56 @@
       </div>
     </section>
 
+    <!-- ================= 【v1.6.2】热搜管理 =================
+         热搜榜每分钟抓一次，落库时按「自然日 + 词条」聚合：同一天同一词条只占一行，
+         只更新「最好排名 / 峰值热度 / 最后出现 / 出现次数」，所以一天最多几百行，
+         可以长期留档。榜单顶部的「置顶要闻」（hotgov）单独标 pinned=1，永远排最前。 -->
+    <section class="view" id="view-hotsearch">
+      <h2>热搜管理</h2>
+      <p class="sub">按日留存的微博实时热搜榜。同一词条在同一天只记一行，记录它当日的<b>最好排名</b>、<b>峰值热度</b>与出现次数；
+        榜单顶部的 <b>置顶要闻</b> 会带「置顶」徽章并固定排在最前，方便回溯某一天的热搜情况。点任意一行用系统默认浏览器打开。</p>
+
+      <div class="card">
+        <div class="row hsm-toolbar">
+          <div class="field hsm-date-field">日期
+            <div class="hsm-date-row">
+              <button class="ghost small hsm-step" onclick="stepHotDay(-1)" title="前一天">‹</button>
+              <div class="hsm-date-box">
+                <button id="hotDayBtn" class="hsm-date-btn" onclick="toggleHotCal(event)" title="选择日期">
+                  <span id="hotDayText">—</span>
+                  <span class="hsm-date-ico" aria-hidden="true"></span>
+                </button>
+                <!-- 【v1.6.4】自绘深色日历：系统原生 date picker 是白底弹窗，与本软件配色冲突 -->
+                <div id="hotCal" class="hsm-cal" hidden></div>
+              </div>
+              <button class="ghost small hsm-step" onclick="stepHotDay(1)" title="后一天">›</button>
+              <button class="ghost small" onclick="jumpHotToday()">今天</button>
+            </div>
+          </div>
+          <label class="field" style="width:200px;">关键词
+            <input id="hotKeyword" type="text" placeholder="搜索词条…" oninput="onHotKeywordInput()">
+          </label>
+          <label class="hsm-check" title="只显示榜单顶部的置顶要闻">
+            <input type="checkbox" id="hotPinnedOnly" onchange="loadHotPage(1)">
+            <span>只看置顶</span>
+          </label>
+          <button class="ghost" onclick="loadHotSearchPage(0)">刷新</button>
+          <button class="danger hsm-clear" onclick="clearHotDay()">删除当日</button>
+        </div>
+        <div id="hotStat" class="hsm-stat"></div>
+      </div>
+
+      <div class="card">
+        <div class="hsm-list-head">
+          <h3>当日热搜（<span id="hotTotal">0</span>）</h3>
+          <div id="hotPagination" class="hsm-pagination"></div>
+        </div>
+        <!-- 【v1.6.3】近 6 个月热力点图：橙色深浅 = 当日峰值热度合计，点格子直接跳到那天 -->
+        <div id="hotHeat" class="hsm-heat"></div>
+        <div id="hotBody" class="hsm-body"></div>
+      </div>
+    </section>
+
     <!-- ================= 【v1.2.2】存储管理 =================
          四个大目录（images / media / models / history）的位置、占用与一键清理。
          占用统计走**后台线程**（storage.py），前端只轮询内存状态 ——
@@ -861,7 +966,8 @@
         </div>
         <div class="chart-legend" data-page-node-id="9DVDhtlniSkR9YhVZ3BXGn">
           <span data-page-node-id="miB7IXDwT1QDLpErSQBBPT"><i style="background:var(--accent);" data-page-node-id="3X2t9HwKpcwwWVI7jj7MaS"></i>抓取</span>
-          <span data-page-node-id="kjNEtb4I4sEDBpf9KVEAzc"><i style="background:var(--green);" data-page-node-id="XFqfSMNjzknztKB2cI2Zy3"></i>转发</span>
+          <span data-page-node-id="kjNEtb4I4sEDBpf9KVEAzc"><i style="background:var(--green);" data-page-node-id="XFqfSMNjzknztKB2cI2Zy3"></i>转发成功</span>
+          <span id="legendBad"><i style="background:var(--red);"></i>跳过 / 失败</span>
         </div>
       </div>
 
@@ -870,6 +976,26 @@
         <ul class="data-overview-list" id="dataOverviewTop" data-page-node-id="0mqBr1JLFgnCmuVwiJRRqs">
           <li class="muted" data-page-node-id="KTTDT1xcqRohvNce6xmbVO">暂无数据</li>
         </ul>
+      </div>
+
+      <!-- 【v1.6.0 · P3-4】转发队列视图：最近 60 条记录，成功/跳过/失败一目了然，
+           失败与跳过都带原因，方便直接判断是账号问题、去重规则还是网络问题。 -->
+      <div class="card" id="fwdQueueCard">
+        <div class="row" style="justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+          <h3 style="margin:0;">转发队列</h3>
+          <div class="queue-counts" id="fwdQueueCounts"></div>
+        </div>
+        <p class="sub" style="margin:6px 0 10px;">最近 60 条转发记录（今日计数在右上方）。失败项可到「日志」页按 <b>FWD</b> 分类进一步排查。</p>
+        <div class="queue-table-wrap">
+          <table class="queue-table">
+            <thead>
+              <tr><th>时间</th><th>账号</th><th>对象</th><th>类型</th><th>状态</th><th>原因 / 摘要</th></tr>
+            </thead>
+            <tbody id="fwdQueueBody">
+              <tr><td colspan="6" class="muted">暂无数据</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <div class="card" data-page-node-id="hehtrTDQZCB9EPMi80O8C3">
@@ -1004,6 +1130,9 @@
   </div>
 </div>
 <div class="toast" id="toast" data-page-node-id="OfyJDZHY6q5wG5eJSiLwxV"></div>
+<!-- 【v1.6.3】热搜悬停浮层：本地留档数据秒出，原文（作者/摘要/配图）抓到后补位。
+     挂在 body 下用 position:fixed 定位，避免被 #main 的滚动容器裁掉。 -->
+<div class="hot-tip" id="hotTip" hidden></div>
 <script src="app.js"></script>
   <!-- ================= 【v1.2.2】首次启动：存储位置设置向导 =================
        用户的原话：「软件首次启动设置 /images 和 /media 和 /models 和 /history

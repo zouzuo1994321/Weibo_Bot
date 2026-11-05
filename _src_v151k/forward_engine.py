@@ -131,6 +131,65 @@ def _schedule_forward(delay, fn):
     threading.Thread(target=_run, daemon=True).start()
 
 
+# ---------------- 每轮排程数量（v1.6.1） ----------------
+# 用户可设置「每轮轮询后要排程发送的微博条数」。默认 1（历史行为），上限 10 条
+# —— 再多容易在短时间内形成批量转发特征，反而提高被风控的概率。
+FORWARD_COUNT_KEY = "forward_count"
+FORWARD_COUNT_MIN = 1
+FORWARD_COUNT_MAX = 10
+
+
+def get_forward_count(cfg=None) -> int:
+    """读取并钳制「每轮排程数量」（1~10，缺省/非法值一律回退到 1）。"""
+    cfg = cfg or get_config()
+    try:
+        n = int(cfg.get(FORWARD_COUNT_KEY, 1))
+    except Exception:
+        n = 1
+    return max(FORWARD_COUNT_MIN, min(FORWARD_COUNT_MAX, n))
+
+
+def _pick_candidates(candidates, n):
+    """从候选池中随机挑 n 条微博。
+
+    优先「一条一个监控对象」（先把不同 UID 各取一条），不足 n 条时才回到同一
+    对象里补 —— 这样排程出的多条转发天然分散在不同账号 / 话题上，不会在同一条
+    微博下堆叠多条转发记录，也避免了同一对象连发被判定为刷屏。
+    """
+    pool = list(candidates)
+    random.shuffle(pool)
+    n = max(0, int(n))
+    if n <= 0 or not pool:
+        return []
+    if n == 1:
+        return pool[:1]
+    picked, seen = [], set()
+    for c in pool:
+        if len(picked) >= n:
+            break
+        uid = c.get("uid")
+        if uid in seen:
+            continue
+        seen.add(uid)
+        picked.append(c)
+    if len(picked) < n:
+        for c in pool:
+            if len(picked) >= n:
+                break
+            if any(c is p for p in picked):
+                continue
+            picked.append(c)
+    return picked
+
+
+# 同一监控对象被选中多条时的状态聚合优先级（取「更值得关注」的那个）
+_ACTION_RANK = {"scheduled": 4, "forwarded": 3, "failed": 2, "skipped": 1, "none": 0}
+
+
+def _merge_action(a, b):
+    return a if _ACTION_RANK.get(a, 0) >= _ACTION_RANK.get(b, 0) else b
+
+
 def _writeback_cookie(acc_id, old_cookie, new_cookie):
     """把续期后的 Cookie 回写到账户（会话保活）。仅在确有变化时落盘。"""
     if not new_cookie or new_cookie == old_cookie:
@@ -411,7 +470,6 @@ def run_once(force_immediate=False):
                   f" · 进入候选 {new_count} 条", CAT_FWD)
 
         _poll_progress["phase"] = "forward"
-        forwarded = 0
         info(f"本轮抓取完成 · 候选池 {len(candidates)} 条（已剔除历史已转发）· 覆盖 {len(results)} 个对象", CAT_FWD)
         if not can_forward():
             warn("本轮不执行转发：授权未生效（试用已结束或未激活）· 监控记录仍正常写入", CAT_FWD)
@@ -424,43 +482,80 @@ def run_once(force_immediate=False):
                     "forwarded": 0,
                     "message": "转发功能未授权，已跳过转发（监控记录仍正常进行）"}
 
+        chosen_items = []
         if candidates:
-            chosen_item = random.choice(candidates)
-            uid = chosen_item["uid"]
-            screen_name = chosen_item["screen_name"]
-            post = chosen_item["post"]
-            res = _forward_one(acc["id"], acc.get("display_name", ""), cookie,
-                               uid, screen_name, post, force_immediate=force_immediate)
-            results[uid]["action"] = res["action"]
-            results[uid]["detail"] = res["detail"]
-            # 【v1.4.21】排程转发的实际执行时刻必须透传——scheduler 靠它设置
-            # next_forward_run 供前端进度环对齐 100%；v1.4.20 只合并了
-            # action/detail，run_at 被丢弃，导致进度环恒回退到 next_run 终点。
-            if res.get("run_at"):
-                results[uid]["run_at"] = res["run_at"]
-            debug(f"候选池 {len(candidates)} 条 → 随机选中 UID={uid}（{screen_name}）"
+            _want = get_forward_count(get_config())
+            chosen_items = _pick_candidates(candidates, _want)
+            debug(f"本轮排程数量上限 {_want} 条 → 候选池 {len(candidates)} 条 "
+                  f"→ 实际选中 {len(chosen_items)} 条", CAT_FWD)
+        sched_n = direct_n = skip_n = fail_n = 0
+        picked_uids = set()
+        for item in chosen_items:
+            uid = item["uid"]
+            screen_name = item["screen_name"]
+            post = item["post"]
+            try:
+                res = _forward_one(acc["id"], acc.get("display_name", ""), cookie,
+                                   uid, screen_name, post, force_immediate=force_immediate)
+            except Exception as e:
+                error(f"转发 UID={uid} 异常：{e}", CAT_FWD)
+                res = {"action": "failed", "detail": f"转发异常：{e}"}
+            act = res.get("action") or "failed"
+            det = res.get("detail") or ""
+            picked_uids.add(uid)
+            row = results.get(uid)
+            if row is not None:
+                if row.get("action") == "none":
+                    row["action"] = act
+                    row["detail"] = det
+                else:
+                    # 同一对象被选中多条：状态取更重要者，明细用「；」串接
+                    row["action"] = _merge_action(row.get("action"), act)
+                    row["detail"] = (row.get("detail") or "") + "；" + det
+                # 【v1.4.21】排程转发的实际执行时刻必须透传——scheduler 靠它设置
+                # next_forward_run 供前端进度环对齐 100%；v1.4.20 只合并了
+                # action/detail，run_at 被丢弃，导致进度环恒回退到 next_run 终点。
+                if res.get("run_at"):
+                    row["run_at"] = res["run_at"]
+            debug(f"候选池 {len(candidates)} 条 → 选中 UID={uid}（{screen_name}）"
                   f" 微博ID={post.get('id', '')} 内容「{(post.get('text') or '')[:40]}」", CAT_FWD)
-            if res["action"] in ("forwarded", "scheduled"):
-                forwarded = 1
-                info(f"本轮随机选中 UID={uid} 转发：{res['detail']}", CAT_FWD)
+            if act == "scheduled":
+                sched_n += 1
+                info(f"本轮随机选中 UID={uid} 排程转发：{det}", CAT_FWD)
+            elif act == "forwarded":
+                direct_n += 1
+                info(f"本轮随机选中 UID={uid} 转发：{det}", CAT_FWD)
+            elif act == "skipped":
+                skip_n += 1
+                warn(f"选中微博但已跳过 UID={uid} · {det}", CAT_FWD)
             else:
-                warn(f"选中微博但未完成转发 UID={uid} · 动作={res['action']} · 详情={res['detail']}", CAT_FWD)
-            # 其他有新增但未被选中的对象给出友好提示
-            for c in candidates:
-                if c["uid"] != uid and results[c["uid"]]["action"] == "none":
-                    results[c["uid"]]["detail"] = "本轮随机未选中"
+                fail_n += 1
+                warn(f"选中微博但未完成转发 UID={uid} · 动作={act} · 详情={det}", CAT_FWD)
+        # 其他有新增但未被选中的对象给出友好提示
+        for c in candidates:
+            if c["uid"] in picked_uids:
+                continue
+            if results.get(c["uid"], {}).get("action") == "none":
+                results[c["uid"]]["detail"] = "本轮随机未选中"
 
         if not candidates:
             message = "本轮无新微博"
-        elif results[uid]["action"] == "scheduled" if candidates else False:
-            message = "本轮排程转发 1 条"
-        elif forwarded:
-            message = "本轮转发 1 条"
+        elif sched_n and direct_n:
+            message = f"本轮排程转发 {sched_n} 条 · 立即转发 {direct_n} 条"
+        elif sched_n:
+            message = f"本轮排程转发 {sched_n} 条"
+        elif direct_n:
+            message = f"本轮转发 {direct_n} 条"
+        elif skip_n:
+            message = f"本轮选中 {skip_n} 条但被跳过"
         else:
-            message = "本轮选中 1 条但未转发"
+            message = f"本轮选中 {len(chosen_items)} 条但未转发"
+        if fail_n:
+            warn(f"本轮有 {fail_n} 条转发失败", CAT_FWD)
         _poll_progress["active"] = False
         return {"ok": True, "error": "", "results": list(results.values()),
-                "forwarded": forwarded, "message": message}
+                "forwarded": sched_n + direct_n, "scheduled": sched_n,
+                "message": message}
     finally:
         _run_lock.release()
 

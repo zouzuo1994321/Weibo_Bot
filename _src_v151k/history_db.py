@@ -73,6 +73,26 @@ CREATE TABLE IF NOT EXISTS media_files (
     downloaded_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_media_url ON media_files(url, media_type);
+-- 【v1.6.2】热搜历史：按「自然日 + 词条」聚合，一天一个词条只占一行，
+-- 后续每次刷新只更新「最高排名 / 峰值热度 / 最后出现时间 / 出现次数」，
+-- 因此每天最多几百行（而不是 1440 次抓取 × 20 条），可长期保留。
+-- pinned=1 的是榜单顶部那条「置顶要闻」（hotgov），用户要求长期留档。
+CREATE TABLE IF NOT EXISTS hot_search (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    day TEXT NOT NULL,              -- YYYY-MM-DD（自然日）
+    word TEXT NOT NULL,             -- 词条
+    url TEXT,                       -- 点击跳转地址
+    label TEXT,                     -- 热 / 新 / 沸 / 置顶
+    pinned INTEGER DEFAULT 0,       -- 1 = 置顶要闻
+    rank_first INTEGER,             -- 当日首次出现时的排名
+    rank_best INTEGER,              -- 当日最好排名
+    hot_peak INTEGER DEFAULT 0,     -- 当日峰值热度
+    first_seen TEXT,                -- 当日首次出现时间
+    last_seen TEXT,                 -- 最后一次出现时间
+    seen_count INTEGER DEFAULT 1    -- 当日被看到的次数
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hot_day_word ON hot_search(day, word);
+CREATE INDEX IF NOT EXISTS idx_hot_day_rank ON hot_search(day, pinned DESC, rank_best);
 -- v1.1.9j 性能索引：logs 表曾达 38.6 万行，`ORDER BY id DESC LIMIT 500` 走全表 SCAN，
 -- 且按级别 / 分类筛选也无索引。补索引后可走索引扫描，查询从数百 ms 降到 ms 级。
 CREATE INDEX IF NOT EXISTS idx_logs_id_desc ON logs(id DESC);
@@ -495,6 +515,178 @@ class HistoryDB:
             _COUNT_CACHE["ts"] = time.time()
             _COUNT_CACHE["n"] = 0
 
+    # ---------- 【v1.6.2】热搜历史 ----------
+    def record_hot_search(self, items, pinned=None, day=None):
+        """把一次热搜榜快照写进历史库（按「日 + 词条」聚合）。
+
+        items  —— 实时榜条目 [{word, hot, label, url}]
+        pinned —— 置顶要闻 [{word, hot, label, url}]（hotgov，永久标 pinned=1）
+
+        同一天同一个词条只占一行：再次被看到时只更新
+        `rank_best`（排名更好才覆盖）、`hot_peak`（峰值）、`last_seen`、`seen_count`。
+        这样即使每分钟抓一次，一天的增量也只是「新词条」，不会把库撑爆。
+        返回 (新增词条数, 更新词条数)。
+        """
+        day = day or datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        batch = []
+        for i, it in enumerate(items or [], 1):
+            w = (it.get("word") or "").strip()
+            if not w:
+                continue
+            batch.append((w, it.get("url") or "", (it.get("label") or "")[:8], 0, i,
+                          int(it.get("hot") or 0)))
+        for it in (pinned or []):
+            w = (it.get("word") or "").strip()
+            if not w:
+                continue
+            # 置顶要闻没有排名与热度，rank 记 0（排序时固定在最前）
+            batch.append((w, it.get("url") or "",
+                          (it.get("label") or "置顶")[:8], 1, 0, 0))
+        if not batch:
+            return (0, 0)
+
+        added = updated = 0
+        with _lock:
+            try:
+                for word, url, label, pin, rank, hot in batch:
+                    cur = self.conn.execute(
+                        "SELECT id, rank_best, hot_peak FROM hot_search "
+                        "WHERE day=? AND word=?", (day, word)).fetchone()
+                    if cur is None:
+                        self.conn.execute(
+                            "INSERT INTO hot_search (day, word, url, label, pinned,"
+                            " rank_first, rank_best, hot_peak, first_seen, last_seen,"
+                            " seen_count) VALUES (?,?,?,?,?,?,?,?,?,?,1)",
+                            (day, word, url, label, pin, rank, rank, hot, now, now))
+                        added += 1
+                    else:
+                        rid, rbest, hpeak = cur[0], cur[1], cur[2]
+                        if rank and (not rbest or rank < rbest):
+                            rbest = rank
+                        if hot > (hpeak or 0):
+                            hpeak = hot
+                        self.conn.execute(
+                            "UPDATE hot_search SET url=?, label=?, pinned=?, rank_best=?,"
+                            " hot_peak=?, last_seen=?, seen_count=seen_count+1 WHERE id=?",
+                            (url, label, pin, rbest, hpeak, now, rid))
+                        updated += 1
+                self.conn.commit()
+            except Exception as e:
+                # logger 会写 logs 表 → 与 history_db 存在循环依赖，这里必须延迟导入
+                try:
+                    from logger import warn as _warn
+                    _warn(f"热搜入库失败：{e}")
+                except Exception:
+                    pass
+                return (0, 0)
+        return (added, updated)
+
+    def hot_search_days(self, limit=90):
+        """有记录的日期列表（倒序），用于「热搜管理」的日期下拉。"""
+        try:
+            rows = self.conn.execute(
+                "SELECT day, COUNT(*) AS total, SUM(pinned) AS pinned,"
+                " MIN(first_seen) AS first_at, MAX(last_seen) AS last_at "
+                "FROM hot_search GROUP BY day ORDER BY day DESC LIMIT ?",
+                (max(1, int(limit)),)).fetchall()
+        except Exception:
+            return []
+        return [{"day": r[0], "total": r[1] or 0, "pinned": r[2] or 0,
+                 "first_at": r[3] or "", "last_at": r[4] or ""} for r in rows]
+
+    def hot_search_heatmap(self, days=190):
+        """按日聚合「峰值热度合计」，供热搜管理页的橙色热力点图（v1.6.3）。
+
+        分母用 SUM(hot_peak) 而不是 MAX：一天里有多少条词条冲得多高，
+        合起来才代表「这一天整体有多热」；MAX 会被单个爆款词条带偏。
+        置顶要闻没有热度值（hot_peak=0），只计入 total 不计入 heat。
+        """
+        try:
+            n = max(1, min(int(days), 730))
+        except Exception:
+            n = 190
+        start = (datetime.now() - timedelta(days=n - 1)).strftime("%Y-%m-%d")
+        try:
+            rows = self.conn.execute(
+                "SELECT day, COUNT(*) AS total, COALESCE(SUM(hot_peak),0) AS heat,"
+                " COALESCE(SUM(pinned),0) AS pinned FROM hot_search "
+                "WHERE day >= ? GROUP BY day ORDER BY day",
+                (start,)).fetchall()
+        except Exception:
+            return []
+        return [{"day": r[0], "total": r[1] or 0, "heat": r[2] or 0,
+                 "pinned": r[3] or 0} for r in rows]
+
+    def hot_search_item(self, day, word):
+        """取单个词条在某一天的完整记录（悬停浮层用；找不到返回 None）。"""
+        try:
+            row = self.conn.execute(
+                "SELECT day, word, url, label, pinned, rank_first, rank_best,"
+                " hot_peak, first_seen, last_seen, seen_count FROM hot_search"
+                " WHERE day=? AND word=?", (day, word)).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        cols = ["day", "word", "url", "label", "pinned", "rank_first", "rank_best",
+                "hot_peak", "first_seen", "last_seen", "seen_count"]
+        return dict(zip(cols, row))
+
+    def hot_search_list(self, day="", keyword="", pinned_only=False,
+                        limit=200, offset=0):
+        """按日期（可选关键词 / 只看置顶）查询热搜历史。
+
+        排序：置顶要闻永远排最前，其余按「当日最好排名」升序，同排名按峰值热度降序。
+        """
+        where, params = [], []
+        if day:
+            where.append("day=?")
+            params.append(day)
+        if keyword:
+            where.append("word LIKE ?")
+            params.append("%" + keyword + "%")
+        if pinned_only:
+            where.append("pinned=1")
+        sql_where = (" WHERE " + " AND ".join(where)) if where else ""
+        try:
+            total = self.conn.execute(
+                "SELECT COUNT(*) FROM hot_search" + sql_where, params).fetchone()[0]
+            rows = self.conn.execute(
+                "SELECT day, word, url, label, pinned, rank_first, rank_best,"
+                " hot_peak, first_seen, last_seen, seen_count FROM hot_search"
+                + sql_where +
+                " ORDER BY pinned DESC, CASE WHEN rank_best=0 THEN 9999 ELSE rank_best END,"
+                " hot_peak DESC LIMIT ? OFFSET ?",
+                params + [max(1, int(limit)), max(0, int(offset))]).fetchall()
+        except Exception:
+            return {"total": 0, "rows": []}
+        cols = ["day", "word", "url", "label", "pinned", "rank_first", "rank_best",
+                "hot_peak", "first_seen", "last_seen", "seen_count"]
+        return {"total": total, "rows": [dict(zip(cols, r)) for r in rows]}
+
+    def clear_hot_search(self, day=None):
+        """删除某一天的热搜历史；day 为空则清空全部。返回删除行数。"""
+        with _lock:
+            if day:
+                cur = self.conn.execute("DELETE FROM hot_search WHERE day=?", (day,))
+            else:
+                cur = self.conn.execute("DELETE FROM hot_search")
+            self.conn.commit()
+            return cur.rowcount or 0
+
+    def prune_hot_search(self, keep_days=180):
+        """只保留最近 N 天，防止无限增长（默认半年，每天仅数百行）。"""
+        try:
+            keep = max(1, int(keep_days))
+            cutoff = (datetime.now() - timedelta(days=keep)).strftime("%Y-%m-%d")
+            with _lock:
+                cur = self.conn.execute("DELETE FROM hot_search WHERE day < ?", (cutoff,))
+                self.conn.commit()
+                return cur.rowcount or 0
+        except Exception:
+            return 0
+
     # ---------- 视频 / 相册（媒体文件） ----------
     _MEDIA_COLS = ["id", "uid", "screen_name", "post_id", "media_type", "url",
                    "file_path", "file_name", "size", "post_text",
@@ -803,6 +995,14 @@ class HistoryDB:
             rows = self.conn.execute(sql, params).fetchall()
             return {r[0]: r[1] for r in rows if r[0]}
 
+        def _status_map(sql, params=()):
+            """(时间键, status) → 计数。【v1.6.0】用于把 跳过 / 失败 拆出来。"""
+            rows = self.conn.execute(sql, params).fetchall()
+            return {(r[0], r[1] or "unknown"): r[2] for r in rows if r[0]}
+
+        def _bad(mp, key):
+            return mp.get((key, "skipped"), 0) + mp.get((key, "failed"), 0)
+
         with _lock:
             summary = {
                 "today": {"monitored": _count_monitored("fetched_at LIKE ?", (today + "%",)),
@@ -834,7 +1034,13 @@ class HistoryDB:
                 "SELECT SUBSTR(created_at,12,2) as h, COUNT(*) FROM forwards WHERE status='success' AND created_at LIKE ? GROUP BY h",
                 (today + "%",))
             hours = [f"{i:02d}" for i in range(24)]
-            today_hourly = [{"label": h, "monitored": mon_h.get(h, 0), "forwarded": fwd_h.get(h, 0)} for h in hours]
+            hwd_st = _status_map(
+                "SELECT SUBSTR(created_at,12,2) as h, status, COUNT(*) FROM forwards WHERE created_at LIKE ? GROUP BY h, status",
+                (today + "%",))
+            today_hourly = [{"label": h, "monitored": mon_h.get(h, 0), "forwarded": fwd_h.get(h, 0),
+                             "skipped": hwd_st.get((h, "skipped"), 0),
+                             "failed": hwd_st.get((h, "failed"), 0),
+                             "bad": _bad(hwd_st, h)} for h in hours]
 
             # 本月天级
             mon_d = _series(
@@ -843,12 +1049,18 @@ class HistoryDB:
             fwd_d = _series(
                 "SELECT SUBSTR(created_at,1,10) as d, COUNT(*) FROM forwards WHERE status='success' AND created_at >= ? GROUP BY d",
                 (month_start,))
+            dwd_st = _status_map(
+                "SELECT SUBSTR(created_at,1,10) as d, status, COUNT(*) FROM forwards WHERE created_at >= ? GROUP BY d, status",
+                (month_start,))
             days = []
             d = datetime.strptime(month_start, "%Y-%m-%d")
             while d <= now:
                 days.append(d.strftime("%Y-%m-%d"))
                 d += timedelta(days=1)
-            month_daily = [{"label": d[-5:], "monitored": mon_d.get(d, 0), "forwarded": fwd_d.get(d, 0)} for d in days]
+            month_daily = [{"label": d[-5:], "monitored": mon_d.get(d, 0), "forwarded": fwd_d.get(d, 0),
+                            "skipped": dwd_st.get((d, "skipped"), 0),
+                            "failed": dwd_st.get((d, "failed"), 0),
+                            "bad": _bad(dwd_st, d)} for d in days]
 
             # 本年月级
             mon_m = _series(
@@ -865,19 +1077,56 @@ class HistoryDB:
                 if mo > 12:
                     mo = 1
                     y += 1
-            year_monthly = [{"label": m[-2:] + "月", "monitored": mon_m.get(m, 0), "forwarded": fwd_m.get(m, 0)} for m in months]
+            mwd_st = _status_map(
+                "SELECT SUBSTR(created_at,1,7) as m, status, COUNT(*) FROM forwards WHERE created_at >= ? GROUP BY m, status",
+                (year_start,))
+            year_monthly = [{"label": m[-2:] + "月", "monitored": mon_m.get(m, 0), "forwarded": fwd_m.get(m, 0),
+                             "skipped": mwd_st.get((m, "skipped"), 0),
+                             "failed": mwd_st.get((m, "failed"), 0),
+                             "bad": _bad(mwd_st, m)} for m in months]
 
             # 全部年月级
             mon_all = _series(
                 "SELECT SUBSTR(fetched_at,1,7) as m, COUNT(*) FROM monitored_posts GROUP BY m ORDER BY m")
             fwd_all = _series(
                 "SELECT SUBSTR(created_at,1,7) as m, COUNT(*) FROM forwards WHERE status='success' GROUP BY m ORDER BY m")
-            all_keys = sorted(set(mon_all.keys()) | set(fwd_all.keys()))
-            all_monthly = [{"label": k, "monitored": mon_all.get(k, 0), "forwarded": fwd_all.get(k, 0)} for k in all_keys]
+            awd_st = _status_map(
+                "SELECT SUBSTR(created_at,1,7) as m, status, COUNT(*) FROM forwards GROUP BY m, status")
+            all_keys = sorted(set(mon_all.keys()) | set(fwd_all.keys()) | {k[0] for k in awd_st})
+            all_monthly = [{"label": k, "monitored": mon_all.get(k, 0), "forwarded": fwd_all.get(k, 0),
+                            "skipped": awd_st.get((k, "skipped"), 0),
+                            "failed": awd_st.get((k, "failed"), 0),
+                            "bad": _bad(awd_st, k)} for k in all_keys]
+
+            # 【v1.6.0 · P3-2】按状态汇总：成功率一目了然
+            status_counts = {}
+            for scope, where, params in (("today", " WHERE created_at LIKE ?", (today + "%",)),
+                                         ("month", " WHERE created_at >= ?", (month_start,)),
+                                         ("all", "", ())):
+                rows = self.conn.execute(
+                    "SELECT status, COUNT(*) FROM forwards" + where + " GROUP BY status",
+                    params).fetchall()
+                status_counts[scope] = {r[0] or "unknown": r[1] for r in rows}
+
+            # 【v1.6.0 · P3-4】转发队列视图：最近 60 条（含跳过与失败的失败原因）
+            qrows = self.conn.execute(
+                """SELECT id, account_name, screen_name, uid, post_id, forward_type,
+                          persona, status, reason, created_at,
+                          SUBSTR(COALESCE(original_content,''), 1, 60)
+                     FROM forwards ORDER BY id DESC LIMIT 60""").fetchall()
+            queue = [{"id": r[0], "account_name": r[1] or "",
+                      "screen_name": r[2] or r[3] or "未知",
+                      "post_id": r[4] or "", "type": r[5] or "normal",
+                      "persona": r[6] or "", "status": r[7] or "unknown",
+                      "reason": r[8] or "", "at": r[9] or "",
+                      "excerpt": r[10] or ""} for r in qrows]
+
 
         return {
             "summary": summary,
             "top_forwarded": top_forwarded,
+            "status_counts": status_counts,
+            "queue": queue,
             "series": {
                 "today_hourly": today_hourly,
                 "month_daily": month_daily,
@@ -914,8 +1163,15 @@ class HistoryDB:
                    WHERE status='success' AND created_at LIKE ?
                    GROUP BY uid ORDER BY cnt DESC LIMIT 10""",
                 (date + "%",)).fetchall()
+            # 【v1.6.0】按小时拆出 跳过 / 失败，便于回看某天到底哪里出了问题
+            st_h = {(r[0], r[1] or "unknown"): r[2] for r in self.conn.execute(
+                "SELECT SUBSTR(created_at,12,2), status, COUNT(*) FROM forwards "
+                "WHERE created_at LIKE ? GROUP BY 1, 2", (date + "%",)).fetchall() if r[0]}
         hours = [f"{i:02d}" for i in range(24)]
-        hourly = [{"label": h, "monitored": mon_h.get(h, 0), "forwarded": fwd_h.get(h, 0)} for h in hours]
+        hourly = [{"label": h, "monitored": mon_h.get(h, 0), "forwarded": fwd_h.get(h, 0),
+                   "skipped": st_h.get((h, "skipped"), 0),
+                   "failed": st_h.get((h, "failed"), 0),
+                   "bad": st_h.get((h, "skipped"), 0) + st_h.get((h, "failed"), 0)} for h in hours]
         top_forwarded = [{"uid": r[0], "screen_name": r[1] or r[0], "count": r[2]} for r in top]
         return {
             "date": date,

@@ -218,7 +218,19 @@ def get_status():
 # ---------------------------------------------------------------------------
 
 # 「清缓存」时保留的东西：模型（要重新下 1GB）、数据库与导出（不可再生）
-_PRESERVE_EXT = {".db", ".json", ".log", ".pem", ".txt"}
+# 【v1.5.7】补 .gguf（原缺失 → 清理 models 目录会把 1GB 模型删掉）；
+# 补 SQLite 的 -wal / -shm / -journal —— 注意 splitext("history.db-wal")
+# 得到的是 ".db-wal" 而不是 ""+".db"，所以旁挂文件必须用后缀匹配，
+# 否则活库的 WAL 会被当成缓存删掉（未落盘事务直接丢失）。
+_PRESERVE_EXT = {".db", ".json", ".log", ".pem", ".txt", ".gguf"}
+_PRESERVE_SUFFIX = (".db-wal", ".db-shm", ".db-journal")
+
+
+def _is_preserved(fn):
+    low = fn.lower()
+    if os.path.splitext(low)[1] in _PRESERVE_EXT:
+        return True
+    return low.endswith(_PRESERVE_SUFFIX)
 
 
 def _human(n):
@@ -270,7 +282,7 @@ def clear_dir(key, mode="cache"):
         for root, _dirs, files in os.walk(path):
             for fn in files:
                 fp = os.path.join(root, fn)
-                if mode == "cache" and os.path.splitext(fn)[1].lower() in _PRESERVE_EXT:
+                if mode == "cache" and _is_preserved(fn):
                     kept += 1
                     continue
                 victims.append(fp)
