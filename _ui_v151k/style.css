@@ -38,7 +38,6 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 /* 主体区域明确不可拖，确保文本可被选择 */
 #main { flex: 1; overflow-y: auto; padding: 24px 28px; }
 
-
 /* 侧边栏 */
 #sidebar {
   width: 200px; background: var(--bg-soft); border-right: 1px solid var(--border);
@@ -151,6 +150,22 @@ h2 { margin: 0 0 6px; font-size: 22px; font-weight: 700; }
 .fwd-mode-item { align-items: center; }
 .fwd-mode-item > .switch { flex-shrink: 0; }
 .fwd-mode-item > div { display: flex; flex-direction: column; gap: 2px; }
+
+/* 【v1.6.12】转发设置里的两个策略开关（排程波动 / 仅转发含图博文）。
+   纵向堆叠、开关固定宽度不参与收缩，说明文字占满剩余宽度自行折行 ——
+   与「转发方式」卡的 .fwd-mode-item 保持同一套视觉节奏。
+   【v1.6.13】「仅转发含图博文」移到「转发方式」卡，两卡各只剩一行；
+   本组样式随之成为两张卡共用的行样式。 */
+.fwd-opt-list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.row.fwd-opt-row { flex-wrap: nowrap; align-items: flex-start; gap: 10px; }
+/* 开关（24px 高）与标题行盒（19px）中心对齐：24-19=5，故上移 2px。
+   实测该值下圆心与标题行中心偏差 0.5px；若用 +2px 会偏下 4.5px（肉眼可辨）。 */
+.row.fwd-opt-row > .switch { flex-shrink: 0; margin-top: -2px; }
+.row.fwd-opt-row > div { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.row.fwd-opt-row .muted { font-size: 12px; line-height: 1.5; }
+/* 排程数量为 1 时「排程波动」不产生任何差别，降透明度提示（仍可点击） */
+.row.fwd-opt-row.is-off { opacity: .55; }
+.row.fwd-opt-row.is-off .switch { cursor: help; }
 
 /* 概览实时时钟（当前放在标题右侧） */
 .overview-header {
@@ -327,14 +342,28 @@ tr:last-child td { border-bottom: none; }
 
 /* 账户表：Cookie 有效期预测单元格 */
 .cookie-exp { font-size: 12px; line-height: 1.4; }
-.cookie-exp .ce-date { font-weight: 600; color: var(--text); }
 .cookie-exp .ce-remain { color: var(--text-dim); margin-top: 2px; }
-.cookie-exp.safe .ce-date { color: var(--green); }
-.cookie-exp.warn .ce-date { color: var(--yellow); }
+/* v1.6.8：剩余时间升为主行（日期移到 tooltip），字号/字重比原来的次行更醒目 */
+.cookie-exp .ce-remain.ce-main {
+  font-size: 13px; font-weight: 600; color: var(--text); margin-top: 0;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
 .cookie-exp.warn .ce-remain { color: var(--yellow); }
-.cookie-exp.expired .ce-date { color: var(--red); }
+.cookie-exp.safe .ce-remain.ce-main { color: var(--green); }
+.cookie-exp.warn .ce-remain.ce-main { color: var(--yellow); }
 .cookie-exp.expired .ce-remain { color: var(--red); font-weight: 600; }
-.cookie-exp.none .ce-date { color: var(--text-dim); font-weight: 400; }
+.cookie-exp.expired .ce-remain.ce-main { color: var(--red); }
+/* v1.6.8：「无法预测」也用主行字号（和其它分支视觉分量一致），但保持灰阶不作强调 */
+.cookie-exp.none .ce-remain.ce-main { color: var(--text-dim); font-weight: 500; }
+/* v1.6.7：实测行 —— 明确区分「实测确认」与「按 7 天推算」，避免被当成精确倒计时 */
+.cookie-exp .ce-verified { color: var(--text-dim); font-size: 11px; margin-top: 1px; opacity: .85; }
+.cookie-exp .ce-verified.bad { color: var(--red); opacity: 1; font-weight: 600; }
+
+/* v1.6.8：表头与内容对齐。
+   「状态」列内容是一个胶囊标签（padding: 3px 9px），标签框与表头对齐时，
+   框内文字比表头右移 9px —— 实测差 8px，看起来就是没对齐。
+   这里把该列表头的左内边距补上同样的 9px，让表头文字正对标签文字。 */
+th.th-tag { padding-left: 21px; }
 
 /* 监控页顶部账户健康横幅（v1.1.1：抓取失败根因直接可见） */
 .mon-alert {
@@ -401,7 +430,16 @@ tr:last-child td { border-bottom: none; }
 /* 【v1.4.17】卡片改为左右两栏：左侧信息 + 右侧最新图片预览 */
 .media-obj-card {
   background: var(--bg-input); border: 1px solid var(--border);
-  border-radius: 10px; padding: 14px; transition: .15s;
+  border-radius: 10px; padding: 14px;
+  /* 【v1.6.12】原来是 `transition: .15s`（等价于 all）—— hover 时连
+     background / padding / box-shadow 都进了过渡，滚动中鼠标掠过也在补间。
+     只保留真正会变的两个属性。 */
+  transition: border-color .15s, background-color .15s;
+  /* 视口外的卡片直接跳过布局与绘制，滚动时只处理看得见的那几行。
+     估值取实测卡高 140px（信息块 112 + 上下内边距 28）：估准了第一遍滚动
+     就不会因为「先按估值排版、再按真实高度修正」而抖一下。 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 140px;
 }
 .media-obj-card:hover { border-color: var(--accent); }
 .media-obj-main { display: flex; align-items: stretch; gap: 12px; }
@@ -410,21 +448,17 @@ tr:last-child td { border-bottom: none; }
   flex: 0 0 104px; width: 104px; height: 104px; border-radius: 8px;
   background: rgba(0,0,0,.22); border: 1px solid var(--border);
   overflow: hidden; display: flex; align-items: center; justify-content: center;
+  /* 【v1.6.12】预览框自身的绘制与外部完全隔离：里面的图怎么变都不会
+     触发整张卡片的布局/绘制失效重算 */
+  contain: paint;
 }
+/* 【v1.6.12】预览图一律带显式 104×104 属性，图未到时不占位跳变 */
 .media-obj-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .media-obj-thumb .mot-empty { color: var(--text-dim); font-size: 18px; }
 .media-obj-name { font-weight: 600; margin-bottom: 4px; word-break: break-all; }
 .media-obj-uid { font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }
 .media-obj-counts { font-size: 12px; color: var(--text-dim); }
 .media-obj-counts b { color: var(--text); }
-.media-thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; margin-top: 10px; }
-.media-thumb {
-  position: relative; width: 100%; aspect-ratio: 1; object-fit: cover;
-  border-radius: 6px; cursor: pointer; background: #0c0e12; border: 1px solid var(--border);
-}
-.media-thumb:hover { border-color: var(--accent); }
-.media-thumb-video { display: flex; align-items: center; justify-content: center; font-size: 26px; }
-.media-subtitle { font-size: 12px; color: var(--text-dim); margin: 12px 0 4px; font-weight: 600; }
 
 /* 监控列表：批量导入 / 导出工具栏 */
 .mon-io-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
@@ -531,7 +565,7 @@ tr:last-child td { border-bottom: none; }
 .log-line.log-w .log-msg { color: #ffcf7a; }
 .log-line.log-e .log-level { color: #ff5c5c; }
 .log-line.log-e .log-msg { color: #ff8a8a; }
-.kbd { background: var(--bg-input); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; font-size: 12px; }
+
 .toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
   background: var(--bg-card); border: 1px solid var(--border); color: var(--text);
@@ -824,12 +858,6 @@ button.dirty { box-shadow: 0 0 0 2px rgba(245, 196, 81, .38); }
 }
 .persona-card:hover .persona-del { opacity: 1; }
 .persona-del:hover { background: var(--red); color: #fff; }
-
-/* 历史记录复选列 */
-.col-chk { width: 38px; text-align: center; }
-.col-chk input { width: auto; display: inline-block; cursor: pointer; }
-th.col-chk { text-align: center; }
-.col-content { max-width: 420px; }
 
 /* 历史记录 - 卡片式 */
 .hist-list { display: flex; flex-direction: column; gap: 12px; }
@@ -1447,7 +1475,6 @@ button.hsm-clear { margin-left: auto; }
 .hot-tip-actions { display: flex; gap: 6px; margin-top: 9px; }
 .hot-tip-actions button { padding: 4px 10px; font-size: 11.5px; border-radius: 6px; }
 
-
 /* 数据总览 */
 .data-overview-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 18px; }
 .data-overview-grid .stat { text-align: center; }
@@ -1548,7 +1575,6 @@ button.hsm-clear { margin-left: auto; }
   filter: drop-shadow(0 0 2px rgba(255,130,0,.5));
   flex-shrink: 0;
 }
-
 
 /* ================= 【v1.2.0】数据路径设置 ================= */
 .path-locked {

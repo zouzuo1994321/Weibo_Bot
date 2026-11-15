@@ -154,6 +154,17 @@ async function init() {
   /* 【v1.4.9】开屏进度：界面骨架已就绪，开始接触后端 */
   bootProgress(15, "界面骨架已就绪，正在连接后端…");
 
+  /* 【v1.6.11】统计卡尺寸变化交给 ResizeObserver 监听（窗口缩放、侧栏收展、
+     数据总览页切换导致主区宽度变化都会触发），替代原先「每秒主动读一次
+     clientWidth」的强制重排。 */
+  try {
+    if (window.ResizeObserver) {
+      const _ro = new ResizeObserver(function () { layoutFwdRing(); });
+      const _c = document.getElementById("statForwards");
+      if (_c) _ro.observe(_c);
+    }
+  } catch (e) { /* 老内核无 ResizeObserver 时退回 window.resize 监听 */ }
+
   setInterval(updateWhBar, 30000);      // 工作时间条实时更新
   setInterval(monAutoTick, 15000);     // 监控列表定时刷新
   setInterval(refreshOverviewLive, 1000);  // 【v1.4.18】概览轮询改为秒级（后端缓存优先）
@@ -162,7 +173,10 @@ async function init() {
   setInterval(updateOverviewClock, 1000);  // 概览时钟每秒刷新（纯前端）
   setInterval(refreshAccountsLive, 1000);  // 【v1.4.18】账户管理页秒级刷新（仅激活时拉取）
   setInterval(function () { refreshHotSearch(false); }, 30000);  // 【v1.6.1】热搜快照（后 60s 抓一次）
-  tickForwardRing();   // 【v1.4.18】启动本日转发进度环动画循环
+  /* 【v1.6.11】进度环改为「按需驱动」：不再启动常驻 rAF 循环，改由 1s 看门狗
+     在调度运行时拉起、空闲时让循环自然结束（详见 tickForwardRing 注释）。 */
+  _fwdRingWatchdog();
+  setInterval(_fwdRingWatchdog, 1000);
 
   // 【v1.4.0】数字输入框自定义上下按钮：先装饰已存在的，再用 MutationObserver 覆盖动态渲染的
   decorateNumberInputs(document);
@@ -534,7 +548,9 @@ function renderOverview() {
   setText("numAccounts", STATE.accounts.length + "/5");
   setText("numPosts", s.monitored_posts_today || 0);
   setText("numForwards", s.forwards_today || 0);
-  layoutFwdRing();   // 卡片尺寸可能因布局变化而变，重排进度环几何
+  /* 【v1.6.11】这里原本每秒调一次 layoutFwdRing()，而它每次都要读
+     clientWidth/clientHeight（强制同步重排）。卡片尺寸并不会因为数字变化而改变，
+     改由 init() 里挂的 ResizeObserver 在真正变化时重排。 */
 
   const sch = STATE.scheduler;
   const tag = document.getElementById("schedState");
@@ -566,7 +582,12 @@ function renderOverview() {
 /* 安全设置元素文本（元素不存在时静默跳过） */
 function setText(id, v) {
   const el = document.getElementById(id);
-  if (el) el.textContent = (v === undefined || v === null) ? "" : String(v);
+  if (!el) return;
+  const s = (v === undefined || v === null) ? "" : String(v);
+  /* 【v1.6.11】值没变就不碰 DOM。本函数被 renderOverview 每秒调用十余次，
+     旧实现即使文本完全相同也照样赋值 —— 每次赋值都会替换文本节点、让该元素
+     以及受其影响的布局失效，纯属白烧。 */
+  if (el.textContent !== s) el.textContent = s;
 }
 
 /* ---------------- 本日转发进度环（v1.4.18，v1.4.19 修正） ---------------- */
@@ -586,6 +607,7 @@ function setText(id, v) {
 let _fwdPrevNextRun = null;     // 上一帧的 next_run（用于检测新周期开始）
 let _fwdDoneFor = null;         // 已触发满环驻留的 next_run（每个周期只触发一次）
 let _fwdPerim = 0;              // 路径周长（像素）
+let _fwdGeom = "";              // 【v1.6.11】上次的几何签名（宽x高），尺寸没变就不重排
 function layoutFwdRing() {
   const card = document.getElementById("statForwards");
   const svg = document.getElementById("fwdRing");
@@ -594,6 +616,12 @@ function layoutFwdRing() {
   if (!card || !svg || !track || !prog) return;
   const W = card.clientWidth, H = card.clientHeight;
   if (!W || !H) return;
+  /* 【v1.6.11】几何签名守卫：旧实现被 renderOverview 每秒调一次，每次都读
+     clientWidth/clientHeight（强制同步重排）并重写两条 <path> 的 d 属性
+     （浏览器要重新细分曲线），纯属白烧。尺寸不变就直接返回。 */
+  const sig = W + "x" + H;
+  if (sig === _fwdGeom) return;
+  _fwdGeom = sig;
   const sw = 3;      // 描边线宽
   const r = 10;      // 圆角半径（与卡片圆角观感一致）
   const x = sw / 2, y = sw / 2, w = W - sw, h = H - sw;
@@ -635,21 +663,57 @@ function triggerFwdDone() {
   }, 10000 + 1500);
 }
 
-function tickForwardRing() {
+/* 【v1.6.11】进度环驱动方式重构。
+   旧实现是一个无条件自我续期的 requestAnimationFrame 循环：即使调度未运行、
+   环根本不可见，也照样每帧（60fps）醒来执行一次、并写 strokeDashoffset。
+   SVG 描边的 dashoffset 每变一次都要重新计算整条路径的描边 → 每帧都在重排重绘，
+   这是软件待机时前端最稳定的 CPU/GPU 开销来源。
+
+   现在改为：
+     · **空闲即停**：调度未运行 → 不排下一帧，rAF 循环彻底结束；空闲态的 DOM
+       清理只做一次（_fwdIdleDone 守卫），不再逐帧写样式。
+     · **绘制节流**：运行中也最多 10fps（100ms 一帧）。进度环是分钟级的进度指示，
+       10fps 与 60fps 肉眼无差，描边重算次数直接降到 1/6。
+     · **看门狗兜底**：1s 一次的极轻量检查负责「调度启动时把循环拉起来」，
+       保证停掉之后一定能重新开始，不依赖任何事件时序。 */
+const _FWD_FRAME_MS = 100;      // 进度环最大绘制频率（10fps）
+let _fwdRafId = 0;              // 当前 rAF 句柄，0 = 循环已停
+let _fwdLastFrame = 0;          // 上次真正绘制的时刻
+let _fwdIdleDone = false;       // 空闲态 DOM 是否已清理过
+
+function _fwdShowIdle() {
+  if (_fwdIdleDone) return;     // 已清过，不重复碰 DOM
   const card = document.getElementById("statForwards");
   const prog = document.getElementById("fwdRingProg");
+  if (card) card.classList.remove("fwd-active", "fwd-done", "fwd-fading");
+  if (prog) prog.style.strokeDashoffset = String(_fwdPerim || 0);
+  _fwdPrevNextRun = null;
+  _fwdDoneFor = null;
+  _fwdIdleDone = true;
+}
+
+function tickForwardRing(ts) {
+  _fwdRafId = 0;                                  // 本帧已消费
+  const card = document.getElementById("statForwards");
+  const prog = document.getElementById("fwdRingProg");
+  /* 元素不存在（尚未渲染 / 已切走）：不排下一帧，交给 1s 看门狗在需要时重启 */
+  if (!card || !prog) return;
   const sch = (STATE && STATE.scheduler) || {};
-  if (!card || !prog) { requestAnimationFrame(tickForwardRing); return; }
   const perim = _fwdPerim || 0;
   if (!sch.running || !sch.next_run) {
-    // 调度未运行：隐藏进度环
-    card.classList.remove("fwd-active", "fwd-done", "fwd-fading");
-    prog.style.strokeDashoffset = String(perim);
-    _fwdPrevNextRun = null;
-    _fwdDoneFor = null;
-    requestAnimationFrame(tickForwardRing);
+    _fwdShowIdle();
+    return;                                       // ★ 空闲：rAF 循环到此为止
+  }
+  _fwdIdleDone = false;
+
+  /* 节流：距上次绘制不足 100ms，只排下一帧，不做任何计算与 DOM 写入 */
+  const nowMs = ts || (window.performance && performance.now ? performance.now() : Date.now());
+  if (_fwdLastFrame && (nowMs - _fwdLastFrame) < _FWD_FRAME_MS) {
+    _fwdRafId = requestAnimationFrame(tickForwardRing);
     return;
   }
+  _fwdLastFrame = nowMs;
+
   // 【v1.4.20】进度周期修正：
   //   起点 = 上一次轮询真实完成时刻 last_run（"%Y-%m-%d %H:%M:%S" 字符串）；
   //   终点 = 本次排程的实际转发时刻 next_forward_run（浮点秒，含抖动），未排程时回退 next_run。
@@ -685,7 +749,21 @@ function tickForwardRing() {
     card.classList.add("fwd-active");
     prog.style.strokeDashoffset = String(perim * (1 - progress));
   }
-  requestAnimationFrame(tickForwardRing);
+  _fwdRafId = requestAnimationFrame(tickForwardRing);
+}
+
+/* 【v1.6.11】进度环看门狗：1s 一次，只在「该跑却没跑」时把循环拉起来。
+   由于 rAF 在空闲时会自然结束，必须有这个兜底来响应「点了启动」。 */
+function _fwdRingWatchdog() {
+  if (document.hidden) return;                    // 最小化 / 托盘：不驱动
+  const card = document.getElementById("statForwards");
+  if (!card) return;
+  const sch = (STATE && STATE.scheduler) || {};
+  if (!sch.running || !sch.next_run) { _fwdShowIdle(); return; }
+  if (!_fwdRafId) {
+    _fwdLastFrame = 0;                            // 重新起跑，不等满 100ms
+    _fwdRafId = requestAnimationFrame(tickForwardRing);
+  }
 }
 
 /* 将最近一次轮询结果格式化成运行日志样式，方便阅读 */
@@ -964,6 +1042,29 @@ function renderHotCal() {
     + `<div class="hsm-cal-grid">${cells}</div>`
     + `<div class="hsm-cal-foot"><button onclick="event.stopPropagation();jumpHotToday()">今天</button>`
     + `<span class="hint">带圆点＝当天有记录</span></div>`;
+  /* 【v1.6.11 修复】点日期没反应。
+     v1.6.4 换成自绘日历后，格子只写了 data-day，却始终没有人给它绑点击 ——
+     `calPick()` 定义了却没有任何调用点（原生日历自带的选中能力随替换一起丢了）。
+     现象：日期只能靠「上/下一天」「今天」按钮或热力点图切换，日历里点哪一天都不动。
+     这里用事件委托补上（每次重绘 innerHTML 都要重新绑，委托挂在容器上只绑一次）。
+     注意 `event.stopPropagation()`：document 上有一个「点空白处收起日历」的全局监听，
+     不拦住的话本函数刚选中日期就被它关掉（头部按钮的 onclick 里已有同样处理）。 */
+  if (!box.dataset.pickBound) {
+    box.dataset.pickBound = "1";
+    box.addEventListener("click", function (e) {
+      const t = e.target;
+      if (!t || !t.closest) return;
+      if (t.closest(".hsm-cal-head") || t.closest(".hsm-cal-foot")) {
+        e.stopPropagation();     // 翻月 / 今天：按钮自己已 stop，这里再兜一层
+        return;
+      }
+      const cell = t.closest(".hsm-cal-d");
+      if (!cell) return;
+      e.stopPropagation();       // 别让「点空白收起」抢先关掉
+      const day = cell.getAttribute("data-day");
+      if (day) calPick(day);
+    });
+  }
 }
 
 
@@ -1479,27 +1580,47 @@ function accountStatusTag(a) {
   return `<span class="tag ${meta.cls}"${detail}>${meta.text}</span>`;
 }
 
+/* v1.6.10：这一列只保留「还剩多久」一句结论。
+   「实测 11-13 23:46 确认」与右侧「检测时间」列是同一个时刻的两种说法（实测就是
+   检测/轮询本身跑出来的），并排放着纯属重复，删掉。实测时刻改放进悬停提示，
+   需要核对锚点时仍查得到，但不再占一格。 */
 function cookieExpiryCell(a) {
-  const e = a.cookie_expiry;
-  if (!e || !e.has_expiry) {
-    return `<td><div class="cookie-exp none"><div class="ce-date">—</div><div class="ce-remain">无法预测</div></div></td>`;
+  const last = a.last_verified_at || "";
+  const anchor = last ? `（实测确认于 ${last}）` : "（尚未实测，按最近一次成功活动推算）";
+  // 实测判定失效优先级最高：它是直接证据，盖过一切按 7 天推算出来的日期。
+  // 否则会出现「上面写着还剩 6 天、下面写着实测已失效」的自相矛盾。
+  if ((a.verify_result || "") === "expired") {
+    return `<td><div class="cookie-exp expired" title="最后一次确认有效：${esc(last || "无记录")}">
+      <div class="ce-remain ce-main">实测已失效</div>
+      <div class="ce-verified bad">最后有效 ${esc(last ? last.slice(5, 16) : "无记录")}</div>
+    </div></td>`;
   }
-  if (e.expired) {
-    return `<td><div class="cookie-exp expired"><div class="ce-date">${esc(e.expiry_str)}</div><div class="ce-remain">已过期</div></div></td>`;
+  const e = a.cookie_expiry;
+  if (e && e.expired) {
+    return `<td><div class="cookie-exp expired" title="预计失效：${esc(e.expiry_str)}${anchor}">
+      <div class="ce-remain ce-main">已过期</div></div></td>`;
+  }
+  if (!e || !e.has_expiry) {
+    return `<td><div class="cookie-exp none" title="${anchor}">
+      <div class="ce-remain ce-main">无法预测</div></div></td>`;
   }
   const lvl = e.level === "warn" ? "warn" : "safe";
-  return `<td><div class="cookie-exp ${lvl}" title="失效时间：${esc(e.expiry_str)}（来源 ${esc(e.source||"")}）">
-      <div class="ce-date">${esc(e.expiry_str)}</div>
-      <div class="ce-remain">${esc(e.remaining_text || "")}</div>
+  return `<td><div class="cookie-exp ${lvl}" title="预计失效：${esc(e.expiry_str)}　${anchor}">
+      <div class="ce-remain ce-main">${esc(e.remaining_text || "")}</div>
     </div></td>`;
 }
 
 function renderAccounts() {
   const list = STATE.accounts;
-  document.getElementById("accCount").textContent = list.length;
+  setText("accCount", list.length);
   const tb = document.getElementById("accList");
-  if (!list.length) { tb.innerHTML = `<tr><td colspan="7" class="empty">暂无账户，请先登录并添加</td></tr>`; return; }
-  tb.innerHTML = list.map(a => `
+  if (!tb) return;
+  /* 【v1.6.11】差量更新：账户页每秒调一次 get_state 后就会走到这里，旧实现无条件
+     重写整张 tbody 的 innerHTML —— 即使没有任何字段变化，也要销毁并重建全部 <tr>
+     与其中的按钮，再触发整表重排重绘。现在先拼字符串，与上次结果完全相同就跳过
+     赋值。字符串拼接成本远低于 DOM 重建，且判断是「逐字节比较」，不会漏更新。 */
+  const html = list.length
+    ? list.map(a => `
     <tr>
       <td>${esc(a.display_name || a.remark || "未命名账户")}</td>
       <td class="muted">${esc(a.created_at)}</td>
@@ -1508,7 +1629,11 @@ function renderAccounts() {
       ${cookieExpiryCell(a)}
       <td class="muted">${esc(a.last_check || "—")}</td>
       <td><button class="small" onclick="checkAccount('${a.id}')">检测</button> <button class="small ghost" onclick="renewAccount('${a.id}')">续期</button> <button class="small danger" onclick="removeAccount('${a.id}')">删除</button></td>
-    </tr>`).join("");
+    </tr>`).join("")
+    : `<tr><td colspan="7" class="empty">暂无账户，请先登录并添加</td></tr>`;
+  if (tb._lastHtml === html) return;
+  tb._lastHtml = html;
+  tb.innerHTML = html;
 }
 
 async function checkAccount(id) {
@@ -1546,8 +1671,9 @@ async function addAccount() {
     const remark = document.getElementById("accName").value.trim();
     const cookie = document.getElementById("accCookie").value.trim();
     if (!cookie) { toast("Cookie 不能为空", "err"); return; }
-    const r = await apiCall("add_account", remark, cookie);
-    if (r.ok) { toast("账户已添加", "ok"); document.getElementById("accName").value = ""; document.getElementById("accCookie").value = ""; await refreshStateFresh(); }
+    const jar = (_CAPTURED_JAR && cookie === _CAPTURED_STR) ? _CAPTURED_JAR : null;
+    const r = await apiCall("add_account", remark, cookie, jar);
+    if (r.ok) { toast("账户已添加", "ok"); document.getElementById("accName").value = ""; document.getElementById("accCookie").value = ""; _CAPTURED_JAR = null; _CAPTURED_STR = ""; await refreshStateFresh(); }
     else toast(r.message, "err");
   } finally { window._accBusy = false; }
 }
@@ -1592,10 +1718,18 @@ async function openSystemLogin() {
   const r = await apiCall("open_system_browser");
   toast(r.message || "已打开系统浏览器");
 }
+/* v1.6.5：内置浏览器读到的「带域条目」，随账户一起落库。
+   只有 cookie 文本仍是当时抓取的那一份时才使用（用户手动粘贴/编辑过就丢弃，
+   避免把不匹配的域信息套到新 Cookie 上）。 */
+let _CAPTURED_JAR = null;
+let _CAPTURED_STR = "";
+
 async function captureCookie() {
   const r = await apiCall("capture_login_cookies");
   if (!r.ok) { toast(r.error, "err"); return; }
   document.getElementById("accCookie").value = r.cookie;
+  _CAPTURED_JAR = r.entries || null;
+  _CAPTURED_STR = r.cookie || "";
   toast(r.logged_in ? "已获取登录态 Cookie" : "已获取 Cookie（未检测到登录态，请确认已登录）", r.logged_in ? "ok" : "err");
 }
 async function closeLogin() { await apiCall("close_login_browser"); toast("已关闭登录窗口"); }
@@ -1883,11 +2017,48 @@ function renderForward() {
     const n = parseInt(c.forward_count, 10);
     fc.value = (isNaN(n) || n < 1) ? 1 : Math.min(10, n);
   }
+  /* 【v1.6.12】排程波动 / 仅转发含图博文 */
+  const jit = document.getElementById("fwdCountJitter");
+  if (jit) jit.checked = !!c.forward_count_jitter;
+  const imgOnly = document.getElementById("fwdImagesOnly");
+  if (imgOnly) imgOnly.checked = !!c.forward_images_only;
+  _syncJitterAvail();
   document.getElementById("aiSwitch").checked = !!c.ai_enabled;
   const normal = document.getElementById("normalSwitch");
   if (normal) normal.checked = !c.ai_enabled;   // 两种转发方式互斥
   loadAiSettings();          // 【v1.2.0】三引擎：主/备 + 参数 + 状态
   refreshAiDeploy();
+}
+
+/* 【v1.6.12】排程数量为 1 时「排程波动」没有意义（1~1 仍是 1）。
+   这里**不**禁用开关（禁用+已勾选会让用户以为坏了），只降透明度并给 title 说明，
+   用户仍可自由开关；真正兜底在后端 get_forward_count_for_round()（n<=1 直接返回 1）。 */
+function _syncJitterAvail() {
+  const jit = document.getElementById("fwdCountJitter");
+  if (!jit) return;
+  const fcEl = document.getElementById("forwardCount");
+  const n = parseInt(fcEl ? fcEl.value : 1, 10);
+  const idle = (isNaN(n) || n < 2);
+  const row = jit.closest(".fwd-opt-row");
+  if (row) row.classList.toggle("is-off", idle);
+  jit.title = idle
+    ? "排程数量为 1 时波动无效（每轮本来就只有 1 条）；把排程数量调到 2 以上即可生效"
+    : "每轮在 1 ~ 排程数量 之间随机取条数";
+}
+
+/* 【v1.6.12】两个策略开关独立保存（改一次即刻生效，不必再点「保存间隔」） */
+async function saveForwardOptions() {
+  const jit = document.getElementById("fwdCountJitter");
+  const imgOnly = document.getElementById("fwdImagesOnly");
+  const patch = {
+    forward_count_jitter: !!(jit && jit.checked),
+    forward_images_only: !!(imgOnly && imgOnly.checked),
+  };
+  const r = await apiCall("save_config", JSON.stringify(patch));
+  if (!r || !r.ok) { toast((r && r.error) || "保存失败", "err"); return; }
+  toast("转发策略已保存", "ok");
+  await refreshStateFresh();
+  renderForward();
 }
 async function saveInterval() {
   const v = parseInt(document.getElementById("intervalMin").value, 10);
@@ -1899,6 +2070,7 @@ async function saveInterval() {
   if (fcEl) fcEl.value = n;
   await apiCall("save_config", JSON.stringify({ interval_minutes: v, forward_count: n }));
   toast("间隔与排程数量已保存", "ok"); await refreshStateFresh();
+  _syncJitterAvail();       // 【v1.6.12】排程数量变了，「波动」的有效性跟着变
 }
 /* 转发方式互斥切换：开启其一自动关闭另一种，且至少保留一种 */
 async function onForwardModeChange(which) {
@@ -2173,14 +2345,6 @@ async function aiSelfCheck() {
   toast(r.ok ? "AI 自检全部通过" : "AI 自检发现问题", r.ok ? "ok" : "err");
 }
 
-/* 旧版二引擎入口（保留以兼容旧 HTML/书签） */
-async function saveAiEngine() {
-  const p = document.getElementById("aiPrimaryEngine");
-  const val = p ? p.value : "builtin";
-  const r = await apiCall("set_ai_engine", val);
-  if (r && r.ok) { toast("AI 主路线已保存", "ok"); await refreshStateFresh(); }
-  else toast((r && r.error) || "保存失败", "err");
-}
 
 async function startModelDownload() {
   const r = await apiCall("start_model_download");
@@ -2680,7 +2844,10 @@ function updateOverviewClock() {
 
 /* ---------------- 历史 ---------------- */
 let HIST_ROWS = [];
-let HIST_FILTERS = { kind: "monitored", keyword: "", dateFrom: "", dateTo: "", status: "", ftype: "", hasImg: false };
+/* 【v1.6.13】「只看有图」默认开启。集中成一处常量，切页 / 清空筛选都回到这个默认值，
+   避免「默认开」「清空筛选后变关」两套口径打架。 */
+const HIST_HASIMG_DEFAULT = true;
+let HIST_FILTERS = { kind: "monitored", keyword: "", dateFrom: "", dateTo: "", status: "", ftype: "", hasImg: HIST_HASIMG_DEFAULT };
 let HIST_PAGE = 1;
 let HIST_PAGE_SIZE = 20;
 let HIST_FILTERED = [];
@@ -2695,6 +2862,13 @@ async function switchHist(kind) {
     kind === "monitored" ? "被监控对象发过的微博" : "本软件转发记录";
   document.getElementById("btnHistMon").classList.toggle("active", kind === "monitored");
   document.getElementById("btnHistFwd").classList.toggle("active", kind === "forwards");
+  // v1.6.10：「只看有图」只对被监控微博有意义（转发记录没有配图字段），随手切到此页时
+  // 恢复默认值，避免带着上一页的筛选状态让人以为记录丢了。
+  // 【v1.6.13】默认值改为「开启」：回到被监控微博页即恢复勾选。
+  const imgOnly = document.getElementById("histImgOnly");
+  const imgChk = document.getElementById("hfHasImg");
+  if (imgOnly) imgOnly.style.display = kind === "monitored" ? "" : "none";
+  if (imgChk) imgChk.checked = (kind === "monitored") ? HIST_HASIMG_DEFAULT : false;
   renderHistFilters();
   if (kind === "monitored") {
     HIST_ROWS = await apiCall("get_monitored_posts", null, 500, 0);
@@ -2736,10 +2910,6 @@ function renderHistFilters() {
         </label>
         <label class="field hist-filter-date">结束日期
           <input id="hfDateTo" type="date" onchange="applyHistFilter()">
-        </label>
-        <label class="field hist-filter-check">
-          <span class="hist-check-label">仅看有图</span>
-          <span class="hist-check-box"><input type="checkbox" id="hfHasImg" onchange="applyHistFilter()"></span>
         </label>
         <button class="ghost hist-filter-clear" onclick="clearHistFilters()">清空筛选</button>
       </div>`;
@@ -2853,13 +3023,6 @@ function renderPagination(total) {
   `;
 }
 
-function onPageSizeChange(v) {
-  if (v === "custom") {
-    showCustomPageSize();
-    return;
-  }
-  changePageSize(parseInt(v, 10));
-}
 
 function showCustomPageSize() {
   const wrap = document.getElementById("customPageWrap");
@@ -2895,14 +3058,10 @@ function clearHistFilters() {
   document.getElementById("hfDateTo").value = "";
   if (document.getElementById("hfStatus")) document.getElementById("hfStatus").value = "";
   if (document.getElementById("hfFtype")) document.getElementById("hfFtype").value = "";
-  if (document.getElementById("hfHasImg")) document.getElementById("hfHasImg").checked = false;
+  if (document.getElementById("hfHasImg")) document.getElementById("hfHasImg").checked = HIST_HASIMG_DEFAULT;
   applyHistFilter();
 }
 
-function _chkCell(id) {
-  const checked = HIST_SELECTED.has(id) ? "checked" : "";
-  return `<td class="col-chk"><input type="checkbox" class="histChk" data-id="${id}" ${checked} onchange="toggleHistSelect(${id}, this.checked)"></td>`;
-}
 
 function _histAvatar(r) {
   const ch = esc((r.screen_name || r.uid || "?").charAt(0).toUpperCase());
@@ -3082,12 +3241,6 @@ async function exportSelected() {
 async function exportAll() {
   const r = await apiCall("export_all_data");
   if (r.ok) afterExport({ ...r, count: r.count }); else toast(r.error || "导出失败", "err");
-}
-async function exportKind(kind) {
-  const fmt = pickExportFmt("导出格式：输入 csv / json / xlsx");
-  if (!fmt) return;
-  const r = await apiCall("export_data", kind, fmt);
-  if (r.ok) afterExport(r); else toast(r.error || "导出失败", "err");
 }
 
 /* ---------------- 数据总览 ---------------- */
@@ -3748,7 +3901,6 @@ async function exportLogs(fmt) {
   else if (res && res.error && !/取消/.test(res.error)) toast("导出失败：" + res.error);
 }
 
-function clearLogView() { document.getElementById("logView").innerHTML = ""; }
 
 /* ---------------- 关于 ---------------- */
 function renderAbout() {
@@ -3841,6 +3993,104 @@ function renderAbout() {
    数据内嵌于前端，保证离线可用（本软件为单机离线运行）。
    与 README.md「版本迭代记录」保持同步维护。 */
 const CHANGELOG = [
+  {
+    ver: "v1.6.13", internal: "2611130009", date: "2026-11-13",
+    title: "「仅转发含图博文」归位到转发方式 + 「只看有图」默认开启",
+    items: [
+      "【转发设置 · 开关注换了位置】上一版把「排程波动」和「仅转发含图博文」一起塞进了「轮询间隔」卡，左边那张卡被撑高一截，右边「转发方式」卡底部空出一大片 —— 两张本来就是并排的一对，一眼就看得出不齐。现在「仅转发含图博文」挪到「转发方式」卡里：它决定的是**转发什么样的内容**，与同一张卡上「AI 增强转发 / 普通转发」（决定**怎么转发**）本来就是同一个层级的事。",
+      "【两卡高度重新拉平】移完之后左右两卡的内容量几乎持平（自然高度 299.6 / 289.4 px，差的 10px 由等高拉伸补齐），原先 146px 的空档消失。等高还是靠「网格拉伸 + 卡内 body 撑开 + 按钮贴底」那套机制，没有写死任何像素高度 —— 以后往任何一边加内容都不会撑破版式。",
+      "【历史记录 · 「只看有图」默认勾选】打开「被监控对象发过的微博」时，默认只显示带图的微博。带图的通常才是值得看一眼的内容，纯文字多是转评、签到、水帖，默认滤掉能省下大量翻页。想全看时取消勾选即可。",
+      "【「清空筛选」回到默认，而不是全关】（v1.6.13 起）清空筛选后「只看有图」会重新勾上 —— 否则会出现「点了清空筛选，反倒多出一堆不想看的」这种和直觉相反的结果。三处会写这个开关的地方（首次进页 / 切换子页 / 清空筛选）统一走同一个默认值常量，不会再出现「默认开、清一下变关」的自相矛盾。",
+      "【切到「转发记录」页仍自动收起】转发记录本身没有配图字段，这个筛选在这一页无意义，所以保持上一版行为：切过去即隐藏并置为不勾选，切回来时自动恢复勾选。",
+    ]
+  },
+  {
+    ver: "v1.6.12", internal: "2611130008", date: "2026-11-13",
+    title: "转发策略两个新开关 + 相册监控滚动卡顿修复",
+    items: [
+      "【转发设置 · 排程波动】新开关。以前「排程数量」是个固定值，设为 5 就是每轮雷打不动发 5 条 —— 时间一长就是一条「每隔 N 分钟必发 K 条」的机械节律，反而是风控最容易盯上的特征。开启波动后，排程数量被当作**上限**：设 5 则每轮在 1~5 之间随机取一个条数，忽多忽少，节奏自然。关闭时行为与之前完全一致；排程数量为 1 时波动没有意义（1~1 还是 1），卡片上会以半透明提示。",
+      "【转发设置 · 仅转发含图博文】新开关。开启后只挑**带图**的微博参与排程，纯文字和纯视频微博不进候选池 —— 因为转发视频博文时客户端只渲染出一张链接卡片，观感与「配图转发」的预期不符，所以视频也不算含图。若本轮抓到的全是纯文字，就如实跳过并说明原因，不会随便挑一条凑数。",
+      "【这两个开关各管一段，互不干扰】波动决定「本轮发几条」，含图决定「从哪些里挑」，所以是先在候选池里滤掉无图微博，再按（可能是随机的）条数去挑 —— 顺序反了会把条数悄悄做少。被滤掉的监控对象在轮询结果里会写清「无图博文已按设置滤除」，不会笼统显示成「本轮随机未选中」。",
+      "【相册监控滚动卡顿 —— 根因是预览图用了原图】卡片右侧那个 104×104 的小预览框，取的是**微博原图**整份转成 base64。本机实测媒体库 85 个对象、17149 张图共 49GB，每个对象最新一张的**中位数就有 1.9MB**（最大 29MB）—— 一页 85 张卡片意味着约 250MB 字符串和几十亿像素的解码位图常驻浏览器，滚动时每一帧都在为这些超大纹理做栅格化，必然掉帧。",
+      "【改成服务端缩略图 + 落盘缓存】新增缩略图接口：把原图缩到 208px（104 CSS px 的 2 倍，兼顾高分屏）存成 JPEG 缓存到本地，单张只有 8~20KB。实测 8 张原图合计 18.4MB，缩略后 62.5KB —— **降到 0.33%，约 300 倍**。同一张图第二次打开直接读缓存不再重算；原图被重新下载覆盖时（大小/时间变了）会自动重新生成，不会固守旧图。",
+      "【前端三件事：进视口才加载、最多同时 3 个请求、结果只取一次】旧实现是页面一打开就给全部对象一次性发请求，JS 线程和解码内存同时被打满 —— 这正是「一进页面就开始卡」的来源。现在只有滚到卡片附近 300px 才请求，同时最多 3 个在途，切页回来不重复拉；图片带显式宽高与异步解码，不会再出现「先撑开再回缩」的重排。",
+      "【CSS 顺手收紧】卡片原来的 `transition: .15s` 等价于 all，鼠标掠过时连背景、内边距都在补间；现在只保留边框色。视口外的卡片加 `content-visibility: auto` 直接跳过布局与绘制，预览框加 `contain: paint` 与外部隔离 —— 图怎么变都不会触发整张卡片重算。",
+    ]
+  },
+  {
+    ver: "v1.6.11", internal: "2611130007", date: "2026-11-13",
+    title: "CPU 占用优化 + 整体瘦身 + 日历点日期修复",
+    items: [
+      "【CPU 瞬时冲高的真正原因找到了】不是轮询、不是转发，而是**读 CPU 温度**：旧实现每 30 秒新起一个 `powershell.exe` 去查一次 WMI，实测单次 400 毫秒（进程内首次更是 993 毫秒）—— 也就是每半分钟让一个核心满载小半秒，任务管理器里就是一根根尖刺；而且这个定时器一旦随「系统概览」页启动就永不停止，软件收到托盘后照样每 30 秒烧一次。现在改成**常驻查询进程**（进程只起一次，之后走 stdin/stdout 一问一答，稳态单次 17 毫秒）+ **空闲 90 秒自动退出**（内存还给系统，不留常驻进程）+ **按需探测**（概览页关着时一次都不查）。原来每分钟 800 毫秒的固定开销，降到 34 毫秒；不看概览页时是 0。",
+      "【进度环不再空转】「本日转发次数」卡外框那个进度环，旧写法是一个**永不停止的 60fps 动画循环**：即使转发调度根本没启动、环根本看不见，它也照样每帧醒来、每帧重写描边偏移量，而 SVG 描边每变一次都要重算整条路径。现在空闲时循环彻底结束，运行中降到 10fps（进度环是分钟级指示，10fps 与 60fps 肉眼无差），另加一个 1 秒一次的极轻量看门狗负责在点「启动」时把循环拉起来。",
+      "【停止每秒的无效重绘】概览页与账户页会每秒取一次状态，这本身很便宜（后端 5 秒缓存、命中后 0.01 毫秒），但此前拿到数据后**无条件重建整块界面**：账户表每秒把整张表格的 HTML 重新拼一遍再销毁重建（连里面的按钮一起）；统计数字每秒重新赋一次值（哪怕数字没变，赋值就会让该元素重排）；进度环每秒强制读一次卡片尺寸（读尺寸会触发浏览器同步重排）。现在三处都改成**值没变就不碰 DOM**，卡片尺寸改由尺寸观察器在真正变化时通知。",
+      "【日历点日期没反应的 BUG 修好了】热搜页那个自绘深色日历（v1.6.4 加的），日期格子只带了日期属性、却**始终没有绑定点击事件** —— 选中日期的函数写好了，没有任何地方调用它。表现就是：在日历里点哪一天都不动，只能用「上/下一天」「今天」按钮或热力点图换日期。现在补上了事件委托，点日期即生效。",
+      "【体积精简：约 26MB（解压后）】按解包统计逐项核实后剔除了三类完全没被用到的内容：jieba 的词法分析大模型（10.2MB）和 TF-IDF 词频表（5.9MB，软件只用分词和词性标注）、Pillow 的 AVIF 编解码（7.5MB，软件只在托盘读 logo，微博图片一律原样字节落盘不过 Pillow）与文字栅格化模块（2.1MB，没有任何在图上绘字的代码）、llama.cpp 的静态导入库（2.9MB，运行期不加载）。同时剥掉打包内的文档字符串。",
+      "【构建流程加了两道闸门】上次打包时软件还开着，复制到根目录报「文件被占用」，结果是 dist 里已是新版、根目录和历史归档还停在上一个版本，三处错位。现在打包**开始前**就检查有没有旧进程在跑，有就明确中止并提示；归档阶段再被占用也会直接报错说清「哪一处没更新」，不再留下错位现场。",
+      "【顺带清掉一批重构残留】删除了 7 个已无人调用的旧函数（旧版单数 AI 引擎保存、旧分页回调、旧导出分发、旧勾选单元格、媒体预览浮层等）与 15 条死样式规则。其中「媒体大图预览浮层」自 v1.4.17 改成卡片缩略图后就没有任何入口能打开，属于纯残留，一并移除。"
+    ]
+  },
+  {
+    ver: "v1.6.10", internal: "2611130006", date: "2026-11-13",
+    title: "账户表去掉重复时间 + 「只看有图」挪到列表工具栏",
+    items: [
+      "【去掉重复的实测确认时间】「Cookie 有效期」列原本是「剩 6 天 23 小时」+「实测 11-13 23:46 确认」两行，而右边紧邻的「检测时间」列就是 2026-11-13 23:46:48 —— **同一个时刻的两种说法**（「实测」本来就是检测/轮询跑出来的），并排摆着纯属重复。现在这一列只留一句结论；实测时刻改放进悬停提示（`预计失效：… 实测确认于 …`），要核对锚点时仍查得到，但不占版面。",
+      "【「最后有效」保留】失效状态下仍显示两行：「实测已失效」+「最后有效 11-10 08:00」。这条和「检测时间」不是一回事 —— 前者是最后一次真的能用，后者是最后一次检查，中间可能差好几天，正是判断「什么时候开始挂」的依据。",
+      "【「只看有图」挪位置】这个筛选本来就有，但藏在上面那张筛选卡的最右边，离列表太远、基本找不到。现在挪到列表标题旁（「全选本页」右边），看列表时随手就能切；只在「被监控微博」页出现，转发记录没有配图字段，切过去时自动收起并复位，避免带着筛选状态让人以为记录丢了。"
+    ]
+  },
+  {
+    ver: "v1.6.9", internal: "2611130005", date: "2026-11-13",
+    title: "修复「功能一切正常却显示实测已失效」+ 运行日志留痕",
+    items: [
+      "【BUG · 假失效】现场：账户状态「正常」、抓取全部成功、转发正常，但「Cookie 有效期」列却写「实测已失效」，点一下「检测」又恢复正常。根因是 v1.6.7 的登录态探针用错了口径：它把 `m.weibo.cn/api/config` 的 `login:false` 当成失效证据，而 **m.weibo.cn 与 weibo.com 不同源** —— 一份网页端完全有效的 Cookie，到移动端接口上本来就回答未登录。这个坑在检测函数里早就写明过（「只能做正向确认，绝不能否定登录态」），新探针却违反了它。",
+      "【修法 · 两级判定】① 同源实测 `probe_login_web()`（`weibo.com/ajax/profile/info`）——与 Cookie 同源，是唯一有资格判「失效」的轻量接口；② 移动端 `probe_login()` 收窄为**只做正向确认**，`login` 只可能是 `True` 或 `None`，永远不会再返回 `False`。两路都给不出结论就一个字都不写库。",
+      "【自动纠错】真实抓取成功是比任何探针都硬的证据：只要本轮有对象拉取成功，就顺手把实测结论纠正为「有效」。因此即便某个历史版本留下误标，下一轮正常轮询就会自己复原，不必再手点「检测」。",
+      "【升级自愈】老版本误标的「已失效」没有 `verify_expired_at` 时间戳（当时不记）。升级后若账户状态正常且确有成功活动记录，该标记会被退回「未实测」并在日志留一行说明；带时间戳的真失效一律保留，不会被升级掩盖。",
+      "【日志 · 让这类问题下次能查】① 启动快照：版本 / 内部号 / 数据目录 / 关键开关一次记全（程序常跑在别的机器上，没有这行就无法把日志对应到构建）；② 账户判定快照：启动时逐账户记 `status / verify / last_verified / expiry`，「状态正常但标记失效」这种自相矛盾一贴日志就能看出来；③ 每次实测留痕：同源结论 → 移动端结论 → 写入值 → 依据；④ 标记翻转单独记一行（含来源与依据），谁在什么时候把有效改成失效有完整轨迹；⑤ 未捕获异常兜底：主线程与后台线程都写 `UNCAUGHT` + 完整堆栈，另存 `crash.log`（打包成 windowed exe 后 stderr 不可见，此前这类异常等于彻底静默）。",
+      "【日志 · 降噪】「忽略表情/贴纸图片」原先逐张打一行，一条微博能刷十几行、几十条帖子就把关键判定行彻底淹没——而开着 verbose 恰恰是最需要读日志的时候。改为每帖一行汇总「剔除表情 N 张、装饰图 N 张，保留 N 张」。"
+    ]
+  },
+  {
+    ver: "v1.6.8", internal: "2611130004", date: "2026-11-13",
+    title: "账户表：有效期只留剩余时间 + 表头与内容对齐",
+    items: [
+      "【有效期列只显示剩余时间】原来这一格是三行——绝对日期、剩余时间、实测确认，一列里塞了三层信息，扫一眼要先做「2026-11-20 减今天」的心算才知道急不急。现在主行直接就是「剩 6 天 23 小时」，绝对日期挪进悬停提示，「已过期 / 实测已失效 / 无法预测」三种降级状态同样只保留一句结论；剩余时间字号提到 13px / 600 权重并用等宽数字，多行数字右边缘也齐。",
+      "【「无法预测」不再是小字】该分支原来沿用的是次行的小字号，与其它四种状态视觉分量不一致；现统一为主行字号，但保持灰阶、不加粗，降级状态不该抢眼。",
+      "【修复表头与内容左侧错位】「状态」列内容是一枚胶囊标签（`padding: 3px 9px`），标签框和表头都从同一个 12px 内边距起排，**框内文字就比表头右移了 9px**——同一张表里只有这一列歪，越看越像没对齐。现在该列表头单独补到 21px（12 + 9），让表头文字正对标签文字。已用 DOM 逐列实测：七列偏移量全部为 0px（修复前「状态」列为 9px，其余六列本就为 0）。"
+    ]
+  },
+  {
+    ver: "v1.6.7", internal: "2611130003", date: "2026-11-13",
+    title: "Cookie 有效期：从「纯推算」改为「实测锚点 + 预计失效」",
+    items: [
+      "【为什么不能直接查】Cookie 的 `Expires` 只决定浏览器什么时候删掉它，**不代表服务端认它多久**。有人实测过登录当天的真实值：`SUB(.weibo.com)` = **1 年**、`ALF(.weibo.com)` = 30 天、`SUBP(.sina.com.cn)` = 7 天 —— 而服务端 7 天就作废。所以「读 Cookie 到期时间」这条路会给出「一年」的假象，比原来的推算更差。",
+      "【真实有效期的本质】服务端 session 是**可变状态**：可能被风控提前作废，也可能被滑动续期往后推。不存在能 `SELECT` 出「真实过期时间」的接口，**只能探测**。",
+      "【找到的权威探针】`GET https://m.weibo.cn/api/config` 返回 `{\"data\":{\"login\":true/false}}` —— 这是微博自己给出的「此刻是否登录」布尔值，返回体极小、无需解析 HTML，比猜登录墙可靠（实测：伪造 Cookie 会稳定返回 `login:false`）。",
+      "【怎么用起来】每轮常驻保活顺带跑一次该探针（约一次轻请求），把结果写成账户的新字段 `last_verified_at`（最后实测确认有效的时刻）与 `verify_result`。**探测失败不等于失效**：风控 / 网络异常 / 结构变化一律不写，绝不把「测不出来」记成「已过期」。",
+      "【界面上怎么变】「Cookie 有效期」这一列多一行小字：`实测 11-13 22:51 确认` —— 上面那行日期现在锚定在**这个实测时刻 + 7 天**，而不是登录时刻的推算；从没探测过就明写「未实测」；实测判定失效时整格转红显示「实测已失效」，不再拿时间推算当结论。手工「检测」的结果同样计入实测。",
+      "【顺带】老账户自动补齐字段（用 `last_ok_at` 兜底播种），不需要重新登录。"
+    ]
+  },
+  {
+    ver: "v1.6.6", internal: "2611130002", date: "2026-11-13",
+    title: "账户表「最近使用」改为最近一次成功轮询的时间",
+    items: [
+      "【问题】「最近使用」这一列一直是空的（显示 `—`）——排查发现 `mark_used()` 这个方法从 v1.1 就写好了，但**从来没有被调用过**，所以 `last_used` 永远停在初始的空字符串。",
+      "【改法】`fetch_uid()` 补一个 `ok` 返回值，明确区分「拉取成功但没新微博」和「拉取失败（Cookie 失效 / 风控 / 网络异常）」。轮询跑完时只要**本轮至少有一个对象真的拉取成功**，就把该账户的 `last_used` 更新为当前时间。判定口径故意不用「有没有抓到新微博」——没有新微博也是成功轮询，不能因此不记账。",
+      "【顺带的好处】`mark_used()` 同时会刷新 `last_ok_at`，也就是把微博的 7 天滑动窗口往前推——所以「最近使用」现在既是可见的使用记录，也是续期窗口的真实锚点。更新后会立即失效状态缓存，账户表当场刷新，不用等下一轮轮询。"
+    ]
+  },
+  {
+    ver: "v1.6.5", internal: "2611130001", date: "2026-11-13",
+    title: "登录态持久化：内置浏览器不再每次清空 Cookie + 常驻保活 + Cookie 带域存储",
+    items: [
+      "【根因一：内置浏览器根本不落盘】排查发现 pywebview 默认 `private_mode=True`，后果远比名字严重：① 未给 `storage_path` 时，WebView2 的用户数据文件夹取的是一个**每次启动都不同的临时目录**；② WebView2 初始化时还会主动 `DeleteAllCookies()`。也就是说内置浏览器「记得自己登录过」这件事从来没发生过——登录态真正靠的是登录时抓的一份**静态快照**。现在显式关掉私有模式并把存储目录固定到 `data\\webview`，内置浏览器终于会正常记住登录态。",
+      "【根因二：没人去续期】微博的 7 天不是从登录倒计时，而是**从最后一次有效访问**开始刷新；系统浏览器天天用所以越用越久，本软件此前只在轮询循环里才跑一次保活——软件一关、或只做单次转发，就完全没有请求去触发滑动续期，第 7 天必然掉线。现在改为**常驻保活线程**：应用启动后 20 秒补一次、之后按「保活间隔」定时续期、退出前再补一次（有界 8 秒，绝不拖慢退出），与排程是否运行彻底解耦。",
+      "【根因三：Cookie 被压平丢了域】旧实现把 Cookie 存成 `name=value; name=value` 单串，domain 维度被压掉。而微博的同一个 `SUB` 在 `.weibo.com` / `.weibo.cn` / `.sina.com.cn` 下各有一份，压平后互相覆盖——续期回来的那一份会把另一份顶掉，表现为「刚保活过却报未登录」。现在改为**带域条目存储**（name/value/domain/path/expires，加密落盘），续期时按 (name, domain) 精确匹配：网页端续期落在 `.weibo.com`、移动端落在 `.weibo.cn`，互不干扰；老账户在启动时自动迁移（domain 留空 = 通用条目，行为与旧版一致，无需重新登录）。",
+      "【内置浏览器扫码后信息更完整】「获取Cookie」现在会把 WebView2 里每个 Cookie 的 domain / path / expires 一起带出来并随账户落库（之前只取 name=value），添加账户时按域存好，后续续期不再靠猜。"
+    ]
+  },
   {
     ver: "v1.6.4", internal: "2611050004", date: "2026-11-05",
     title: "热力点图铺满面板 + 日期选择改成深色自绘日历",
@@ -4734,6 +4984,7 @@ async function searchMedia() {
 function renderMediaObjects(list) {
   const box = document.getElementById("mediaList");
   if (!box) return;
+  _mediaThumb.queue.length = 0;
   if (!list.length) {
     box.innerHTML = `<div class="muted" style="font-size:13px;">暂无媒体文件，点击「立即执行下载」开始抓取。</div>`;
     return;
@@ -4742,7 +4993,7 @@ function renderMediaObjects(list) {
     const mb = (o.size || 0) / 1024 / 1024;
     const sizeTxt = mb >= 1 ? ` · 占用 ${mb.toFixed(1)} MB` : "";
     return `
-    <div class="media-obj-card">
+    <div class="media-obj-card" data-thumb-uid="${escAttr(o.uid)}">
       <div class="media-obj-main">
         <div class="media-obj-info">
           <div class="media-obj-name">${esc(o.screen_name || "(无昵称)")}</div>
@@ -4758,47 +5009,124 @@ function renderMediaObjects(list) {
       </div>
     </div>`;
   }).join("") + `</div>`;
-  // 懒加载每个对象的最新一张预览图（只取信息，再按需读图）
-  list.forEach(o => loadMediaThumb(o.uid));
+  // 已缓存过的对象直接把图贴回去（切页 / 搜索回来不重新拉）
+  list.forEach(function (o) {
+    if (o && o.uid && _mediaThumb.data[o.uid]) _mediaThumbApply(o.uid);
+  });
+  _mediaThumbBind();
+  _mediaThumbPrimeViewport();     // 首屏在视口内的立刻加载
 }
 
-/* 【v1.4.17】卡片右侧最新图片预览：先取最新图信息，再按需拉 base64。
-   只加载「最新一张」，避免旧版点击展开整个相册带来的软件 / 硬盘压力。 */
-async function loadMediaThumb(uid) {
-  const box = document.getElementById("mediaThumb_" + uid);
-  if (!box) return;
+/* ---------------- 相册卡片缩略图调度（v1.6.12） ----------------
+   三个约束，缺一不可：
+     · 懒加载：滚到卡片附近（300px 预取边距）才请求，滚多远加载多远；
+     · 并发限流：同时最多 3 个桥调用，避免 85 个请求堆在 JS 线程上；
+     · 结果缓存：同一对象的数据 URL 只取一次，切页回来不重新拉。
+
+   【为什么用 scroll 事件而不是 IntersectionObserver】卡片带了
+   `content-visibility: auto`，视口外时**子元素根本不产生布局盒**，
+   IO 观察子元素会永远等不到相交回调；改观察卡片本身虽然可行，但在
+   WebView2 无渲染更新的场景（窗口刚显示、最小化恢复）下首帧回调会迟到，
+   期间满屏都是「—」占位。滚动驱动只需要读矩形，行为确定、可测、不挑内核。 */
+const _mediaThumb = { data: {}, busy: 0, queue: [], bound: false, timer: 0 };
+const _MEDIA_THUMB_PARALLEL = 3;
+const _MEDIA_THUMB_PX = 104;       // 卡片预览框的 CSS 边长，后端按 2 倍生成
+const _MEDIA_THUMB_MARGIN = 300;   // 预取边距：视口外这么远就开始取，滚动时图已就位
+const _MEDIA_THUMB_THROTTLE = 120; // 滚动期间最多每 120ms 重扫一次
+
+function _mediaThumbBind() {
+  if (_mediaThumb.bound) return;
+  const main = document.getElementById("main");
+  if (!main) return;
+  _mediaThumb.bound = true;
+  // passive：不参与滚动拦截；回调里只读矩形、不写 DOM，不会造成读写抖动
+  main.addEventListener("scroll", _mediaThumbSchedule, { passive: true });
+  window.addEventListener("resize", _mediaThumbSchedule);
+}
+
+function _mediaThumbSchedule() {
+  if (_mediaThumb.timer) return;
+  _mediaThumb.timer = setTimeout(function () {
+    _mediaThumb.timer = 0;
+    _mediaThumbPrimeViewport();
+  }, _MEDIA_THUMB_THROTTLE);
+}
+
+/* 扫一遍样式表里所有带 data-thumb-uid 的卡片，把「已经在视口（含预取边距）内」
+   且还没加载过的推进队列。量的是**卡片**矩形：卡片带 content-visibility，
+   视口外时内部子元素没有布局盒，拿子元素量出来全是 0，会把所有卡片误判成在视口内。
+   全部是纯读取，布局干净时只是一次缓存查表，不会触发重排。 */
+function _mediaThumbPrimeViewport() {
+  const main = document.getElementById("main");
+  if (!main) return;
+  const mr = main.getBoundingClientRect();
+  const m = _MEDIA_THUMB_MARGIN;
+  const vTop = mr.top - m, vBottom = mr.bottom + m;
+  const vLeft = mr.left - m, vRight = mr.right + m;
+  const cards = document.querySelectorAll("#mediaList .media-obj-card[data-thumb-uid]");
+  for (let i = 0; i < cards.length; i++) {
+    const card = cards[i];
+    const uid = card.getAttribute("data-thumb-uid");
+    if (!uid || _mediaThumb.data[uid]) continue;
+    const r = card.getBoundingClientRect();
+    if (r.height <= 0) continue;                 // 尚未布局
+    if (r.bottom >= vTop && r.top <= vBottom && r.right >= vLeft && r.left <= vRight) {
+      _mediaThumbPush(uid);
+    }
+  }
+}
+
+function _mediaThumbPush(uid) {
+  if (_mediaThumb.data[uid]) { _mediaThumbApply(uid); return; }
+  if (_mediaThumb.queue.indexOf(uid) >= 0) return;
+  _mediaThumb.queue.push(uid);
+  _mediaThumbPump();
+}
+
+function _mediaThumbPump() {
+  while (_mediaThumb.busy < _MEDIA_THUMB_PARALLEL && _mediaThumb.queue.length) {
+    const uid = _mediaThumb.queue.shift();
+    _mediaThumb.busy++;
+    _mediaThumbFetch(uid).then(function () {
+      _mediaThumb.busy--;
+      _mediaThumbPump();
+    }, function () {
+      _mediaThumb.busy--;
+      _mediaThumbPump();
+    });
+  }
+}
+
+async function _mediaThumbFetch(uid) {
   let info = null;
-  try { info = await apiCall("get_latest_media_thumb", uid); } catch (e) { /* 忽略 */ }
+  try { info = await apiCall("get_latest_media_thumb", uid); } catch (e) { return; }
   if (!info || !info.ok || !info.file_path) return;
   let res = null;
-  try { res = await apiCall("load_media_base64", info.file_path); } catch (e) { /* 忽略 */ }
-  if (!res || !res.ok || !res.data_url) return;
-  const el = document.getElementById("mediaThumb_" + uid);
-  if (!el) return;   // 渲染可能已被刷新替换
-  el.innerHTML = `<img src="${res.data_url}" title="${escAttr(info.file_name || "")}" alt="">`;
+  try { res = await apiCall("get_media_thumb_data", info.file_path, _MEDIA_THUMB_PX); }
+  catch (e) { return; }
+  if (!res || !res.ok || !res.data_url) return;      // 生成失败 → 保留「—」占位，不退回原图
+  _mediaThumb.data[uid] = { url: res.data_url, name: info.file_name || "" };
+  _mediaThumbApply(uid);
+}
+
+function _mediaThumbApply(uid) {
+  const rec = _mediaThumb.data[uid];
+  if (!rec || !rec.url) return;
+  const el = document.getElementById("mediaThumb_" + escAttr(uid));
+  if (!el || el.getAttribute("data-thumb") === "1") return;
+  el.setAttribute("data-thumb", "1");
+  // 显式 width/height：不给图留出「先撑开再回缩」的重排机会；
+  // decoding=async：把解码放到合成线程，不阻塞滚动。
+  el.innerHTML = `<img src="${rec.url}" width="${_MEDIA_THUMB_PX}" height="${_MEDIA_THUMB_PX}"`
+    + ` decoding="async" alt=""`
+    + (rec.name ? ` title="${escAttr(rec.name)}"` : "") + `>`;
 }
 
 /* 【v1.4.17】原 toggleMediaObject（点击卡片展开整个相册）已移除 ——
-   一次性取几十张 base64 对软件内存与磁盘压力过大，改为卡片右侧只显示最新一张预览图。 */
+   一次性取几十张 base64 对软件内存与磁盘压力过大，改为卡片右侧只显示最新一张预览图。
+   【v1.6.11】随之一起清掉了打开预览的两支函数与 #mediaPreviewMask 浮层：
+   自 v1.4.17 起就没有任何入口能打开那个浮层，属于纯残留（体积审计发现）。 */
 
-async function previewMedia(rel, type) {
-  const box = document.getElementById("mediaPreview");
-  const mask = document.getElementById("mediaPreviewMask");
-  if (!box || !mask) return;
-  box.innerHTML = `<div class="muted">加载中…</div>`;
-  mask.classList.add("show");
-  const r = await apiCall("load_media_base64", rel);
-  box.innerHTML = (r && r.ok)
-    ? `<img src="${r.data_url}">`
-    : `<div class="muted" style="color:#ff8a8a;">无法加载：${esc((r && r.error) || "未知错误")}</div>`;
-}
-
-function closeMediaPreview() {
-  const mask = document.getElementById("mediaPreviewMask");
-  const box = document.getElementById("mediaPreview");
-  if (mask) mask.classList.remove("show");
-  if (box) box.innerHTML = "";
-}
 
 async function startMediaDownload() {
   const res = await apiCall("start_media_download");

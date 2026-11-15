@@ -40,6 +40,9 @@ class Scheduler:
         self._lock = threading.Lock()
         self._last_keepalive_ts = 0.0
         self.last_keepalive = None
+        # 【v1.6.5】独立保活线程：不依赖排程是否运行
+        self._ka_stop = threading.Event()
+        self._ka_thread = None
         # 【v1.4.20】本轮轮询排程出的实际转发执行时间（浮点秒，含抖动偏移）。
         # next_run 是「下一次轮询」；真正下一次「发出去」的时刻是这个字段。
         # 前端进度环用它对齐 100%，未排程时回退到 next_run。
@@ -147,23 +150,97 @@ class Scheduler:
         except Exception:
             pass
 
-    def _maybe_keepalive(self):
-        """按 keepalive_minutes 节流触发会话保活，避免每轮轮询都联网。"""
+    def _maybe_keepalive(self, force=False):
+        """按 keepalive_minutes 节流触发会话保活，避免每轮轮询都联网。
+
+        force=True 时跳过节流（启动后首次、退出前兜底）。
+        """
         try:
             cfg = get_config()
             km = max(5, int(cfg.get("keepalive_minutes", 30)))
         except Exception:
             km = 30
         now_ts = time.time()
-        if self._last_keepalive_ts and (now_ts - self._last_keepalive_ts) < km * 60:
-            return
+        if not force and self._last_keepalive_ts and (now_ts - self._last_keepalive_ts) < km * 60:
+            return None
         self._last_keepalive_ts = now_ts
         info("执行会话保活探针（双通道）", CAT_SCHED)
-        self.keepalive_all()
+        return self.keepalive_all()
+
+    # ---------------- 独立保活线程（v1.6.5） ----------------
+    # 此前保活只挂在轮询循环里（run loop 内），软件一关 / 停止轮询就没人续期，
+    # 微博 7 天硬期限一到必然失效 —— 这就是「系统浏览器能存一周以上、软件却刚好
+    # 一周掉线」的直接原因。现在改为常驻线程 + 启动/退出各补一次。
+    def start_keepalive_worker(self):
+        """启动常驻保活线程（幂等）。每 60s 醒一次，按 keepalive_minutes 节流真正联网。"""
+        if self._ka_thread is not None and self._ka_thread.is_alive():
+            return False
+        self._ka_stop.clear()
+        t = threading.Thread(target=self._keepalive_loop, daemon=True,
+                             name="cookie-keepalive")
+        self._ka_thread = t
+        t.start()
+        info("会话保活常驻线程已启动（不依赖排程）", CAT_SCHED)
+        return True
+
+    def _keepalive_loop(self):
+        # 先等 20s：让首屏、状态缓存、开屏自推进先跑完，别抢网络
+        if self._ka_stop.wait(20):
+            return
+        try:
+            self._maybe_keepalive(force=True)
+        except Exception as e:
+            warn(f"启动保活失败：{e}", CAT_SCHED)
+        while not self._ka_stop.is_set():
+            if self._ka_stop.wait(60):
+                return
+            try:
+                self._maybe_keepalive()
+            except Exception as e:
+                warn(f"周期保活失败：{e}", CAT_SCHED)
+
+    def stop_keepalive_worker(self):
+        try:
+            self._ka_stop.set()
+        except Exception:
+            pass
+
+    def final_keepalive(self, timeout=6.0):
+        """退出前补一次续期。**走节流**，有界等待，绝不拖慢退出。
+
+        故意不 force：正常使用时启动/周期保活刚跑过，节流会直接跳过，退出零延迟；
+        只有「开了十几秒就关」这种还没轮到首次保活的情况才会真的发一次请求。
+        """
+        try:
+            if not get_account_manager().list_accounts():
+                return False
+        except Exception:
+            return False
+        done = threading.Event()
+
+        def _run():
+            try:
+                self._maybe_keepalive()
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        threading.Thread(target=_run, daemon=True, name="ka-final").start()
+        return done.wait(timeout)
 
     def keepalive_all(self):
-        """对所有账户执行双通道会话保活，并将续期结果回写。"""
-        from weibo_client import keepalive
+        """对所有账户执行双通道会话保活，并将续期结果回写。
+
+        【v1.6.7】每轮额外跑一次登录态实测，把「此刻到底还有没有效」记成 last_verified_at。
+        【v1.6.9 修正】实测改为**两级**，且口径必须与 check_account 一致：
+          ① 同源 `probe_login_web`（weibo.com/ajax/profile/info）——唯一有资格判「失效」；
+          ② 移动端 `probe_login`（m.weibo.cn/api/config）——**只敢确认有效，不敢否定**
+             （跨域口径差异，网页端有效 Cookie 在移动端也常报未登录）。
+        v1.6.7 只用②并据其 False 判失效，导致「一切正常却显示实测已失效」，
+        所以这里把②降级为兜底确认。探测不到一律**不写库**。
+        """
+        from weibo_client import keepalive, probe_login, probe_login_web
         am = get_account_manager()
         results = []
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -175,13 +252,39 @@ class Scheduler:
                                 "detail": "缺少登录凭证", "renewed": False})
                 continue
             try:
-                res = keepalive(cookie)
-                if res.get("ok") and res.get("cookie") and res["cookie"] != cookie:
-                    am.update_cookie(acc["id"], res["cookie"],
-                                     "保活探针已自动续期 Cookie（会话保活）")
+                res = keepalive(cookie, entries=am.get_cookie_entries(acc["id"]))
+                if res.get("ok") and (res.get("entries") or res.get("cookie")):
+                    am.update_cookie(acc["id"], res.get("cookie") or "",
+                                     "保活探针已自动续期 Cookie（会话保活）",
+                                     entries=res.get("entries"))
+                # 实测登录态（用保活后的最新 Cookie，比原 Cookie 更接近服务端认知）
+                live_cookie = res.get("cookie") or cookie
+                uid = acc.get("wb_uid") or ""
+                web = probe_login_web(live_cookie, uid)
+                probe = web
+                # 同源测不出来才退回移动端；移动端只能把「有效」补上来，不能推翻
+                if web.get("login") is None:
+                    mob = probe_login(live_cookie)
+                    if mob.get("login") is True:
+                        probe = mob
+                wrote = None
+                if probe.get("login") is not None:
+                    wrote = bool(probe["login"])
+                    am.set_verified(acc["id"], wrote, source="会话保活实测",
+                                    detail=probe.get("detail", ""))
+                # 【v1.6.9】每次实测都留痕，便于事后从日志还原判定过程
+                if wrote is None:
+                    info(f"登录态实测跳过 {name} · 同源={web.get('status')}"
+                         f"（{web.get('detail', '')}）· 移动端未给出有效结论，不写库",
+                         CAT_SCHED)
+                else:
+                    info(f"登录态实测 {name} · 同源={web.get('status')} → 移动端="
+                         f"{probe.get('status')} · 写入={'有效' if wrote else '失效'}"
+                         f" · {probe.get('detail', '')}", CAT_SCHED)
                 results.append({"name": name, "ok": res.get("ok"),
                                 "status": res.get("status"), "detail": res.get("detail"),
-                                "renewed": res.get("cookie") != cookie})
+                                "renewed": res.get("cookie") != cookie,
+                                "verified": wrote})
             except Exception as e:
                 results.append({"name": name, "ok": False, "status": "error",
                                 "detail": str(e), "renewed": False})

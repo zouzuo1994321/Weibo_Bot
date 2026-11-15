@@ -43,7 +43,7 @@ def _init_dpi_awareness():
 
 _init_dpi_awareness()
 
-from paths import (FROZEN, BASE_DIR, ensure_dirs, start_legacy_migration)
+from paths import (FROZEN, BASE_DIR, DATA_DIR, ensure_dirs, start_legacy_migration)
 from diag_log import diag
 import webview
 from api_bridge import Api
@@ -254,15 +254,115 @@ def _warmup_storage():
         sys.stderr.write("[STORAGE] 启动占用扫描失败：%s\n" % e)
 
 
+def install_uncaught_hooks():
+    """【v1.6.9】把未捕获异常写进 diag.log / app.log。
+
+    为什么需要：打包成 windowed exe 后没有控制台，`sys.stderr` 被丢弃，
+    任何「没人 try 住」的异常都是彻底静默的 —— 表现就是「软件出问题了，
+    但日志里一行都没有」。装上钩子后至少留下异常类型、消息与完整调用栈，
+    并记录线程名（后台线程出错此前尤其难查）。
+
+    只做记录、不改变程序行为：原 hook 仍会被调用，异常照常向上抛。
+    """
+    import threading
+    import traceback
+
+    def _record(exc_type, exc, tb, who):
+        try:
+            text = "".join(traceback.format_exception(exc_type, exc, tb))
+            tail = text.strip().splitlines()
+            diag("UNCAUGHT", "%s %s: %s" % (who, getattr(exc_type, "__name__", "?"),
+                                            str(exc)[:200]))
+            try:
+                from logger import error as _err, CAT_CORE
+                _err("未捕获异常（%s）：\n%s" % (who, text[-4000:]), CAT_CORE)
+            except Exception:
+                pass
+            # 调用栈同时落一份到独立文件，避免被日志滚动冲掉
+            try:
+                import os
+                p = os.path.join(DATA_DIR, "crash.log")
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write("\n===== %s | %s =====\n%s\n" % (
+                        time.strftime("%Y-%m-%d %H:%M:%S"), who, text))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    _prev = sys.excepthook
+
+    def _hook(exc_type, exc, tb):
+        _record(exc_type, exc, tb, "main")
+        try:
+            _prev(exc_type, exc, tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _hook
+
+    # 后台线程异常：默认只打印到 stderr，打包后等于消失
+    def _thook(args):
+        _record(args.exc_type, args.exc_value, args.exc_traceback,
+                "thread:" + (getattr(args.thread, "name", "") or "?"))
+
+    try:
+        threading.excepthook = _thook
+    except Exception:
+        pass
+
+
 def main():
     # 【v1.5.0 Part2-A】单实例互斥：上一个实例还在退出拖尾里时不再叠开新窗口
     if not _acquire_single_instance():
         return
     diag("LAUNCH", "pid=%d frozen=%s" % (os.getpid(), bool(FROZEN)))
-    # 【v1.2.2】这里只建 DATA_DIR（小目录，本地盘，几乎零成本）。
-    # 四个大目录一律懒创建，见 paths.ensure_dirs 的注释。
+    # 【v1.6.9】全局异常兜底：未捕获异常此前只会冒到 stderr（打包成 exe 后看不见），
+    # 日志里完全空白 —— 这正是「用户说有问题、日志里什么都没有」的根源。最先装上。
+    install_uncaught_hooks()
     ensure_dirs()
     diag("DIRS_OK")
+    # 【v1.6.9】启动快照：把「这是哪个构建、跑在哪个数据目录、关键开关是什么」一次记全。
+    # 用户常在别的机器上跑（问题现场不在开发机），没有这几行就无法判断日志属于哪个版本，
+    # 也没法确认是否命中「老数据 / 老配置」这类只在对方环境成立的路径。
+    try:
+        from version import get_version
+        _v = get_version()
+        diag("LOG_SNAPSHOT", "version=%s internal=%s data_dir=%s meipass=%s"
+             % (_v.get("major"), _v.get("internal"), DATA_DIR, FROZEN))
+        from config_manager import get_config
+        _cfg = get_config()
+        _md = _cfg.get("media_download") or {}
+        diag("LOG_SNAPSHOT", "ai_enabled=%s engine=%s interval=%smin forward_count=%s "
+             "fwd_jitter=%s fwd_imgs_only=%s "
+             "auto_renew=%s log_verbose=%s media_dl=%s/%smin"
+             % (_cfg.get("ai_enabled"), _cfg.get("ai_engine"),
+                _cfg.get("interval_minutes"), _cfg.get("forward_count"),
+                _cfg.get("forward_count_jitter"), _cfg.get("forward_images_only"),
+                _cfg.get("auto_renew_cookie"), _cfg.get("log_verbose"),
+                _md.get("enabled"), _md.get("interval_minutes")))
+    except Exception as _e:
+        diag("LOG_SNAPSHOT_FAIL", str(_e))
+    # 【v1.6.9】账户判定现状快照：只记状态字段、绝不记 Cookie 内容。
+    # 「状态=正常 但 verify_result=expired」这种自相矛盾，一贴日志就能立刻看出来。
+    try:
+        from account_manager import get_account_manager
+        _am = get_account_manager()
+        _accs = _am.list_accounts()
+        diag("ACCT_SNAPSHOT", "count=%d" % len(_accs))
+        for _a in _accs:
+            _e = _a.get("cookie_expiry") or {}
+            diag("ACCT_SNAPSHOT", "acc=%s status=%s verify=%s last_verified=%s "
+                 "last_used=%s expiry=%s(%s) remain=%s"
+                 % (_a.get("remark") or _a.get("id"), _a.get("status"),
+                    _a.get("verify_result") or "(空)",
+                    _a.get("last_verified_at") or "(空)",
+                    _a.get("last_used") or "(空)",
+                    _e.get("expiry_str") or "(无)",
+                    "expired" if _e.get("expired") else "ok",
+                    _e.get("remaining_text") or "(无)"))
+    except Exception as _e:
+        diag("ACCT_SNAPSHOT_FAIL", str(_e))
     # 历史记录目录被用户改过 → 把老history.db 挪过去（一次性，通常几毫秒）
     try:
         from paths import migrate_history_db
@@ -334,7 +434,6 @@ def main():
     # 启动系统托盘（守护线程），保证「最小化到托盘」随时可用
     if _HAS_TRAY:
         threading.Thread(target=_start_tray, args=(api,), daemon=True).start()
-    diag("WEBVIEW_START", "blocking")
     # 【v1.6.0 · PF-2】AI 分词词典预热。
     # 内置引擎首次生成要 685ms，其中大头是 jieba 首次载入词典（约 500ms）。
     # 这里等首屏稳定后在后台线程把它做掉，用户第一次点「生成文案」时就是热的。
@@ -351,7 +450,41 @@ def main():
         except Exception as e:
             sys.stderr.write("[AI] 分词预热跳过：%s\n" % e)
     threading.Thread(target=_prewarm_ai, daemon=True, name="ai-prewarm").start()
-    webview.start()
+
+    # 【v1.6.5】常驻会话保活线程（不依赖排程是否运行）。
+    # 此前保活只在轮询循环里触发，软件一关 / 停止轮询就没人续期。
+    try:
+        from scheduler import get_scheduler
+        get_scheduler().start_keepalive_worker()
+    except Exception as _e:
+        diag("KEEPALIVE_START_FAIL", str(_e))
+
+    # 【v1.6.5】打开 WebView2 持久化 —— 内置浏览器第一次真正「记得自己登录过」。
+    # pywebview 默认 private_mode=True，后果远比名字严重（已逐行核对安装源码）：
+    #   · winforms.init_storage()：private_mode 且未给 storage_path 时，UserDataFolder
+    #     取一个**每次启动都不同的临时目录**，Cookie 库随进程消失；
+    #   · edgechromium 初始化时 private_mode 为真还会直接 DeleteAllCookies()。
+    # 于是登录态只能靠登录时抓的一份静态快照，那份快照没有任何活跃会话去触发
+    # 微博的滑动续期 → 7 天硬期限一到必然掉线。
+    _wv_storage = os.path.join(DATA_DIR, "webview")
+    try:
+        os.makedirs(_wv_storage, exist_ok=True)
+    except Exception as _e:
+        diag("WV_STORAGE_FAIL", str(_e))
+        _wv_storage = None      # 落回 %APPDATA%\pywebview，仍是非私有模式
+
+    diag("WEBVIEW_START", "blocking")
+    webview.start(private_mode=False, storage_path=_wv_storage)
+
+    # 退出前：停线程 + 补一次续期（走节流，正常使用时直接跳过；有界 6s 绝不拖慢退出）
+    try:
+        from scheduler import get_scheduler as _gs
+        _sch = _gs()
+        _sch.stop_keepalive_worker()
+        _sch.final_keepalive(6.0)
+        diag("KEEPALIVE_FINAL", "done")
+    except Exception as _e:
+        diag("KEEPALIVE_FINAL_FAIL", str(_e))
     # 【v1.5.0 Part2-B】窗口关闭（含托盘「退出」的 destroy 路径）后
     # 落盘收尾 + 硬退出，根治 ~12.5s 的 WebView2 拆环境拖尾。
     diag("WINDOW_CLOSED", "webview.start returned")
@@ -380,6 +513,15 @@ def _hard_exit(api):
     try:
         from history_db import get_history_db
         get_history_db().close()
+    except Exception:
+        pass
+    # 【v1.6.11】显式关掉常驻温度查询宿主（powershell）。
+    # 下面 os._exit(0) 会跳过 atexit，所以不能只靠 atexit 注册的那个钩子；
+    # 虽然宿主在父进程管道关闭后会因 stdin EOF 自行退出（实测 6s 内、0 残留），
+    # 但这里主动关掉更即时、也更确定。
+    try:
+        from api_bridge import _close_temp_host
+        _close_temp_host()
     except Exception:
         pass
     diag("EXIT_HARD")

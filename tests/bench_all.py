@@ -678,6 +678,619 @@ def run_one(data_dir, out_json):
     chk("S18", "hot_search_parser", _hot_search_parser)
     chk("S18", "hot_preview_guard", _hot_preview_guard)
 
+    # ---------------- S19 Cookie 带域存储 + 常驻保活（v1.6.5） ----------------
+    def _cookie_entries_domain():
+        """同名 Cookie 在 .weibo.com / .weibo.cn 下各存一份，互不覆盖；
+        老的空域条目原地升级而不是追加；扁平串按域优先级择一输出。"""
+        import http.cookiejar
+        import requests
+        from weibo_client import parse_cookie_entries, entries_to_cookie, merge_cookie_entries
+        flat = "SUB=A1; SUBP=B1; WBPSESS=C1"
+        rows = parse_cookie_entries(flat)
+        if entries_to_cookie(rows) != flat:
+            return (False, "扁平串往返不一致：%s" % entries_to_cookie(rows))
+        s = requests.Session()
+        for name, val, dom in (("SUB", "A2", ".weibo.com"),
+                               ("WBPSESS", "C9", ".weibo.cn"),
+                               ("SUB", "M3", ".weibo.cn")):
+            s.cookies.set_cookie(http.cookiejar.Cookie(
+                0, name, val, None, False, dom, True, False, "/", True, False,
+                None, False, None, None, {}))
+        rows2, changed = merge_cookie_entries(rows, s)
+        out = entries_to_cookie(rows2)
+        subs = sorted((e["domain"], e["value"]) for e in rows2 if e["name"] == "SUB")
+        ok = (changed and subs == [(".weibo.cn", "M3"), (".weibo.com", "A2")]
+              and "SUB=A2" in out and "WBPSESS=C9" in out and "SUBP=B1" in out
+              and out.count("SUB=") == 1)      # 扁平串里同名只出现一次
+        return (ok, "SUB 条目=%s 输出=%s" % (subs, out))
+
+    def _cookie_store_roundtrip():
+        """账户层：带域落库 → 读回扁平串 → 老路径只给扁平串时域信息不丢。"""
+        import account_manager as am_mod
+        m = am_mod.AccountManager()
+        ok, aid = m.add_account("__bench_ck__", "SUB=H1; SUBP=H2")
+        if not ok:
+            return (False, "建账户失败：%s" % aid)
+        try:
+            m.update_cookie(aid, "", "带域回写", entries=[
+                {"name": "SUB", "value": "H3", "domain": ".weibo.com", "path": "/"},
+                {"name": "WBPSESS", "value": "H4", "domain": ".weibo.cn", "path": "/"}])
+            after_entries = m.get_cookie(aid)
+            jar = [(e["name"], e["domain"]) for e in m.get_cookie_entries(aid)]
+            # 旧回写路径：只给扁平串
+            m.update_cookie(aid, "SUB=H5; WBPSESS=H4", "扁平回写")
+            after_flat = m.get_cookie(aid)
+            jar2 = [(e["name"], e["domain"], e["value"]) for e in m.get_cookie_entries(aid)]
+            domains_kept = all(d for _, d, _ in jar2)
+            ok2 = ("SUB=H3" in after_entries and "WBPSESS=H4" in after_entries
+                   and ("SUB", ".weibo.com") in jar
+                   and "SUB=H5" in after_flat and domains_kept)
+            return (ok2, "entries=%s jar=%s flat=%s jar2=%s"
+                    % (after_entries, jar, after_flat, jar2))
+        finally:
+            m.remove_account(aid)
+
+    def _keepalive_worker_lifecycle():
+        """常驻保活线程：幂等启动、可停止、无账户时不联网直接返回。"""
+        import scheduler as S
+        sch = S.get_scheduler()
+        first = sch.start_keepalive_worker()
+        second = sch.start_keepalive_worker()
+        alive = bool(sch._ka_thread and sch._ka_thread.is_alive())
+        no_net = sch.final_keepalive(1.0)      # 无账户 → 不发请求，返回 False
+        sch.stop_keepalive_worker()
+        stopped = sch._ka_stop.is_set()
+        ok = (first is True and second is False and alive and no_net is False and stopped)
+        return (ok, "first=%s second=%s alive=%s final_no_net=%s stopped=%s"
+                % (first, second, alive, not no_net, stopped))
+
+    chk("S19", "cookie_entries_domain", _cookie_entries_domain)
+    chk("S19", "cookie_store_roundtrip", _cookie_store_roundtrip)
+    chk("S19", "keepalive_worker_lifecycle", _keepalive_worker_lifecycle)
+
+    # ---------------- S20 「最近使用」= 最近一次成功轮询（v1.6.6） ----------------
+    def _fetch_uid_ok_flag():
+        """fetch_uid 必须带出 ok 标志：失败 False、成功 True（无新微博也算成功）。"""
+        import forward_engine as fe
+        orig = fe.get_latest_posts
+        try:
+            fe.get_latest_posts = lambda *a, **k: {
+                "ok": False, "status": "cookie_expired", "error": "已失效"}
+            bad = fe.fetch_uid("1000001", "SUB=x", {"screen_name": "T"})
+            fe.get_latest_posts = lambda *a, **k: {
+                "ok": True, "posts": [], "renewed_cookie": ""}
+            good = fe.fetch_uid("1000001", "SUB=x", {"screen_name": "T"})
+        finally:
+            fe.get_latest_posts = orig
+        ok = (len(bad) == 5 and bad[4] is False
+              and len(good) == 5 and good[4] is True)
+        return (ok, "失败元组=%s 成功元组=%s" % (len(bad), len(good)))
+
+    def _last_used_recorded():
+        """mark_used 必须写进 last_used 并在 list_accounts 里透出（前端「最近使用」列）。"""
+        import account_manager as am_mod
+        m = am_mod.AccountManager()
+        ok, aid = m.add_account("__bench_lu__", "SUB=LU1")
+        if not ok:
+            return (False, "建账户失败：%s" % aid)
+        try:
+            before = {a["id"]: a for a in m.list_accounts()}[aid]["last_used"]
+            m.mark_used(aid)
+            row = {a["id"]: a for a in m.list_accounts()}[aid]
+            val = row.get("last_used") or ""
+            # 形如 2026-11-13 22:41:58
+            shape = len(val) == 19 and val[4] == "-" and val[10] == " "
+            return (before == "" and shape, "before=%r after=%r" % (before, val))
+        finally:
+            m.remove_account(aid)
+
+    chk("S20", "fetch_uid_ok_flag", _fetch_uid_ok_flag)
+    chk("S20", "last_used_recorded", _last_used_recorded)
+
+    # ---------------- S21 登录态实测锚点（v1.6.7） ----------------
+    def _verify_anchor_moves():
+        """实测成功 → 写 last_verified_at 且预计失效锚定到「实测 + 7 天」；
+        实测失效 → 只标 expired，last_verified_at 作为历史事实保留不动。"""
+        from datetime import datetime, timedelta
+        import account_manager as am_mod
+        m = am_mod.AccountManager()
+        ok, aid = m.add_account("__bench_vf__", "SUB=VF1")
+        if not ok:
+            return (False, "建账户失败：%s" % aid)
+        try:
+            m.set_verified(aid, True)
+            row = {a["id"]: a for a in m.list_accounts()}[aid]
+            v1 = row.get("last_verified_at") or ""
+            r1 = row.get("verify_result")
+            exp_str = (row.get("cookie_expiry") or {}).get("expiry_str", "")
+            # 预计失效应等于 实测时刻 + 7 天
+            want = (datetime.strptime(v1, "%Y-%m-%d %H:%M:%S")
+                    + timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+            m.set_verified(aid, False)
+            row2 = {a["id"]: a for a in m.list_accounts()}[aid]
+            kept = row2.get("last_verified_at") == v1
+            r2 = row2.get("verify_result")
+            good = (len(v1) == 19 and r1 == "valid" and exp_str == want
+                    and kept and r2 == "expired")
+            return (good, "实测=%s 预计=%s 期望=%s r1=%s kept=%s r2=%s"
+                    % (v1, exp_str, want, r1, kept, r2))
+        finally:
+            m.remove_account(aid)
+
+    def _probe_login_guard():
+        """空 Cookie：不发请求、不抛异常，且**不给出否定结论**（v1.6.9 起移动端只做正向确认）。"""
+        from weibo_client import probe_login
+        r = probe_login("")
+        return (r.get("ok") is False and r.get("login") is None
+                and r.get("status") == "unknown", str(r))
+
+    chk("S21", "verify_anchor_moves", _verify_anchor_moves)
+    chk("S21", "probe_login_guard", _probe_login_guard)
+
+    # ---------------- S22 实测口径修正（v1.6.9） ----------------
+    class _FakeResp(object):
+        def __init__(self, code, text):
+            self.status_code = code
+            self.text = text
+
+        def json(self):
+            import json as _j
+            return _j.loads(self.text)
+
+    class _FakeSession(object):
+        def __init__(self, resp):
+            self.headers = {}
+            self._resp = resp
+
+        def update(self, *a, **k):
+            pass
+
+        def get(self, *a, **k):
+            return self._resp
+
+    def _probe_mobile_never_negative():
+        """【回归 v1.6.9 核心 BUG】移动端 data.login=false **绝不能**变成「已失效」。
+
+        现场症状：抓取全部成功、账户状态正常，有效期列却显示「实测已失效」，
+        点一次「检测」又恢复 —— 因为移动端与网页端不同源，网页端有效 Cookie
+        在 m.weibo.cn 上本来就会回答未登录。
+        """
+        import weibo_client as wc
+        orig = wc._session
+        try:
+            wc._session = lambda *a, **k: _FakeSession(
+                _FakeResp(200, '{"ok":1,"data":{"login":false}}'))
+            r = wc.probe_login("SUB=abc; SUBP=def")
+        finally:
+            wc._session = orig
+        ok = (r.get("login") is None and r.get("status") == "unknown"
+              and r.get("status") != "expired")
+        return (ok, "login=%r status=%r detail=%s"
+                % (r.get("login"), r.get("status"), r.get("detail")))
+
+    def _probe_web_can_say_expired():
+        """同源接口 ok=-100 时必须判失效 —— 否则真过期就永远发现不了。"""
+        import weibo_client as wc
+        orig = wc._session
+        try:
+            wc._session = lambda *a, **k: _FakeSession(
+                _FakeResp(200, '{"ok":-100,"url":"https://passport.weibo.com/sso/login"}'))
+            r = wc.probe_login_web("SUB=abc", "1234567890")
+        finally:
+            wc._session = orig
+        ok = (r.get("login") is False and r.get("status") == "expired")
+        return (ok, "login=%r status=%r detail=%s"
+                % (r.get("login"), r.get("status"), r.get("detail")))
+
+    def _probe_web_requires_uid():
+        """没有 uid 就不该发请求，也不能给出否定结论（只能 unknown）。"""
+        from weibo_client import probe_login_web
+        r = probe_login_web("SUB=abc", "")
+        ok = (r.get("ok") is False and r.get("login") is None
+              and r.get("status") == "unknown")
+        return (ok, str(r))
+
+    def _keepalive_no_false_expired():
+        """保活轮次里，两路探针都给不出结论时，**一个字都不许写库**。"""
+        import scheduler as S
+        import weibo_client as wc
+        import account_manager as am_mod
+        m = am_mod.AccountManager()
+        ok, aid = m.add_account("__bench_ka__", "SUB=KA1")
+        if not ok:
+            return (False, "建账户失败：%s" % aid)
+        orig = (wc.keepalive, wc.probe_login_web, wc.probe_login)
+        try:
+            wc.keepalive = lambda *a, **k: {"ok": False, "cookie": "SUB=KA1",
+                                           "entries": [], "status": "unknown",
+                                           "detail": "bench"}
+            wc.probe_login_web = lambda *a, **k: {
+                "ok": False, "login": None, "status": "unknown", "detail": "同源测不出"}
+            wc.probe_login = lambda *a, **k: {
+                "ok": True, "login": None, "status": "unknown", "detail": "跨域口径"}
+            S.get_scheduler().keepalive_all()
+        finally:
+            (wc.keepalive, wc.probe_login_web, wc.probe_login) = orig
+        try:
+            row = {a["id"]: a for a in m.list_accounts()}[aid]
+            vr = row.get("verify_result") or ""
+            lv = row.get("last_verified_at") or ""
+            return (vr == "" and lv == "", "verify=%r last_verified=%r" % (vr, lv))
+        finally:
+            m.remove_account(aid)
+
+    def _set_verified_reports_transition():
+        """set_verified 必须回报状态翻转，并留下「何时判失效」的时间证据（v1.6.9）。"""
+        import account_manager as am_mod
+        m = am_mod.AccountManager()
+        ok, aid = m.add_account("__bench_tv__", "SUB=TV1")
+        if not ok:
+            return (False, "建账户失败：%s" % aid)
+        try:
+            r1 = m.set_verified(aid, True, source="bench", detail="首次")
+            r2 = m.set_verified(aid, True, source="bench", detail="重复")
+            r3 = m.set_verified(aid, False, source="bench", detail="失效")
+            raw = {a["id"]: a for a in m.accounts}[aid]
+            stamp = raw.get("verify_expired_at") or ""
+            r4 = m.set_verified(aid, True, source="bench", detail="恢复")
+            raw2 = {a["id"]: a for a in m.accounts}[aid]
+            cleared = raw2.get("verify_expired_at") or ""
+            ok = (r1.get("changed") is True and r1.get("now") == "valid"
+                  and r2.get("changed") is False
+                  and r3.get("changed") is True and r3.get("now") == "expired"
+                  and len(stamp) == 19          # 判失效时刻已记录
+                  and r4.get("changed") is True and r4.get("prev") == "expired"
+                  and cleared == "")            # 恢复后时间证据被撤销
+            return (ok, "r1=%s r2=%s r3=%s stamp=%r r4=%s cleared=%r"
+                    % (r1.get("changed"), r2.get("changed"), r3.get("changed"),
+                       stamp, r4.get("changed"), cleared))
+        finally:
+            m.remove_account(aid)
+
+    def _legacy_expired_reconciled():
+        """老版本误标的 expired（无 verify_expired_at 时间戳）必须自动清理，
+        但**带时间戳的真失效必须保留** —— 否则升级会掩盖真正过期的账户。"""
+        import account_manager as am_mod
+        m = am_mod.AccountManager()
+        ok1, a1 = m.add_account("__bench_legacy__", "SUB=LG1")
+        ok2, a2 = m.add_account("__bench_real__", "SUB=RG1")
+        if not (ok1 and ok2):
+            return (False, "建账户失败")
+        try:
+            for a in m.accounts:
+                if a["id"] == a1:
+                    a["status"] = "ok"
+                    a["last_ok_at"] = "2026-11-13 23:20:54"
+                    a["last_used"] = "2026-11-13 23:20:54"
+                    a["verify_result"] = "expired"
+                    a.pop("verify_expired_at", None)   # 老版本没这个字段
+                elif a["id"] == a2:
+                    a["status"] = "cookie_expired"
+                    a["verify_result"] = "expired"
+                    a["verify_expired_at"] = "2026-11-13 23:33:22"
+            m.save()
+            m2 = am_mod.AccountManager()               # 重新 load，触发 reconcile
+            rows = {a["id"]: a for a in m2.list_accounts()}
+            legacy = rows[a1].get("verify_result") or ""
+            real = rows[a2].get("verify_result") or ""
+            good = (legacy == "" and real == "expired")
+            return (good, "误报已清=%r(期望空) 真失效保留=%r(期望expired)"
+                    % (legacy, real))
+        finally:
+            m.remove_account(a1)
+            m.remove_account(a2)
+
+    chk("S22", "probe_mobile_never_negative", _probe_mobile_never_negative)
+    chk("S22", "probe_web_can_say_expired", _probe_web_can_say_expired)
+    chk("S22", "probe_web_requires_uid", _probe_web_requires_uid)
+    chk("S22", "keepalive_no_false_expired", _keepalive_no_false_expired)
+    chk("S22", "set_verified_reports_transition", _set_verified_reports_transition)
+    chk("S22", "legacy_expired_reconciled", _legacy_expired_reconciled)
+
+    # ---------------- S23 CPU 占用优化（v1.6.11） ----------------
+    import api_bridge as _ab
+
+    def _temp_probe_needs_demand():
+        """A 组：没人看概览页时不得启动温度探测（连宿主都不许起）。
+
+        这是「软件挂在托盘却周期性冲高 CPU」的根因回归项。
+        """
+        _ab._SYS_LOAD_DEMAND["ts"] = 0.0
+        _ab._CPU_TEMP["next_due"] = 0.0
+        _ab._CPU_TEMP["busy"] = False
+        _ab._schedule_cpu_temp_probe()
+        time.sleep(0.35)
+        busy = _ab._CPU_TEMP["busy"]
+        spawned = _ab._TEMP_HOST._proc is not None
+        good = (busy is False) and (not spawned)
+        return (good, "busy=%r 宿主已起=%r（都应为 False）" % (busy, spawned))
+
+    def _temp_host_steady_state():
+        """B 组：常驻宿主稳态单次查询必须远低于旧实现的 400ms 起进程成本。"""
+        _ab._mark_load_demand()
+        t0 = time.perf_counter()
+        _ab._read_cpu_temp()                       # 冷启动（起宿主 + WMI 装配）
+        cold = (time.perf_counter() - t0) * 1000
+        xs = []
+        for _ in range(3):
+            t1 = time.perf_counter()
+            _ab._read_cpu_temp()
+            xs.append((time.perf_counter() - t1) * 1000)
+        steady = sorted(xs)[len(xs) // 2]
+        # 稳态门槛 120ms：旧实现单次 400ms（冷启动近 1s），留足机器差异余量
+        good = steady < 120.0
+        return (good, "冷启动 %.0fms · 稳态 %.1fms（门槛 <120ms）" % (cold, steady))
+
+    def _temp_host_no_orphan():
+        """C 组：close() 后不得残留 powershell 进程。"""
+        _ab._mark_load_demand()
+        _ab._read_cpu_temp()
+        had = _ab._TEMP_HOST._proc is not None
+        _ab._close_temp_host()
+        time.sleep(0.3)
+        left = _ab._TEMP_HOST._proc is not None
+        good = had and (not left)
+        return (good, "关闭前已起=%r 关闭后仍存活=%r" % (had, left))
+
+    def _rAF_idle_stops():
+        """D 组：前端进度环空闲时必须停止 rAF，而不是每帧空转。"""
+        js = open(os.path.join(UI, "app.js"), encoding="utf-8").read()
+        # 空闲分支必须「return」而不是「requestAnimationFrame 续期」
+        idle_branch = re.search(
+            r"if \(!sch\.running \|\| !sch\.next_run\) \{(.{0,400}?)\n  \}",
+            js, re.S)
+        body = idle_branch.group(1) if idle_branch else ""
+        no_loop = "requestAnimationFrame" not in body
+        has_idle = "_fwdShowIdle" in body
+        # 必须有节流常量与看门狗，保证停掉后还能重新启动
+        throttled = "_FWD_FRAME_MS" in js
+        watchdog = "_fwdRingWatchdog" in js and "setInterval(_fwdRingWatchdog" in js
+        good = no_loop and has_idle and throttled and watchdog
+        return (good, "空闲不续期=%r 有清理=%r 有节流=%r 有看门狗=%r"
+                % (no_loop, has_idle, throttled, watchdog))
+
+    def _render_diff_guard():
+        """E 组：账户表与统计数字必须做差量更新，值没变就不碰 DOM。"""
+        js = open(os.path.join(UI, "app.js"), encoding="utf-8").read()
+        acc = "_lastHtml === html" in js and "tb.innerHTML = html;" in js
+        txt = "if (el.textContent !== s) el.textContent = s;" in js
+        geom = "_fwdGeom = sig;" in js
+        good = acc and txt and geom
+        return (good, "账户表差量=%r 文本差量=%r 几何缓存=%r" % (acc, txt, geom))
+
+    chk("S23", "temp_probe_needs_demand", _temp_probe_needs_demand)
+    chk("S23", "temp_host_steady_state", _temp_host_steady_state)
+    chk("S23", "temp_host_no_orphan", _temp_host_no_orphan)
+    chk("S23", "rAF_idle_stops", _rAF_idle_stops)
+    chk("S23", "render_diff_guard", _render_diff_guard)
+
+
+    # ---------------- S24 转发策略开关 + 相册滚动（v1.6.12） ----------------
+    import forward_engine as _fe
+
+    def _fwd_jitter_range():
+        """排程波动：开启后每次取值必须落在 1~N，且两端都出现；关闭时恒为 N。"""
+        on = {"forward_count": 5, "forward_count_jitter": True}
+        vals = [_fe.get_forward_count_for_round(on) for _ in range(400)]
+        off = {"forward_count": 5, "forward_count_jitter": False}
+        fixed = {_fe.get_forward_count_for_round(off) for _ in range(50)}
+        one = {_fe.get_forward_count_for_round(
+            {"forward_count": 1, "forward_count_jitter": True}) for _ in range(100)}
+        good = (min(vals) == 1 and max(vals) == 5
+                and all(1 <= v <= 5 for v in vals)
+                and fixed == {5} and one == {1})
+        return (good, "波动范围=%d~%d 关闭时=%s N=1时=%s"
+                % (min(vals), max(vals), sorted(fixed), sorted(one)))
+
+    def _fwd_images_only():
+        """仅转发含图：纯文字 / 纯视频（images 为空）必须被滤掉。"""
+        cands = [
+            {"uid": "a", "post": {"id": "1", "images": ["u1"]}},
+            {"uid": "b", "post": {"id": "2", "images": []}},
+            {"uid": "c", "post": {"id": "3"}},
+            {"uid": "d", "post": {"id": "4", "images": ["u2", "u3"]}},
+            {"uid": "e", "post": None},
+        ]
+        kept = [c["post"]["id"] for c in _fe._filter_images_only(cands)]
+        empty = _fe._filter_images_only([])
+        return (kept == ["1", "4"] and empty == [],
+                "保留=%s 空池=%r" % (kept, empty))
+
+    def _fwd_opt_defaults():
+        """两个新开关默认关闭，老用户升级后行为不变。"""
+        from config_manager import DEFAULT_CONFIG as D
+        a = D.get("forward_count_jitter")
+        b = D.get("forward_images_only")
+        return (a is False and b is False,
+                "jitter=%r images_only=%r" % (a, b))
+
+    def _media_thumb_smaller():
+        """缩略图必须同时满足：长边 ≤208px、字节 <60KB、相对原图 <50%。"""
+        import api_bridge as ab
+        from PIL import Image
+        tmp = os.path.join(data_dir, "_thumb_src.jpg")
+        im = Image.new("RGB", (1200, 1600))
+        px = im.load()
+        for y in range(0, 1600, 4):          # 造点纹理，避免纯色 JPEG 小得不真实
+            for x in range(0, 1200, 4):
+                px[x, y] = ((x * 7) % 256, (y * 11) % 256, ((x + y) * 3) % 256)
+        im.save(tmp, "JPEG", quality=95)
+        src = os.path.getsize(tmp)
+        dst_jpg, dst_png = ab._thumb_targets(tmp, 208)
+        for q in (dst_jpg, dst_png):
+            try:
+                os.remove(q)
+            except Exception:
+                pass
+        out = ab._make_thumb(tmp, dst_jpg, dst_png, 208)
+        size = os.path.getsize(out)
+        with Image.open(out) as o:
+            w, h = o.size
+        good = max(w, h) <= 208 and size < 60 * 1024 and size < src * 0.5
+        return (good, "原 %.0fKB → 缩略 %.1fKB %dx%d"
+                % (src / 1024.0, size / 1024.0, w, h))
+
+    def _media_thumb_cache_hit():
+        """第二次必须命中原文件（不重写），且缓存目录不落在用户媒体目录里。"""
+        import api_bridge as ab
+        from PIL import Image
+        tmp = os.path.join(data_dir, "_thumb_src2.jpg")
+        Image.new("RGB", (900, 1200), (30, 60, 90)).save(tmp, "JPEG")
+        dst_jpg, dst_png = ab._thumb_targets(tmp, 208)
+        for q in (dst_jpg, dst_png):
+            try:
+                os.remove(q)
+            except Exception:
+                pass
+        p1 = ab._make_thumb(tmp, dst_jpg, dst_png, 208)
+        m1 = os.stat(p1).st_mtime_ns
+        time.sleep(0.05)
+        # 模拟「缓存已存在」时桥方法的分支：只读文件，不再重建
+        p2 = dst_jpg if os.path.isfile(dst_jpg) else dst_png
+        m2 = os.stat(p2).st_mtime_ns
+        inside = os.path.abspath(ab._THUMB_CACHE_DIR).startswith(
+            os.path.abspath(ab.get_media_dir()) + os.sep)
+        good = (p1 == p2) and (m1 == m2) and (not inside)
+        return (good, "命中=%r mtime相同=%r 缓存落在媒体目录内=%r"
+                % (p1 == p2, m1 == m2, inside))
+
+    def _media_page_lazy_contract():
+        """相册页前端契约：滚动驱动懒加载 + 并发限流 + 走缩略图接口 + 不再逐项拉原图。
+
+        对照组：把同一套判定套在「旧写法」上必须判失败，证明检查不是摆设。
+        """
+        js = open(os.path.join(UI, "app.js"), encoding="utf-8").read()
+
+        def judge(src):
+            return {
+                "scroll": 'addEventListener("scroll", _mediaThumbSchedule' in src,
+                "throttle": "_MEDIA_THUMB_THROTTLE" in src,
+                "par": "_MEDIA_THUMB_PARALLEL" in src,
+                "thumb_api": 'apiCall("get_media_thumb_data"' in src,
+                "no_raw": 'apiCall("load_media_base64"' not in src,
+                "no_eager": "list.forEach(o => loadMediaThumb" not in src,
+                "dims": 'decoding="async"' in src,
+                # 首屏可见的卡片必须立刻加载，不能等下一次滚动事件
+                "prime": "_mediaThumbPrimeViewport();" in src,
+                # 必须量卡片矩形（卡片带 content-visibility，量子元素永远是 0）
+                "card_rect": "card.getBoundingClientRect()" in src,
+            }
+
+        now = judge(js)
+        old = judge(
+            "async function loadMediaThumb(uid){\n"
+            "  const r = await apiCall(\"load_media_base64\", p);\n"
+            "}\n"
+            "list.forEach(o => loadMediaThumb(o.uid));\n")
+        good = all(now.values()) and not all(old.values())
+        return (good, "现=%s 旧写法判失败=%r" % (now, not all(old.values())))
+
+    def _media_card_css():
+        """卡片 CSS：视口外跳过绘制 + 过渡只保留真正会变的属性。"""
+        css = open(os.path.join(UI, "style.css"), encoding="utf-8").read()
+        m = re.search(r"\.media-obj-card \{([^}]*)\}", css)
+        body = m.group(1) if m else ""
+        cv = "content-visibility: auto" in body
+        # 注意排除注释里提到的旧写法（注释中是 `transition: .15s` 后跟反引号），
+        # 只认真实的声明（以分号结尾）。
+        narrowed = ("transition: border-color" in body
+                    and re.search(r"transition:\s*\.15s\s*;", body) is None)
+        contain = re.search(r"\.media-obj-thumb \{[^}]*contain: paint", css, re.S) is not None
+        good = cv and narrowed and contain
+        return (good, "content-visibility=%r 过渡收窄=%r 预览框contain=%r"
+                % (cv, narrowed, contain))
+
+    chk("S24", "fwd_jitter_range", _fwd_jitter_range)
+    chk("S24", "fwd_images_only", _fwd_images_only)
+    chk("S24", "fwd_opt_defaults", _fwd_opt_defaults)
+    chk("S24", "media_thumb_smaller", _media_thumb_smaller)
+    chk("S24", "media_thumb_cache_hit", _media_thumb_cache_hit)
+    chk("S24", "media_page_lazy_contract", _media_page_lazy_contract)
+    chk("S24", "media_card_css", _media_card_css)
+
+    # ---------------- S25 转发设置归位 + 只看有图默认开（v1.6.13） ----------------
+    def _card_block(html, title):
+        """粗切出某个 .card 的 HTML 片段：按 '<div class="card"' 切块，
+        取标题命中 `>title</h3>` 的那一块（块尾即下一张卡的起点）。
+        够用且不依赖缩进 —— 模板里多一层少一层 div 都不会让判定失灵。"""
+        parts = html.split('<div class="card"')
+        for p in parts:
+            if ">%s</h3>" % title in p:
+                return p
+        return ""
+
+    def _fwd_img_only_in_mode_card():
+        """「仅转发含图博文」必须长在「转发方式」卡里，且已从「轮询间隔」卡移除。
+
+        对照组：把开关再塞回「轮询间隔」卡（模拟改动前的结构），同一判定必须判失败
+        —— 否则这条检查无法区分「真移过去了」与「两边都写着」。
+        """
+        html = open(os.path.join(UI, "index.html"), encoding="utf-8").read()
+
+        def judge(src):
+            poll = _card_block(src, "轮询间隔")
+            mode = _card_block(src, "转发方式")
+            return {
+                "in_mode": "fwdImagesOnly" in mode,
+                "not_in_poll": poll != "" and "fwdImagesOnly" not in poll,
+                "after_mode_row": (mode.find("fwd-mode-row") >= 0
+                                   and mode.find("fwdImagesOnly") > mode.find("fwd-mode-row")),
+                "save_hook": 'id="fwdImagesOnly" onchange="saveForwardOptions()"' in mode,
+            }
+
+        now = judge(html)
+        # 制造一段「旧结构」：在轮询间隔卡的 jitter 行旁再插一个 fwdImagesOnly
+        anchor = '<label class="switch"><input type="checkbox" id="fwdCountJitter"'
+        old_html = html.replace(
+            anchor,
+            '<label class="switch"><input type="checkbox" id="fwdImagesOnly"'
+            ' onchange="saveForwardOptions()"><span class="slider"></span></label>'
+            + anchor, 1)
+        changed = old_html != html
+        old = judge(old_html)
+        good = all(now.values()) and changed and not all(old.values())
+        return (good, "现=%s 对照组已生效=%r 旧结构判失败=%r"
+                % (now, changed, not all(old.values())))
+
+    def _fwd_cards_equal_height():
+        """两卡等高靠的是这套三件套，缺一即失效：
+        ① .fwd-grid2 align-items:stretch ② .card 纵向 flex ③ .fwd-body flex:1 1 auto。"""
+        css = open(os.path.join(UI, "style.css"), encoding="utf-8").read()
+        g2 = re.search(r"\.fwd-grid2 \{([^}]*)\}", css)
+        card = re.search(r"#view-forward \.card \{([^}]*)\}", css)
+        body = re.search(r"#view-forward \.card \.fwd-body \{([^}]*)\}", css)
+        stretch = bool(g2) and "align-items: stretch" in g2.group(1)
+        colflex = bool(card) and re.search(r"display:\s*flex", card.group(1)) \
+            and "flex-direction: column" in card.group(1)
+        grow = bool(body) and re.search(r"flex:\s*1 1 auto", body.group(1)) is not None
+        good = stretch and colflex and grow
+        return (good, "网格拉伸=%r 卡片纵向flex=%r body撑开=%r"
+                % (stretch, colflex, grow))
+
+    def _hist_img_default():
+        """「只看有图」默认开启，且三处写入点统一走同一个常量。
+
+        漏掉任意一处都会出现「默认开、清空筛选后变关」这种自相矛盾。
+        """
+        html = open(os.path.join(UI, "index.html"), encoding="utf-8").read()
+        js = open(os.path.join(UI, "app.js"), encoding="utf-8").read()
+        attr = re.search(r'id="hfHasImg"\s+checked', html) is not None
+        const = re.search(r"const HIST_HASIMG_DEFAULT\s*=\s*true", js) is not None
+        # switchHist 与 clearHistFilters 都必须引用常量，不允许再出现硬编码 false
+        switch_ok = re.search(r'imgChk\.checked\s*=\s*\(kind === "monitored"\)\s*\?\s*'
+                              r'HIST_HASIMG_DEFAULT', js) is not None
+        clear_ok = re.search(r'getElementById\("hfHasImg"\)\.checked = '
+                             r'HIST_HASIMG_DEFAULT', js) is not None
+        hard_false = len(re.findall(r'getElementById\("hfHasImg"\)\.checked = false', js))
+        good = attr and const and switch_ok and clear_ok and hard_false == 0
+        return (good, "HTML checked=%r 常量=%r switchHist=%r clearFilters=%r 残留硬编码false=%d"
+                % (attr, const, switch_ok, clear_ok, hard_false))
+
+    chk("S25", "fwd_img_only_in_mode_card", _fwd_img_only_in_mode_card)
+    chk("S25", "fwd_cards_equal_height", _fwd_cards_equal_height)
+    chk("S25", "hist_img_default", _hist_img_default)
+
+
 
 
     # ---------------- S12 性能基线（批量后查询耗时） ----------------

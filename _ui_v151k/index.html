@@ -260,10 +260,10 @@
           <span class="muted" style="font-size:12px;" data-page-node-id="ChdLXLSD3ilusV8UNmI4jv">手动或自动（每 5 分钟）检测：登录态 + 真实抓取 + 转发能力</span>
         </div>
         <p class="help" style="margin:0 0 10px;" data-page-node-id="accStatusHintNode">
-          状态说明：<b>正常</b>=能登录、能抓到微博、能转发；<b>Cookie失效</b>=登录态过期，需删除该账户后重新登录；<b>被风控</b>=请求被微博限流，请调大轮询间隔；<b>网络异常</b>=本机网络或接口超时。<b>Cookie 有效期</b>列由 Cookie 中的 ALF/SSOLoginState 时间戳预测「若不再活动，登录态何时失效」，临近（≤7 天）会标黄。<b>自动续期</b>开启后，软件会在每次成功请求时滑动延长 Cookie，并在临近失效时自动续期，无需频繁重登（亦可点「续期」手动触发）。
+          状态说明：<b>正常</b>=能登录、能抓到微博、能转发；<b>Cookie失效</b>=登录态过期，需删除该账户后重新登录；<b>被风控</b>=请求被微博限流，请调大轮询间隔；<b>网络异常</b>=本机网络或接口超时。<b>Cookie 有效期</b>列给的是「还剩多久」，数字按最后一次确认有效的时刻 + 7 天推算（鼠标悬停可看具体日期）；<b>实测已失效</b>只在网页端同源接口明确答复未登录时才出现，移动端口径的「未登录」不算数（跨域差异，误判会让功能正常的账户被标红）。只要还有任何一次真实抓取成功，软件会自动把标记纠正回有效。
         </p>
         <table data-page-node-id="DCNzcDn9V9qPGigMWjB6Xz">
-          <thead data-page-node-id="shryF0UBPBXkTG2TOeTYGw"><tr data-page-node-id="1LSfnF8Gcvb5uiCOvU3njk"><th data-page-node-id="F5oBU0qB9CWkvmt2cuJILT">昵称（备注）</th><th data-page-node-id="8X8JmZFa69JNusz0TE8GR9">添加时间</th><th data-page-node-id="g3HWSMjqFxzzfhnzOuHxHQ">最近使用</th><th data-page-node-id="1U4Y1NgJrTEgmDrsAD3uHs">状态</th><th data-page-node-id="expCol">Cookie 有效期</th><th data-page-node-id="0VBGsv2Mk3Ycln8sGozWAx">检测时间</th><th data-page-node-id="kLcx52uqrQW5zEG5IdsbGO">操作</th></tr></thead>
+          <thead data-page-node-id="shryF0UBPBXkTG2TOeTYGw"><tr data-page-node-id="1LSfnF8Gcvb5uiCOvU3njk"><th data-page-node-id="F5oBU0qB9CWkvmt2cuJILT">昵称（备注）</th><th data-page-node-id="8X8JmZFa69JNusz0TE8GR9">添加时间</th><th data-page-node-id="g3HWSMjqFxzzfhnzOuHxHQ">最近使用</th><th class="th-tag" data-page-node-id="1U4Y1NgJrTEgmDrsAD3uHs">状态</th><th data-page-node-id="expCol">Cookie 有效期</th><th data-page-node-id="0VBGsv2Mk3Ycln8sGozWAx">检测时间</th><th data-page-node-id="kLcx52uqrQW5zEG5IdsbGO">操作</th></tr></thead>
           <tbody id="accList" data-page-node-id="eGSa67wmw8KLQzXXUURM2r"></tbody>
         </table>
       </div>
@@ -367,7 +367,7 @@
                   <!-- 【v1.6.1】每轮排程数量：控制「每轮轮询后排程发送的微博条数」 -->
                   <label class="field" style="flex:1 1 130px; min-width:110px;">
                     排程数量（条/轮）
-                    <input id="forwardCount" type="number" min="1" max="10" value="1">
+                    <input id="forwardCount" type="number" min="1" max="10" value="1" oninput="_syncJitterAvail()">
                   </label>
                   <button onclick="saveInterval()">保存间隔</button>
                 </div>
@@ -375,6 +375,16 @@
                   排程数量 = 每轮轮询后最多挑多少条新微博去转发（1~10 条）。挑取时优先
                   <b>一条分配一个监控对象</b>，候选不足时才回到同一对象里补，避免同一条微博下连发多条。
                 </p>
+                <!-- 【v1.6.12】排程波动：把排程数量当作上限，每轮随机取条数 -->
+                <div class="fwd-opt-list">
+                  <div class="row fwd-opt-row">
+                    <label class="switch"><input type="checkbox" id="fwdCountJitter" onchange="saveForwardOptions()"><span class="slider"></span></label>
+                    <div>
+                      <b>排程波动</b>
+                      <div class="muted">把排程数量当作<b>上限</b>：设为 5，则每轮在 1~5 条之间随机。转发节奏不再固定，不易被识别为程序。</div>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -404,6 +414,18 @@
                 </div>
               </div>
               <span class="muted" style="font-size:12px; display:block; margin-top:6px;" data-page-node-id="lTlqA8owxcnmuHEfmsPUS6">随机挑选一个监控对象，转发其最新非置顶微博</span>
+              <!-- 【v1.6.13】「仅转发含图博文」由「轮询间隔」卡移到本卡 ——
+                   它决定的是「转发什么样的内容」，与上方的「怎么转发」同一层级；
+                   两卡内容量也因此拉平（移出前自然高：左 366.6 / 右 220.4）。 -->
+              <div class="fwd-opt-list">
+                <div class="row fwd-opt-row">
+                  <label class="switch"><input type="checkbox" id="fwdImagesOnly" onchange="saveForwardOptions()"><span class="slider"></span></label>
+                  <div>
+                    <b>仅转发含图博文</b>
+                    <div class="muted">只挑<b>带图</b>的微博参与排程；纯文字 / 纯视频微博不进候选池。本轮若无含图新微博，则不转发。</div>
+                  </div>
+                </div>
+              </div>
               </div>
               <div class="fwd-actions row" style="gap:10px; align-items:center;">
                 <button onclick="saveForwardMode()" data-page-node-id="uMxvYDIVs9bFhgXJq6B5jY">保存转发设置</button>
@@ -704,11 +726,6 @@
         </div>
         <div id="mediaList" style="margin-top:16px;"></div>
       </div>
-
-      <!-- 预览浮层 -->
-      <div id="mediaPreviewMask" onclick="if(event.target===this) closeMediaPreview()">
-        <div id="mediaPreview"></div>
-      </div>
     </section>
 
     <section class="view" id="view-history" data-page-node-id="nP1FkQwP3w7fQsjuNAGnVS">
@@ -733,6 +750,13 @@
             <label class="hist-select-all-inline" data-page-node-id="vbF1eA1r9Pv3MNdheqQ9Qv">
               <input type="checkbox" id="selAll" onchange="selectAllToggle(this.checked)" data-page-node-id="uaKysusi2Si8aXqrzbxSNU">
               <span data-page-node-id="kor8XqW7ZFaNWFYSnTnNNd">全选本页</span>
+            </label>
+            <!-- v1.6.10：「只看有图」从上方筛选卡挪到这里 —— 筛选是"看列表时随手切的"，
+                 放在列表标题旁才找得到；只在「被监控微博」页显示。
+                 【v1.6.13】默认勾选（带图博文占绝大多数，纯文字多是转评/水帖）。 -->
+            <label class="hist-select-all-inline" id="histImgOnly" style="display:none;">
+              <input type="checkbox" id="hfHasImg" checked onchange="applyHistFilter()">
+              <span>只看有图</span>
             </label>
           </div>
           <div class="hist-toolbar-right" id="histPagination" data-page-node-id="pqYAGpdDixCFWVJMl8EHgc"></div>

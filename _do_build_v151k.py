@@ -85,17 +85,30 @@ SPEC_TEMPLATE = '''# -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 
+# 【v1.6.11】打包瘦身（依据：解包统计 124.4MB / 292 条目，逐项核实「谁在用」）
+#   · jieba.lac_small  —— 词法分析大模型 10.2MB，本软件只用 cut/posseg，从未调用
+#   · jieba.analyse    —— TF-IDF 的 idf.txt 5.9MB，从未调用 extract_tags/textrank
+#   · PIL._avif        —— AVIF 编解码 7.5MB；软件只在托盘读 logo.png/ico，
+#                         微博图片一律原样字节落盘（open(wb)），不过 Pillow
+#   · PIL._imagingft   —— FreeType 文字栅格化 2.1MB，软件没有任何在图上绘字的代码
+#   · llama_cpp/lib/*.lib —— 静态导入库，运行期不加载
+# 保留不动的：cryptography（account_manager 用 Fernet 加密 Cookie）、numpy
+# （llama_cpp 在 import 期就要它）、jieba.posseg（ai_generator 做词性标注）。
+JIEBA_DROP_DATA = ['lac_small', 'lac_small/**', 'analyse', 'analyse/**']
+JIEBA_DROP_MODS = ('jieba.lac_small', 'jieba.analyse')
+
 datas = [('{ui}', 'ui'), ('{version_json}', '.')]
 hiddenimports = ['version', 'ai_engine', 'storage', 'media_index', 'winctl', 'webview', 'webview.guilib', 'pystray', 'PIL', 'llama_cpp', 'llama_cpp.llama']
 datas += collect_data_files('webview')
 datas += collect_data_files('pystray')
 datas += collect_data_files('PIL')
 datas += collect_data_files('certifi')
-datas += collect_data_files('jieba')
-datas += collect_data_files('llama_cpp')
+datas += collect_data_files('jieba', excludes=JIEBA_DROP_DATA)
+datas += collect_data_files('llama_cpp', excludes=['lib/*.lib'])
 hiddenimports += collect_submodules('pystray')
 hiddenimports += collect_submodules('PIL')
-hiddenimports += collect_submodules('jieba')
+hiddenimports += [m for m in collect_submodules('jieba')
+                  if not m.startswith(JIEBA_DROP_MODS)]
 hiddenimports += collect_submodules('llama_cpp')
 
 
@@ -108,10 +121,26 @@ a = Analysis(
     hookspath=[],
     hooksconfig={{}},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['PIL._avif', 'PIL._imagingft'],
     noarchive=False,
-    optimize=0,
+    # optimize=2：剥掉 docstring / 断言（源码里无 assert），PYZ 更小
+    optimize=2,
 )
+
+# 【v1.6.11】二次剔除：jieba 的官方 hook（_pyinstaller_hooks_contrib 里的
+# hook-jieba.py）会无条件 `collect_data_files('jieba')`，把 lac_small / analyse
+# 又整包加回来 —— 在 datas 参数里设 excludes 对它是无效的（上一轮实测残留 18MB）。
+# 只能在 Analysis 之后按最终目标路径剪掉。
+_DROP_PREFIX = ('jieba/lac_small/', 'jieba/analyse/')
+
+
+def _keep_entry(entry):
+    name = (entry[0] or '').replace('\\\\', '/')
+    return not name.startswith(_DROP_PREFIX)
+
+
+a.datas = [d for d in a.datas if _keep_entry(d)]
+a.binaries = [b for b in a.binaries if _keep_entry(b)]
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -194,10 +223,49 @@ def write_spec():
     print("wrote %s" % SPEC_PATH)
 
 
+def running_instances():
+    """返回正在运行的「微博bot小助手.exe」进程 PID 列表。
+
+    【v1.6.11 新增闸门】事故：v1.6.10 打包时用户还开着旧 exe，
+    `shutil.copy2` 写根目录直接抛 PermissionError(WinError 32)，
+    而这一步在 dist 构建之后、哈希断言之前 —— 结果是 dist 已是新版、
+    根目录和历史归档还停在上一个版本，三处错位且脚本没给出明确结论。
+    现在把「有没有旧进程」变成**构建前**的硬闸门，不合格直接退出。
+    """
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq 微博bot小助手.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, encoding="utf-8", errors="ignore")
+    except Exception as e:
+        print("PROC_CHECK_SKIP 无法执行 tasklist：%s" % e)
+        return []
+    pids = []
+    for line in (out.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith('"'):
+            continue
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower().endswith("微博bot小助手.exe".lower()):
+            try:
+                pids.append(int(parts[1]))
+            except Exception:
+                pass
+    return pids
+
+
 def main():
     internal = read_internal()
-    print("开始 v1.6.4 打包（UI=%s，热力图铺满 + 深色自绘日历）…"
-          % os.path.join(ROOT, "_ui_v151k"))
+
+    # 【v1.6.11】旧进程闸门：旧 exe 还开着就会导致根目录覆盖失败、三交付位错位
+    pids = running_instances()
+    if pids:
+        print("PROC_BLOCKED —— 检测到软件仍在运行，已中止打包：")
+        print("  进程 PID: %s" % ", ".join(str(p) for p in pids))
+        print("  请先完全退出软件（含托盘图标右键退出），再重新运行本脚本。")
+        print("  （不先退出的话，dist 会是新的，但根目录/history 会覆盖失败，三处错位）")
+        sys.exit(3)
+
+    print("开始 v1.6.13 打包（「仅转发含图博文」归位到转发方式 + 「只看有图」默认开启）…")
     check_ui_syntax()
     sync_changelog(internal)
     write_spec()
@@ -213,8 +281,15 @@ def main():
     print("ARCHIVE internal=%s" % internal)
     dst_root = os.path.join(ROOT, "微博bot小助手.exe")
     dst_hist = os.path.join(HISTORY_DIR, "微博bot小助手_%s.exe" % internal)
-    shutil.copy2(exe, dst_root)
-    shutil.copy2(exe, dst_hist)
+    try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        shutil.copy2(exe, dst_root)
+        shutil.copy2(exe, dst_hist)
+    except PermissionError as e:
+        # 【v1.6.11】明确报错，不再留下「dist 新、根目录旧」的错位现场
+        sys.exit("ARCHIVE_BLOCKED 文件被占用（多半是软件还在运行）：%s\n"
+                 "  dist 里已是新版，但根目录/历史归档没更新 —— 请退出软件后重跑本脚本。"
+                 % e)
     hashes = {}
     for tag, p in (("dist", exe), ("root", dst_root), ("history", dst_hist)):
         h = sha256(p)

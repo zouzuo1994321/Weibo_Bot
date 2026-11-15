@@ -4,6 +4,7 @@ API 桥接层：暴露给前端（JS）调用的接口。
 前端通过 window.pywebview.api.<method>(...).then(...) 调用。
 """
 import base64
+import hashlib
 import json
 import os
 import random
@@ -39,7 +40,8 @@ from media_engine import (get_media_progress, start_media_download_async,
                           user_media_dir, maybe_run_scheduled_media_download)
 from weibo_client import (get_user_info, get_latest_posts, diagnose_account,
                           repost, get_post_detail, get_hot_search,
-                          get_hot_topic_preview)
+                          get_hot_topic_preview, httpdate_to_ts,
+                          entries_to_cookie)
 import model_manager
 
 # ---------------- 系统负载采样（v1.4.0） ----------------
@@ -64,57 +66,217 @@ _SYS_LOAD_LOCK = _thr.Lock()
 _NET_PREV = {"ts": 0.0, "sent": 0, "recv": 0}
 _SYS_LOAD_THREAD_STARTED = False
 
-# ---------------- CPU 温度（v1.4.6） ----------------
+# ---------------- CPU 温度（v1.4.6 引入，v1.6.11 重写） ----------------
 # Windows 上 psutil 没有温度接口（sensors_temperatures 仅 Linux / FreeBSD 实现），
-# 系统级唯一来源是 WMI 的 ACPI 温度区（单位 0.1K）。wmic 自 Win11 24H2 起已被移除，
-# 故用 PowerShell Get-CimInstance 查 root\wmi\MSAcpi_ThermalZoneTemperature，
-# 并以 root\cimv2 的 Win32_PerfFormattedData_Counters_ThermalZoneInformation 兜底。
-# 单次探测 0.5~1s（首次约 6s 冷启动），绝不能塞进 2s 采样循环里 —— 故到期时另起一次性
-# 守护线程执行，成功缓存 30s、失败（台式机常无 ACPI 温度区）退避 15min，绝不反复起进程。
+# 系统级唯一来源是 WMI 的温度区（ACPI 单位 0.1K；Perf 类单位 0.1°C）。wmic 自 Win11
+# 24H2 起已被移除，故只能走 PowerShell Get-CimInstance。
+#
+# 【v1.6.11 性能重构的由来】旧实现每次探测都 `subprocess.run` 起一个**全新**的
+# powershell.exe，实测成本（本机 8 核实测）：
+#     PowerShell 进程冷启动 .......... 198 ms
+#     Get-CimInstance 查 WMI 类 ...... +150~200 ms
+#     合计单次 ..................... 400 ms（进程内首次调用 993 ms）
+# 每 30 秒一次 → 用户看到的就是「CPU 占用周期性瞬间冲高」。而且定时器一旦随
+# 「系统概览」页启动就永不停止，软件最小化到托盘后仍在每 30 秒烧掉 400ms。
+#
+# 现改为三条措施，把这一笔彻底拿掉：
+#   ① **常驻查询宿主**：进程只起一次，之后走 stdin/stdout 一问一答。实测稳态
+#      单次查询 15.5 ms，是原来的 1/26，尖峰基本看不见。
+#   ② **空闲自退**：90 秒无人查询就自行退出，内存（实测 83MB WorkingSet）与 CPU
+#      全部归零。父进程结束时 stdin 收到 EOF，宿主也会自行退出，不会留孤儿进程。
+#   ③ **按需探测**：前端 `get_system_load` 最近 12 秒内没被调用（即没人看概览页、
+#      或窗口在托盘）就完全不探测，连宿主都不启动。
 _CPU_TEMP = {"val": None, "next_due": 0.0, "busy": False}
 _CPU_TEMP_LOCK = _thr.Lock()
-_CPU_TEMP_TTL_OK = 30.0
-_CPU_TEMP_TTL_FAIL = 900.0
+_CPU_TEMP_TTL_OK = 30.0        # 成功：30s 一测（温度变化本来就慢）
+_CPU_TEMP_TTL_FAIL = 1800.0    # 失败：30min 才重试（台式机常年无温度区，别反复试）
+_TEMP_IDLE_EXIT = 90.0         # 宿主空闲自退
+_TEMP_DEMAND_WINDOW = 12.0     # 前端多久内要过数据就算「有人在看」
 
-_PS_CPU_TEMP = (
+# 前端「有人在看」的时间戳：由 get_system_load 每次调用刷新
+_SYS_LOAD_DEMAND = {"ts": 0.0}
+
+# `Reset` 一行触发一次查询、`Q` 退出。注意：
+#   * 先查 PerfFormatted 类（多数机器有值、只要一次 CIM 枚举），查不到才回落到
+#     ACPI 温度区 —— 旧实现两个都查，白花一次枚举。
+#   * 每次都 `[Console]::Out.WriteLine` + Flush，保证 Python 侧 readline 不会卡住。
+_PS_TEMP_HOST = (
     "$ErrorActionPreference='SilentlyContinue';"
-    "$t=@();"
-    "$t+=Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature"
-    "|ForEach-Object{$_.CurrentTemperature/10-273.15};"
-    "$t+=Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ThermalZoneInformation"
+    "while($true){"
+    "  $line=[Console]::In.ReadLine();"
+    "  if($line -eq $null -or $line -eq 'Q'){break}"
+    "  $v=@();"
+    "  $v+=Get-CimInstance -ClassName "
+    "Win32_PerfFormattedData_Counters_ThermalZoneInformation "
     "|ForEach-Object{($_.HighPrecisionTemperature/10)-273.15};"
-    "$t|ForEach-Object{[math]::Round($_,1)}"
+    "  if(@($v).Count -eq 0){"
+    "    $v+=Get-CimInstance -Namespace root/wmi "
+    "-ClassName MSAcpi_ThermalZoneTemperature "
+    "|ForEach-Object{$_.CurrentTemperature/10-273.15};"
+    "  }"
+    "  $ok=@($v|Where-Object{$_ -is [double] -and $_ -ge 5 -and $_ -le 110});"
+    "  if($ok.Count -gt 0){"
+    "    [Console]::Out.WriteLine([math]::Round(($ok|Measure-Object -Maximum).Maximum,1))"
+    "  } else {[Console]::Out.WriteLine('-')}"
+    "}"
 )
+
+
+class _TempHost(object):
+    """常驻 PowerShell 温度查询宿主（v1.6.11）。
+
+    只做一件事：把「起进程 + 装配 WMI」的固定成本从每次都付，改成只付一次。
+    `query()` 线程安全；宿主异常退出后下一次 query 会自动重启。
+    """
+
+    def __init__(self):
+        self._proc = None
+        self._lock = _thr.Lock()
+        self._last_used = 0.0
+        self._idle_watch = False
+
+    # ---------- 内部 ----------
+    def _alive(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    def _spawn(self):
+        """起宿主进程（首次含 WMI 装配，约 360ms）。"""
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        # IDLE_PRIORITY_CLASS：即使用户在跑满负载，这个查询也不去抢 CPU
+        flags |= getattr(subprocess, "IDLE_PRIORITY_CLASS", 0x00000040)
+        self._proc = subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             _PS_TEMP_HOST],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            text=True, encoding="utf-8", errors="ignore", bufsize=1,
+        )
+        self._last_used = time.time()
+        # 注意：不在这里预热。紧跟着的那次 _ask() 本身就会把 CIM 类装配起来
+        # （首次约 360ms，已在同一次往返内完成），多预热一次只是白等 17ms。
+
+    def _ask(self):
+        """发一行、读一行。失败返回 None。"""
+        p = self._proc
+        try:
+            p.stdin.write("T\n")
+            p.stdin.flush()
+            line = (p.stdout.readline() or "").strip()
+        except Exception:
+            return None
+        if not line or line == "-":
+            return None
+        try:
+            v = float(line)
+        except Exception:
+            return None
+        return round(v, 1) if 5.0 <= v <= 110.0 else None
+
+    def _idle_tick(self):
+        """检查一次空闲状态；超时就关掉宿主并返回 True。调用方需持锁。"""
+        if not self._alive():
+            self._idle_watch = False
+            return False
+        if time.time() - self._last_used < _TEMP_IDLE_EXIT:
+            return False
+        self._shutdown()
+        self._idle_watch = False
+        diag("TEMP_HOST_IDLE_EXIT")
+        return True
+
+    def _watch_idle(self):
+        """空闲自退看门狗：90s 无人查询就关掉宿主，把 83MB 内存还回去。
+
+        每 15s 醒一次自查（唤醒成本可忽略，且只在宿主存活期间存在）。
+        """
+        while True:
+            time.sleep(15.0)
+            with self._lock:
+                if self._idle_tick():
+                    return
+                if not self._idle_watch:
+                    return
+
+    def _shutdown(self):
+        """尽力优雅退出，失败则强杀。调用方需持锁。"""
+        p, self._proc = self._proc, None
+        if p is None:
+            return
+        try:
+            p.stdin.write("Q\n")
+            p.stdin.flush()
+            p.wait(timeout=3)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        for s in (p.stdin, p.stdout):
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    # ---------- 对外 ----------
+    def query(self):
+        """查一次温度（°C）。无温度区 / 非 Windows / 失败返回 None。"""
+        if not sys.platform.startswith("win"):
+            return None
+        with self._lock:
+            if not self._alive():
+                try:
+                    self._spawn()
+                except Exception as e:
+                    diag("TEMP_HOST_SPAWN_FAIL", str(e)[:160])
+                    self._proc = None
+                    return None
+            self._last_used = time.time()
+            if not self._idle_watch:
+                self._idle_watch = True
+                _thr.Thread(target=self._watch_idle, daemon=True).start()
+            return self._ask()
+
+    def close(self):
+        """进程退出时清理（atexit 调用），避免残留 powershell.exe。"""
+        with self._lock:
+            self._shutdown()
+
+
+_TEMP_HOST = _TempHost()
+
+
+def _close_temp_host():
+    """进程退出时关掉常驻温度宿主，避免残留 powershell.exe。"""
+    try:
+        _TEMP_HOST.close()
+    except Exception:
+        pass
+
+
+import atexit  # noqa: E402
+atexit.register(_close_temp_host)
 
 
 def _read_cpu_temp():
     """读 CPU / 主板温度（°C）。无温度区、非 Windows 或查询失败一律返回 None（前端显示「—」）。"""
-    if not sys.platform.startswith("win"):
-        return None
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS_CPU_TEMP],
-            capture_output=True, timeout=12,
-            # CREATE_NO_WINDOW：GUI 程序里绝不能闪出黑色控制台
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-        )
-    except Exception:
-        return None
-    vals = []
-    for tok in (r.stdout or b"").decode("utf-8", "ignore").split():
-        try:
-            v = float(tok)
-        except Exception:
-            continue
-        # ACPI 常返回 0 或荒诞值；只保留 5~110 的合理区间
-        if 5.0 <= v <= 110.0:
-            vals.append(v)
-    return round(max(vals), 1) if vals else None
+    return _TEMP_HOST.query()
+
+
+def _mark_load_demand():
+    """前端刚请求过系统负载 —— 记下「有人在看」，温度探测才有必要跑。"""
+    _SYS_LOAD_DEMAND["ts"] = time.time()
 
 
 def _schedule_cpu_temp_probe():
-    """温度到期才探测，且放到独立线程，绝不拖慢 2s 负载采样。"""
+    """温度到期才探测，且放到独立线程，绝不拖慢 2s 负载采样。
+
+    【v1.6.11】加「按需」闸门：概览页关着（或窗口在托盘）时前端不再调
+    `get_system_load`，此处直接返回，连宿主都不启动 —— 后台待机时这一路彻底静音。
+    """
     now = time.time()
+    if now - _SYS_LOAD_DEMAND["ts"] > _TEMP_DEMAND_WINDOW:
+        return                      # 没人看，不探测、不起进程
     with _CPU_TEMP_LOCK:
         if _CPU_TEMP["busy"] or now < _CPU_TEMP["next_due"]:
             return
@@ -674,6 +836,112 @@ _OPEN_DENY_EXT = {
 }
 
 
+# ---------------- 相册监控卡片缩略图（v1.6.12） ----------------
+# 【为什么必须做这件事】相册卡片右侧的预览框只有 104×104，而旧实现把**原始大图**
+# 整份读成 base64 塞进 <img src="data:...">。实测本机媒体库 85 个对象、17149 张图
+# 共 49GB，每个对象最新一张的**中位数就有 1.9MB**（最大 29MB）—— 一页 85 张卡片
+# 意味着约 250MB 的 base64 字符串与数十亿像素的解码位图常驻 WebView，
+# 滚动时合成器每帧都要为这些超大纹理做栅格化，界面必然掉帧。
+# 现在按需生成 2 倍尺寸（208px）的缩略图并落盘缓存，单张 8~20KB。
+_THUMB_CACHE_DIR = os.path.join(DATA_DIR, "cache", "thumbs")
+_THUMB_CACHE_MAX = 800         # 超过这个数量就清理掉最旧的一半
+_THUMB_GC_LOCK = _thr.Lock()
+
+
+def _thumb_key(src_path, px):
+    """缓存键 = 绝对路径 + 大小 + mtime + 目标尺寸。
+
+    把大小与 mtime 也算进去，是因为同一路径的图片可能被「重新下载覆盖」，
+    否则会一直显示旧图的缩略图。
+    """
+    st = os.stat(src_path)
+    raw = "%s|%d|%d|%d" % (os.path.abspath(src_path), st.st_size,
+                           int(st.st_mtime), int(px))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _thumb_targets(src_path, px):
+    """返回 (jpg 目标路径, png 目标路径) —— 两者互为主备，见 _make_thumb。"""
+    base = os.path.join(_THUMB_CACHE_DIR, _thumb_key(src_path, px))
+    return base + ".jpg", base + ".png"
+
+
+def _gc_thumb_cache():
+    """缓存目录膨胀时清掉最旧的一半（按 mtime）。仅在生成新图时顺手检查。"""
+    if not _THUMB_GC_LOCK.acquire(blocking=False):
+        return
+    try:
+        names = os.listdir(_THUMB_CACHE_DIR)
+        if len(names) <= _THUMB_CACHE_MAX:
+            return
+        files = []
+        for n in names:
+            p = os.path.join(_THUMB_CACHE_DIR, n)
+            try:
+                files.append((os.path.getmtime(p), p))
+            except Exception:
+                continue
+        files.sort()
+        for _, p in files[:max(1, len(files) // 2)]:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        debug("缩略图缓存已清理 %d 项" % (len(files) // 2), CAT_MEDIA)
+    except Exception:
+        pass
+    finally:
+        _THUMB_GC_LOCK.release()
+
+
+def _make_thumb(src_path, dst_jpg, dst_png, px):
+    """生成缩略图，返回**实际**写出的路径（JPEG 优先，失败降级 PNG）。
+
+    两个提速/稳健要点：
+      1. `Image.draft()` 让 JPEG 解码器直接按 1/2、1/4、1/8 降采样解码，
+         一张 6000×9000 的原图从「解全尺寸再缩」变成「解 1/8 再缩」，快 5~10 倍；
+      2. 写到 `.tmp` 再 `os.replace`，避免并发/中途失败留下半张图；
+      3. JPEG 编码器在本机若不可用（被 PyInstaller 裁掉等），退回 PNG —— 
+         PNG 编码是纯 Python 实现，不依赖外部 so，绝不会缺席。
+    """
+    from PIL import Image
+    im = Image.open(src_path)
+    try:
+        im.draft("RGB", (px, px))
+    except Exception:
+        pass
+    if im.mode not in ("RGB", "L"):
+        # P / RGBA / CMYK：统一转 RGB，否则 JPEG 存不下
+        if im.mode == "P":
+            im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, (18, 18, 20))
+        try:
+            bg.paste(im, mask=im.split()[-1] if im.mode == "RGBA" else None)
+            im = bg
+        except Exception:
+            im = im.convert("RGB")
+    rs = getattr(Image, "LANCZOS", None) or getattr(Image, "BICUBIC", None) \
+        or getattr(Image, "ANTIALIAS", 1)
+    im.thumbnail((px, px), rs)
+
+    os.makedirs(_THUMB_CACHE_DIR, exist_ok=True)
+    try:
+        tmp = dst_jpg + ".tmp"
+        im.save(tmp, "JPEG", quality=82, optimize=True)
+        os.replace(tmp, dst_jpg)
+        return dst_jpg
+    except Exception as e:
+        debug("JPEG 缩略图失败，降级 PNG：%s" % e, CAT_MEDIA)
+        try:
+            os.remove(dst_jpg + ".tmp")
+        except Exception:
+            pass
+    tmp = dst_png + ".tmp"
+    im.save(tmp, "PNG", optimize=True)
+    os.replace(tmp, dst_png)
+    return dst_png
+
+
 def _ai_engines_state():
     """【v1.2.0】三引擎的**轻量**状态快照（零网络 I/O）。
 
@@ -1145,8 +1413,12 @@ class Api:
     # ---------------- 系统负载（v1.4.0） ----------------
     def get_system_load(self):
         """返回最近的系统负载快照（CPU/内存/网络上下行/GPU）。
-        数据由后台线程持续采样，本方法只读取共享字典，绝不阻塞 UI 线程。"""
+        数据由后台线程持续采样，本方法只读取共享字典，绝不阻塞 UI 线程。
+
+        【v1.6.11】调用即视为「有人在看概览页」，刷新温度探测的需求时间戳；
+        离开概览页后前端不再调本方法，温度探测随之静音。"""
         _ensure_system_load_thread()
+        _mark_load_demand()
         with _SYS_LOAD_LOCK:
             d = dict(_SYS_LOAD)
         return {
@@ -1209,6 +1481,22 @@ class Api:
             wb = login.get("screen_name", "")
         am.set_check_result(acc_id, diag["status"], diag["message"],
                             wb or None, diag.get("self_uid") or None)
+        # 【v1.6.7】检测本身就是一次真实请求，结果直接作为「实测登录态」的依据。
+        # 只认「确定有效」和「确定失效」两种情况；风控 / 网络异常属于「测不出来」，
+        # 一律不写 —— 绝不把测不出来当成已失效。
+        # 【v1.6.9】补 source/detail 留痕：检测函数自身会给出判定路径（steps），
+        # 取最后一条作为依据，事后从日志就能看出是哪一步定的性。
+        _steps = diag.get("steps") or []
+        _basis = _steps[-1] if isinstance(_steps, list) and _steps else diag.get("message", "")
+        if diag.get("status") == "ok":
+            am.set_verified(acc_id, True, source="手工/定时检测",
+                            detail=str(_basis)[:180])
+        elif diag.get("status") == "cookie_expired":
+            am.set_verified(acc_id, False, source="手工/定时检测",
+                            detail=str(_basis)[:180])
+        else:
+            debug(f"检测结论为 {diag.get('status')}（测不出来），不改写实测标记 · "
+                  f"依据={str(_basis)[:180]}", CAT_CORE)
         # 会话保活：把续期后的 Cookie 写回账户
         if diag.get("renewed_cookie"):
             if am.update_cookie(acc_id, diag["renewed_cookie"],
@@ -1310,7 +1598,8 @@ class Api:
             return False
         try:
             from weibo_client import warm_session
-            w = warm_session(cookie, acc.get("wb_uid", ""))
+            w = warm_session(cookie, acc.get("wb_uid", ""),
+                             entries=am.get_cookie_entries(acc_id))
         except Exception as e:
             warn(f"账户 {acc_id} 续期预热异常：{e}", CAT_CORE)
             return False
@@ -1318,9 +1607,10 @@ class Api:
             return False
         # 只要预热成功就记录一次续期时间，避免短时内重复打扰微博接口
         am.set_last_renew(acc_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        if w.get("cookie") and w["cookie"] != cookie:
-            am.update_cookie(acc_id, w["cookie"],
-                             "会话预热滑动续期（Cookie 已自动延长）")
+        if w.get("entries") or (w.get("cookie") and w["cookie"] != cookie):
+            am.update_cookie(acc_id, w.get("cookie") or "",
+                             "会话预热滑动续期（Cookie 已自动延长）",
+                             entries=w.get("entries"))
             debug(f"账户 {acc_id} Cookie 已滑动续期", CAT_CORE)
             return True
         return False
@@ -1388,8 +1678,8 @@ class Api:
             return {"ok": False, "error": str(e)}
 
 
-    def add_account(self, remark, cookie):
-        ok, msg = get_account_manager().add_account(remark, cookie)
+    def add_account(self, remark, cookie, entries=None):
+        ok, msg = get_account_manager().add_account(remark, cookie, entries)
         if ok:
             info(f"已添加账户：{remark}")
             _state_dirty()   # 【v1.4.3】立即失效状态缓存，前端亚秒级看到新账户
@@ -1564,6 +1854,11 @@ class Api:
         （字典子类，键为 cookie 名，值为 Morsel）。Morsel 通过 .key / .value 属性
         取值，不能用 .get('name')（那只会去查名为 'name' 的 cookie，恒为 None）。
         下面兼容 SimpleCookie 与旧版 dict 两种返回结构。
+
+        【v1.6.5】同时返回带域条目 entries（name/value/domain/path/expires）。
+        WebView2 的 CookieManager 本来就带 domain，之前被压成裸串丢掉了 —— 导致
+        同名 SUB 在 `.weibo.com` / `.weibo.cn` 之间互相覆盖。这里原样带出去，
+        添加账户时按域落库。
         """
         import webview
         if self.login_window is None:
@@ -1574,9 +1869,10 @@ class Api:
             return {"ok": False, "error": f"读取 Cookie 失败：{e}"}
         if not cookies:
             return {"ok": False, "error": "未读取到 Cookie，请确认已登录"}
+
+        entries = []
         parts = []
         for c in cookies:
-            name = value = None
             # 情况一：pywebview（edge/cef 等）返回的 SimpleCookie
             if hasattr(c, "values"):
                 for morsel in c.values():
@@ -1584,19 +1880,44 @@ class Api:
                         morsel.get("key") if hasattr(morsel, "get") else None)
                     value = getattr(morsel, "value", None) or (
                         morsel.get("value") if hasattr(morsel, "get") else None)
-                    break
+                    if not (name and value):
+                        continue
+                    dom = path = ""
+                    exp = 0
+                    secure = httponly = False
+                    try:
+                        dom = (morsel.get("domain") or "") if hasattr(morsel, "get") else ""
+                        path = (morsel.get("path") or "/") if hasattr(morsel, "get") else "/"
+                        exp = httpdate_to_ts(morsel.get("expires") if hasattr(morsel, "get") else "")
+                        secure = bool(morsel.get("secure")) if hasattr(morsel, "get") else False
+                        httponly = bool(morsel.get("httponly")) if hasattr(morsel, "get") else False
+                    except Exception:
+                        pass
+                    entries.append({"name": name, "value": value,
+                                    "domain": (dom or "").lower(),
+                                    "path": path or "/", "expires": exp,
+                                    "secure": secure, "httponly": httponly})
+                    parts.append(f"{name}={value}")
             # 情况二：旧版直接返回 dict（含 name/value 字段）
             elif isinstance(c, dict):
                 name = c.get("name") or c.get("Name")
                 value = c.get("value") or c.get("Value")
-            if name and value:
-                parts.append(f"{name}={value}")
-        cookie_str = "; ".join(parts)
-        if not cookie_str:
+                if name and value:
+                    entries.append({"name": name, "value": value,
+                                    "domain": (c.get("domain") or "").lower(),
+                                    "path": c.get("path") or "/",
+                                    "expires": httpdate_to_ts(c.get("expires")),
+                                    "secure": bool(c.get("secure")),
+                                    "httponly": bool(c.get("httponly"))})
+                    parts.append(f"{name}={value}")
+        if not parts:
             return {"ok": False, "error": "Cookie 解析为空，请确认已成功登录"}
+        # 用条目导出一致的扁平串（同名跨域只保留优先级最高的一条）
+        cookie_str = entries_to_cookie(entries) or "; ".join(parts)
         # 判断是否真正登录（存在 SUB 等关键 cookie）
         logged = any(k in cookie_str for k in ("SUB=", "SUBP=", "SUHB="))
-        return {"ok": True, "cookie": cookie_str, "logged_in": logged}
+        return {"ok": True, "cookie": cookie_str, "entries": entries,
+                "logged_in": logged}
 
     def close_login_browser(self):
         if self.login_window is not None:
@@ -2562,6 +2883,50 @@ class Api:
                     "size": len(data)}
         except Exception as e:
             return {"ok": False, "error": f"读取媒体失败：{e}"}
+
+    def get_media_thumb_data(self, rel_path, px=104):
+        """【v1.6.12】返回相册卡片预览用的**小图**（base64，带磁盘缓存）。
+
+        与 `load_media_base64` 的唯一区别：不返回原图，只返回 2 倍目标尺寸的缩略图。
+        `px` 传的是 CSS 像素（默认 104，即卡片预览框边长），内部按 2 倍生成，
+        兼顾高分屏；服务端仍兜底钳在 64~512。
+        返回 size 是**缩略图**字节数，便于核对「确实变小了」。
+        """
+        try:
+            rel = os.path.normpath(str(rel_path).replace("/", os.sep))
+            p = _safe_join(get_media_dir(), rel)
+            if not p:
+                return {"ok": False, "error": "非法路径"}
+            if not os.path.isfile(p):
+                return {"ok": False, "error": "文件不存在", "missing": True}
+            try:
+                want = int(px)
+            except Exception:
+                want = 104
+            want = max(64, min(512, want * 2))
+
+            dst_jpg, dst_png = _thumb_targets(p, want)
+            if os.path.isfile(dst_jpg):
+                path = dst_jpg
+            elif os.path.isfile(dst_png):
+                path = dst_png
+            else:
+                _gc_thumb_cache()
+                path = _make_thumb(p, dst_jpg, dst_png, want)
+
+            with open(path, "rb") as f:
+                data = f.read()
+            mime = "image/png" if path.endswith(".png") else "image/jpeg"
+            return {"ok": True,
+                    "data_url": "data:%s;base64,%s" % (mime, base64.b64encode(data).decode()),
+                    "thumb": True, "px": want, "size": len(data),
+                    "src_size": os.path.getsize(p)}
+        except Exception as e:
+            try:
+                warn("生成媒体缩略图失败（%s）：%s" % (rel_path, e), CAT_MEDIA)
+            except Exception:
+                pass
+            return {"ok": False, "error": "生成缩略图失败：%s" % e}
 
     def get_media_file_url(self, rel_path):
         """返回媒体文件的 file:// URL（视频预览用，避免 base64 过大卡界面）。"""

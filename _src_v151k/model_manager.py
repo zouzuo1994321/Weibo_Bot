@@ -223,6 +223,10 @@ def generate(prompt, max_tokens=160, temperature=DEFAULT_TEMPERATURE,
         return None
 
 
+_LAST_AUTOSTART_CHECK = [0.0]
+_AUTOSTART_RECHECK = 60.0
+
+
 def maybe_autostart():
     """软件启动/打开 AI 设置时：若 llama.cpp 路线已启用且模型缺失，自动开始下载。
 
@@ -230,7 +234,17 @@ def maybe_autostart():
     —— 只有主路线或备路线里含 local_gguf 时才自动下载；
     同时尊重 local_gguf.auto_download 开关（默认开，保持 v1.1.x 的自动行为）。
     老配置项 config.json的 ai_engine="model" 仍作为兜底判据。
+
+    【v1.6.11】加 60 秒节流。本函数由 `get_state` 每次调用时触发，而前端在
+    概览/账户页会**每秒**拉一次 get_state —— 即每秒读一次 ai_settings.json 并做
+    一次深拷贝合并。本机（SSD）实测每次 0.01ms 尚可忽略，但数据目录允许自定义
+    到 NAS/网络盘（见 paths.py），那里每秒一次读盘会明显拖慢 UI 线程（get_state
+    在 WebView2 的 UI 线程上同步执行）。节流后代价归零，行为不变。
     """
+    now = time.time()
+    if now - _LAST_AUTOSTART_CHECK[0] < _AUTOSTART_RECHECK:
+        return
+    _LAST_AUTOSTART_CHECK[0] = now
     try:
         want = False
         try:

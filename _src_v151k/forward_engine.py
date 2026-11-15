@@ -137,6 +137,9 @@ def _schedule_forward(delay, fn):
 FORWARD_COUNT_KEY = "forward_count"
 FORWARD_COUNT_MIN = 1
 FORWARD_COUNT_MAX = 10
+# 【v1.6.12】两个可选策略开关
+FORWARD_JITTER_KEY = "forward_count_jitter"      # 排程波动
+FORWARD_IMAGES_ONLY_KEY = "forward_images_only"  # 仅转发含图博文
 
 
 def get_forward_count(cfg=None) -> int:
@@ -147,6 +150,44 @@ def get_forward_count(cfg=None) -> int:
     except Exception:
         n = 1
     return max(FORWARD_COUNT_MIN, min(FORWARD_COUNT_MAX, n))
+
+
+def get_forward_count_for_round(cfg=None) -> int:
+    """【v1.6.12】本轮实际要转发几条 —— 排程波动开关的落点。
+
+    「排程数量」在用户心里是**上限**而不是固定值：设为 5 且开启波动时，
+    每轮在 1~5 之间随机取一个数。这样长时间看下来每轮条数忽多忽少，
+    不会呈现「每隔 N 分钟必发 K 条」的机械节律（那是风控最容易识别的特征）。
+
+    关闭波动时行为与 v1.6.1 完全一致（固定 N 条）；N=1 时波动无意义，直接返回 1，
+    避免把「我只想每轮 1 条」的用户随机成 0 条。
+    """
+    cfg = cfg or get_config()
+    n = get_forward_count(cfg)
+    if n <= 1:
+        return n
+    try:
+        jitter = bool(cfg.get(FORWARD_JITTER_KEY, False))
+    except Exception:
+        jitter = False
+    return random.randint(1, n) if jitter else n
+
+
+def _filter_images_only(candidates):
+    """【v1.6.12】只保留「含图」博文（`post.images` 非空）。
+
+    图片直链来自 `weibo_client.extract_images()`（兼容 pics / pic_infos），
+    为空即纯文字 / 纯视频 —— 纯视频不计入「含图」，因为转发视频博文时
+    微博客户端只会渲染出链接卡片，观感与用户预期（配图）不符。
+    """
+    out = []
+    for c in candidates:
+        try:
+            if (c.get("post") or {}).get("images"):
+                out.append(c)
+        except Exception:
+            continue
+    return out
 
 
 def _pick_candidates(candidates, n):
@@ -277,7 +318,9 @@ def _record_monitored_post(post, uid, screen_name, cookie, avatar_local=""):
 def fetch_uid(uid, cookie, item):
     """拉取单个 UID 的最新微博，记录到历史库，更新监控状态。
 
-    返回 (posts, new_posts, screen_name, renewed_cookie)。
+    返回 (posts, new_posts, screen_name, renewed_cookie, ok)。
+    ok 表示「这次拉取真的成功了」（v1.6.6）——账户表的「最近使用」要靠它判定
+    「最近一次成功轮询」，不能靠 posts 是否为空（无新微博也是成功）。
     renewed_cookie 为微博 Set-Cookie 续期后的新 Cookie（无续期时为空串），
     调用方应回写账户实现「会话保活」，显著延长 Cookie 寿命（v1.1.1）。
     """
@@ -298,7 +341,7 @@ def fetch_uid(uid, cookie, item):
             warn(f"抓取失败 UID={uid} · 原因：网络异常（{reason}）", CAT_HTTP)
         else:
             warn(f"抓取失败 UID={uid} · 原因：{reason}", CAT_HTTP)
-        return [], [], item.get("screen_name", ""), ""
+        return [], [], item.get("screen_name", ""), "", False
 
     posts = resp.get("posts", [])
     # 刷新昵称与头像
@@ -336,7 +379,8 @@ def fetch_uid(uid, cookie, item):
         "screen_name": item.get("screen_name", ""),
         "avatar_local": avatar_local,
     })
-    return posts, new_posts, item.get("screen_name", ""), resp.get("renewed_cookie", "")
+    return (posts, new_posts, item.get("screen_name", ""),
+            resp.get("renewed_cookie", ""), True)
 
 
 def _forward_one(acc_id, acc_name, cookie, uid, screen_name, chosen, force_immediate=False):
@@ -436,11 +480,14 @@ def run_once(force_immediate=False):
         db = get_history_db()
         results = {}
         candidates = []
+        ok_fetches = 0
         for it in items:
             uid = it["uid"]
             _poll_progress["current"] = it.get("screen_name") or uid
             try:
-                posts, new_posts, screen_name, renewed = fetch_uid(uid, cookie, it)
+                posts, new_posts, screen_name, renewed, fok = fetch_uid(uid, cookie, it)
+                if fok:
+                    ok_fetches += 1
                 # 会话保活：微博下发的续期 Cookie 立即回写并沿用（v1.1.1）
                 if renewed and renewed != cookie:
                     if acc_mgr.update_cookie(acc["id"], renewed,
@@ -469,8 +516,50 @@ def run_once(force_immediate=False):
             debug(f"抓取 {screen_name or uid}（{uid}）：本页 {len(posts)} 条 · 新增 {len(new_posts)} 条"
                   f" · 进入候选 {new_count} 条", CAT_FWD)
 
+        # 【v1.6.6】「最近使用」= 最近一次成功轮询的时间。
+        # 判定口径是「本轮至少有一个对象真的拉取成功」——Cookie 若已失效，所有对象都会
+        # 失败，此时不更新，免得把一次废轮询记成有效使用。mark_used 同时会滑动 7 天窗口。
+        if ok_fetches:
+            try:
+                acc_mgr.mark_used(acc["id"])
+            except Exception as e:
+                warn(f"记录最近使用时间失败：{e}", CAT_FWD)
+            # 【v1.6.9】真实抓取成功 = 登录态有效的**直接证据**（比任何探针都硬）。
+            # 顺手把实测结论纠正为 valid：这样一旦哪一路探针误报了「已失效」，
+            # 下一轮正常轮询就会自动复原，不必等用户手点「检测」。
+            try:
+                rv = acc_mgr.set_verified(acc["id"], True, source="轮询抓取成功",
+                                          detail=f"本轮 {ok_fetches}/{len(items)} 个对象拉取成功")
+                if rv.get("changed") and rv.get("prev") == "expired":
+                    warn("本轮抓取成功，已自动纠正此前误标的「实测已失效」", CAT_FWD)
+            except Exception as e:
+                debug(f"记录抓取成功的登录态证据失败：{e}", CAT_FWD)
+            try:
+                from api_bridge import _state_dirty as _sd
+                _sd()          # 账户表立即刷新，不用等下一次轮询
+            except Exception:
+                pass
+
         _poll_progress["phase"] = "forward"
         info(f"本轮抓取完成 · 候选池 {len(candidates)} 条（已剔除历史已转发）· 覆盖 {len(results)} 个对象", CAT_FWD)
+        # 【v1.6.12】仅转发含图博文：必须在「排程挑选」之前收窄候选池，
+        # 否则随机挑到无图微博后再丢弃，会把本轮的条数悄悄做少。
+        _cfg_round = get_config()
+        try:
+            _img_only = bool(_cfg_round.get(FORWARD_IMAGES_ONLY_KEY, False))
+        except Exception:
+            _img_only = False
+        _img_dropped = 0
+        _dropped_uids = set()
+        if _img_only:
+            _before = len(candidates)
+            _keep = _filter_images_only(candidates)
+            _dropped_uids = {c.get("uid") for c in candidates} - {c.get("uid") for c in _keep}
+            candidates = _keep
+            _img_dropped = _before - len(candidates)
+            if _before:
+                info(f"仅转发含图博文：候选池 {_before} → {len(candidates)} 条"
+                     f"（滤除 {_img_dropped} 条无图微博）", CAT_FWD)
         if not can_forward():
             warn("本轮不执行转发：授权未生效（试用已结束或未激活）· 监控记录仍正常写入", CAT_FWD)
             # 试用结束且未授权：仅记录监控微博，不执行转发
@@ -484,7 +573,9 @@ def run_once(force_immediate=False):
 
         chosen_items = []
         if candidates:
-            _want = get_forward_count(get_config())
+            # 【v1.6.12】开启「排程波动」时，把排程数量当作**上限**：
+            # 设 5 则每轮在 1~5 之间随机，避免固定节律。
+            _want = get_forward_count_for_round(_cfg_round)
             chosen_items = _pick_candidates(candidates, _want)
             debug(f"本轮排程数量上限 {_want} 条 → 候选池 {len(candidates)} 条 "
                   f"→ 实际选中 {len(chosen_items)} 条", CAT_FWD)
@@ -537,9 +628,18 @@ def run_once(force_immediate=False):
                 continue
             if results.get(c["uid"], {}).get("action") == "none":
                 results[c["uid"]]["detail"] = "本轮随机未选中"
+        # 【v1.6.12】被「仅转发含图博文」整轮滤掉的对象，明细要写清原因 ——
+        # 若仍显示「本轮随机未选中」，用户会以为只是运气不好，而真相是候选里没图。
+        for _uid in _dropped_uids:
+            _row = results.get(_uid)
+            if _row and _row.get("action") == "none":
+                _row["detail"] = "本轮未选中（无图博文已按设置滤除）"
 
         if not candidates:
-            message = "本轮无新微博"
+            if _img_dropped:
+                message = f"本轮无含图新微博（已滤除 {_img_dropped} 条无图微博）"
+            else:
+                message = "本轮无新微博"
         elif sched_n and direct_n:
             message = f"本轮排程转发 {sched_n} 条 · 立即转发 {direct_n} 条"
         elif sched_n:

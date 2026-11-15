@@ -21,6 +21,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 M_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 "
         "(KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
 M_BASE = "https://m.weibo.cn"
+# 【v1.6.7】登录态实测端点：返回 {"data":{"login":true/false,...}}，是微博自己给出的
+# 「当前是否登录」权威布尔值。比解析页面、猜测登录墙都可靠，且返回体极小。
+CONFIG_URL = "https://m.weibo.cn/api/config"
 WEB_BASE = "https://weibo.com"
 
 TAG_RE = re.compile(r"<[^>]+>")
@@ -140,6 +143,224 @@ def _cookie_str(d: dict) -> str:
     return "; ".join(f"{k}={v}" for k, v in d.items() if v != "" and v is not None)
 
 
+# ---------------------------------------------------------------------------
+# 【v1.6.5】带域的 Cookie 条目（结构化存储）
+#
+# 背景：旧实现把 Cookie 压成「name=value; name=value」单串，**丢失 domain 维度**。
+# 而微博的同一个 SUB 在 `.weibo.com` / `.weibo.cn` / `.sina.com.cn` 下各有一份，
+# 压平后互相覆盖 —— 续期回来的 `.weibo.cn` 那份会把 `.weibo.com` 那份顶掉，
+# 表现为「明明刚保活过，转发却报未登录」。
+#
+# 现在 Cookie 以条目列表存储：[{name, value, domain, path, expires, secure, httponly}]
+# 合并时按 (name, domain) 精确匹配；对外仍用 _cookie_str / entries_to_cookie 输出
+# 扁平串，保证所有调用方（转发 / 检测 / 热搜 / 预览）零改动。
+# ---------------------------------------------------------------------------
+# 拼 Cookie 头时同名键只能出一个，按下面的域名顺序择一（越靠前越优先）。
+_DOMAIN_PRIORITY = (".weibo.com", "weibo.com", ".sina.com.cn",
+                    "sina.com.cn", ".weibo.cn", "weibo.cn")
+
+
+def httpdate_to_ts(text) -> int:
+    """把 HTTP 日期（如 'Wed, 20 Nov 2026 08:00:00 GMT'）转成 Unix 秒。
+
+    失败返回 0（0 表示「会话 Cookie，无明确过期时间」）。用 email.utils 解析，
+    避免 strptime 的 %a/%b 受系统区域设置影响。
+    """
+    if text is None or text == "":
+        return 0
+    if isinstance(text, (int, float)):
+        return int(text)
+    s = str(text).strip()
+    if not s:
+        return 0
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(s)
+        if dt is None:
+            return 0
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
+
+def _norm_entries(entries) -> list:
+    """规整条目列表：补齐字段、丢弃无名条目。"""
+    out = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        name = str(e.get("name") or "").strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "value": "" if e.get("value") is None else str(e.get("value")),
+            "domain": str(e.get("domain") or "").strip().lower(),
+            "path": str(e.get("path") or "/") or "/",
+            "expires": int(e.get("expires") or 0),
+            "secure": bool(e.get("secure", False)),
+            "httponly": bool(e.get("httponly", False)),
+        })
+    return out
+
+
+def _domain_rank(domain: str) -> int:
+    """域名优先级：已知微博域按 _DOMAIN_PRIORITY，空域（老数据）次之，未知域最后。"""
+    d = (domain or "").lower()
+    if not d:
+        return 100
+    for i, p in enumerate(_DOMAIN_PRIORITY):
+        if d == p:
+            return i
+    return 200
+
+
+def _entry_rank(e: dict):
+    """条目优先级：域名优先，其次 path 更长（更具体）优先。"""
+    return (_domain_rank(e.get("domain", "")), -len(e.get("path") or "/"))
+
+
+def parse_cookie_entries(cookie: str, default_domain: str = "") -> list:
+    """把扁平 Cookie 串解析为条目列表。
+
+    default_domain 为空表示「来源未知域的通用条目」（老数据迁移路径）；
+    此时该条目会被当作「发给任何域」使用，与旧行为完全一致。
+    """
+    out = []
+    seen = set()
+    for part in (cookie or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append({"name": k, "value": v, "domain": (default_domain or "").lower(),
+                    "path": "/", "expires": 0, "secure": False, "httponly": False})
+    return out
+
+
+def entries_to_cookie(entries) -> str:
+    """把条目列表输出为扁平 Cookie 串（同名键按域/路径优先级只取一条）。"""
+    rows = _norm_entries(entries)
+    if not rows:
+        return ""
+    best = {}
+    for e in rows:
+        cur = best.get(e["name"])
+        if cur is None or _entry_rank(e) < _entry_rank(cur):
+            best[e["name"]] = e
+    parts, seen = [], set()
+    for e in rows:
+        n = e["name"]
+        if n in seen:
+            continue
+        seen.add(n)
+        v = best[n].get("value", "")
+        if v == "":
+            continue
+        parts.append(f"{n}={v}")
+    return "; ".join(parts)
+
+
+def merge_cookie_entries(entries, session):
+    """把 Session 收到的 Set-Cookie（已续期的）按 (name, domain) 合并进条目列表。
+
+    返回 (新条目列表, 是否有变化)。规则：
+      1) 命中 (name, domain) → 原地更新 value / expires；
+      2) 未命中但存在同名「空域」老条目，且新条目带域 → **原地升级**为带域条目
+         （而不是追加），这样老数据迁移是渐进的，列表不会膨胀；
+      3) 其余情况追加新条目。
+    只合并登录相关键（_COOKIE_RENEW_KEYS），避免把追踪 Cookie 塞进来。
+    """
+    rows = _norm_entries(entries)
+    try:
+        jar = list(session.cookies)
+    except Exception:
+        return rows, False
+    if not jar:
+        return rows, False
+    index = {(e["name"], e["domain"]): i for i, e in enumerate(rows)}
+    changed = False
+    for c in jar:
+        name = getattr(c, "name", "") or ""
+        if name not in _COOKIE_RENEW_KEYS:
+            continue
+        value = getattr(c, "value", "")
+        if not value:
+            continue
+        domain = (getattr(c, "domain", "") or "").lower()
+        path = getattr(c, "path", "/") or "/"
+        expires = 0
+        try:
+            exp = getattr(c, "expires", None)
+            if exp:
+                expires = int(exp)
+        except Exception:
+            expires = 0
+        hit = index.get((name, domain))
+        if hit is not None:
+            e = rows[hit]
+            if e["value"] != value or (expires and e["expires"] != expires):
+                e["value"] = value
+                if expires:
+                    e["expires"] = expires
+                changed = True
+            continue
+        # 空域老条目原地升级
+        upgrade = None
+        if domain:
+            for i, e in enumerate(rows):
+                if e["name"] == name and not e["domain"]:
+                    upgrade = i
+                    break
+        if upgrade is not None:
+            e = rows[upgrade]
+            if e["value"] != value or e["domain"] != domain:
+                e["value"] = value
+                e["domain"] = domain
+                e["path"] = path
+                if expires:
+                    e["expires"] = expires
+                index[(name, domain)] = upgrade
+                changed = True
+            continue
+        rows.append({"name": name, "value": value, "domain": domain, "path": path,
+                     "expires": expires,
+                     "secure": bool(getattr(c, "secure", False)),
+                     "httponly": bool(getattr(c, "_rest", {}).get("HttpOnly", False))
+                     if isinstance(getattr(c, "_rest", None), dict) else False})
+        index[(name, domain)] = len(rows) - 1
+        changed = True
+    return rows, changed
+
+
+def apply_flat_to_entries(entries, cookie: str) -> list:
+    """把一份扁平 Cookie 串的值套回现有条目（保留已学到的 domain）。
+
+    用于「调用方只给了新的扁平串、没给条目」的场景：同名条目里**优先级最高**的那条
+    更新值，其余保持不变；新出现的名字追加为空域条目。这样 domain 信息不会因为
+    一次旧的回写路径而丢掉。
+    """
+    rows = _norm_entries(entries)
+    flat = _cookie_dict(cookie)
+    if not flat:
+        return rows
+    for name, value in flat.items():
+        idx = [i for i, e in enumerate(rows) if e["name"] == name]
+        if not idx:
+            rows.append({"name": name, "value": value, "domain": "", "path": "/",
+                         "expires": 0, "secure": False, "httponly": False})
+            continue
+        best = min(idx, key=lambda i: _entry_rank(rows[i]))
+        if rows[best]["value"] != value:
+            rows[best]["value"] = value
+            rows[best]["expires"] = 0
+    return rows
+
+
 def _has_login_cookie(cookie: str) -> bool:
     """是否持有微博登录凭证 SUB。没有 SUB 必然未登录（XSRF-TOKEN 无意义）。"""
     return bool(_cookie_dict(cookie).get("SUB"))
@@ -151,21 +372,13 @@ def _merge_cookies(cookie: str, session) -> str:
     微博在网页请求响应里常通过 Set-Cookie 续期 SUB / SUBP / XSRF-TOKEN / ALF，
     把续期结果回写即等价于「会话保活」，可显著延长 Cookie 寿命，减少必须
     重新登录的次数。只合并与登录相关的键，避免把无关追踪 Cookie 塞进来。
+
+    【v1.6.5】内部改走带域条目：同名 Cookie 在 `.weibo.com` / `.weibo.cn` 下各存
+    一份，互不覆盖。返回仍是扁平串，调用方无需改动。
     """
-    try:
-        jar = session.cookies.get_dict()
-    except Exception:
-        return cookie
-    if not jar:
-        return cookie
-    base = _cookie_dict(cookie)
-    changed = False
-    for k in _COOKIE_RENEW_KEYS:
-        v = jar.get(k)
-        if v and base.get(k) != v:
-            base[k] = v
-            changed = True
-    return _cookie_str(base) if changed else cookie
+    rows = parse_cookie_entries(cookie)
+    rows, changed = merge_cookie_entries(rows, session)
+    return entries_to_cookie(rows) if changed else cookie
 
 
 # ---------------- Cookie 失效时间预测 ----------------
@@ -411,19 +624,27 @@ def extract_images(raw_html: str, pics_field=None) -> list:
         from_html = True
     # 去重并过滤表情小图
     seen, out = set(), []
+    _drop_emoji, _drop_deco = 0, 0
     for u in imgs:
         if not u or u in seen:
             continue
         seen.add(u)
         # 1) 表情包 / 贴纸：一律剔除
         if _is_emoji_url(u):
-            debug(f"忽略表情/贴纸图片：{u}", CAT_HTTP)
+            _drop_emoji += 1
             continue
         # 2) 正文兜底得到的图，必须是图床尺寸目录，否则视为装饰图丢弃
         if from_html and not _looks_like_photo(u):
-            debug(f"忽略非正文配图：{u}", CAT_HTTP)
+            _drop_deco += 1
             continue
         out.append(u)
+    # 【v1.6.9】改「逐张一行」为「每帖一行汇总」。
+    # 旧写法一条微博能刷十几行「忽略表情/贴纸图片：https://face.t.sinajs.cn/...」，
+    # 几十条帖子就把关键判定行（登录态、抓取失败原因）彻底淹没了 —— 开着 verbose
+    # 恰恰是最需要读日志的时候。URL 明细没有必要，数量足够定位。
+    if _drop_emoji or _drop_deco:
+        debug(f"配图过滤：剔除表情/贴纸 {_drop_emoji} 张、装饰图 {_drop_deco} 张"
+              f"（保留 {len(out)} 张）", CAT_HTTP)
     return out
 
 
@@ -726,7 +947,7 @@ def get_user_info(uid: str, cookie: str) -> dict:
             "error": "未获取到用户信息（可能 Cookie 失效或无权限）"}
 
 
-def warm_session(cookie: str, uid: str = "") -> dict:
+def warm_session(cookie: str, uid: str = "", entries=None) -> dict:
     """网页端会话预热 + Cookie 续期（会话保活）。
 
     两个作用：
@@ -734,11 +955,16 @@ def warm_session(cookie: str, uid: str = "") -> dict:
          把续期结果合并回 Cookie 串 —— 相当于滑动续期，可显著延长 Cookie 寿命；
       2) 顺带判定当前 Cookie 是否已被登出（页面落到登录墙即失效）。
 
-    返回 {"ok":bool, "cookie":续期后的 cookie, "status":ok/cookie_expired/risk_control/network_error}
+    entries 可选：调用方若已持有带域条目（v1.6.5），传进来可保留 domain 维度，
+    避免同名 SUB 在 `.weibo.com` / `.weibo.cn` 之间互相覆盖。
+
+    返回 {"ok":bool, "cookie":续期后的 cookie, "entries":带域条目,
+          "status":ok/cookie_expired/risk_control/network_error}
     """
     if not cookie:
-        return {"ok": False, "cookie": cookie, "status": "cookie_expired",
-                "error": "Cookie 为空"}
+        return {"ok": False, "cookie": cookie, "entries": _norm_entries(entries),
+                "status": "cookie_expired", "error": "Cookie 为空"}
+    rows = _norm_entries(entries) or parse_cookie_entries(cookie)
     url = f"{WEB_BASE}/u/{uid}" if uid else f"{WEB_BASE}/"
     try:
         s = _session(cookie, referer=url)
@@ -749,18 +975,22 @@ def warm_session(cookie: str, uid: str = "") -> dict:
         })
         r = s.get(url, timeout=15, allow_redirects=True)
         if _looks_risk_control(r.status_code, r.text):
-            return {"ok": False, "cookie": cookie, "status": "risk_control",
+            return {"ok": False, "cookie": cookie, "entries": rows,
+                    "status": "risk_control",
                     "error": f"会话预热被风控拦截（HTTP {r.status_code}）"}
         if _looks_not_login(r.status_code, r.text):
-            return {"ok": False, "cookie": cookie, "status": "cookie_expired",
+            return {"ok": False, "cookie": cookie, "entries": rows,
+                    "status": "cookie_expired",
                     "error": "会话预热落到登录页，Cookie 已失效"}
-        renewed = _merge_cookies(cookie, s)
+        rows, changed = merge_cookie_entries(rows, s)
+        renewed = entries_to_cookie(rows) if changed else cookie
         if renewed != cookie:
             debug(f"会话预热完成 · Cookie 已续期（{url}）", CAT_HTTP)
-        return {"ok": True, "cookie": renewed, "status": "ok",
+        return {"ok": True, "cookie": renewed, "entries": rows, "status": "ok",
                 "renewed": renewed != cookie}
     except Exception as e:
-        return {"ok": False, "cookie": cookie, "status": "network_error",
+        return {"ok": False, "cookie": cookie, "entries": rows,
+                "status": "network_error",
                 "error": f"会话预热异常：{e}"}
 
 
@@ -781,18 +1011,23 @@ def warm_session(cookie: str, uid: str = "") -> dict:
 # 下面三个函数是「保活」的最小实现：只发 1~2 个轻量 GET，让微博通过 Set-Cookie
 # 滑动续期凭证并捕获续期结果，返回续期后的 Cookie 供上层回写。
 # ---------------------------------------------------------------------------
-def keepalive_mobile(cookie: str) -> dict:
+def keepalive_mobile(cookie: str, entries=None) -> dict:
     """移动端 m.weibo.cn 会话保活探针（轻量）。
 
     仅发 1~2 个轻量 GET（首页 + /api/config），让微博通过 Set-Cookie 滑动续期移动端
     凭证（WBPSESS 等）并捕获续期结果。成功即视为移动端会话存活，返回续期后的 Cookie。
 
-    返回 {"ok":bool, "cookie":续期后 cookie, "status":ok/risk_control/cookie_expired/
-          network_error, "detail":str, "http":int, "renewed":bool}
+    entries 可选：已持有带域条目时传入，移动端下发的 `WBPSESS` 会挂在 `.weibo.cn`
+    域下，不会污染网页端的同名 Cookie。
+
+    返回 {"ok":bool, "cookie":续期后 cookie, "entries":带域条目, "status":...,
+          "detail":str, "http":int, "renewed":bool}
     """
     if not cookie:
-        return {"ok": False, "cookie": cookie, "status": "cookie_expired",
-                "detail": "Cookie 为空", "http": 0, "renewed": False}
+        return {"ok": False, "cookie": cookie, "entries": _norm_entries(entries),
+                "status": "cookie_expired", "detail": "Cookie 为空",
+                "http": 0, "renewed": False}
+    rows = _norm_entries(entries) or parse_cookie_entries(cookie)
     try:
         ms = _session(cookie, referer=f"{M_BASE}/", mobile=True)
         ms.headers.update({
@@ -802,33 +1037,133 @@ def keepalive_mobile(cookie: str) -> dict:
         r = ms.get(f"{M_BASE}/", timeout=10)
         http = r.status_code
         if _looks_risk_control(http, r.text):
-            return {"ok": False, "cookie": cookie, "status": "risk_control",
+            return {"ok": False, "cookie": cookie, "entries": rows,
+                    "status": "risk_control",
                     "detail": f"移动端保活被风控拦截（HTTP {http}）", "http": http,
                     "renewed": False}
         try:
             ms.get(f"{M_BASE}/api/config", timeout=10)
         except Exception:
             pass
-        renewed = _merge_cookies(cookie, ms)
+        rows, changed = merge_cookie_entries(rows, ms)
+        renewed = entries_to_cookie(rows) if changed else cookie
         if renewed != cookie:
             debug("移动端保活完成 · Cookie 已续期", CAT_HTTP)
-        return {"ok": True, "cookie": renewed, "status": "ok",
+        return {"ok": True, "cookie": renewed, "entries": rows, "status": "ok",
                 "detail": "移动端会话已保活", "http": http,
                 "renewed": renewed != cookie}
+
     except Exception as e:
-        return {"ok": False, "cookie": cookie, "status": "network_error",
+        return {"ok": False, "cookie": cookie, "entries": rows,
+                "status": "network_error",
                 "detail": f"移动端保活异常：{e}", "http": 0, "renewed": False}
 
 
-def keepalive_web(cookie: str) -> dict:
+def probe_login(cookie: str) -> dict:
+    """移动端 `m.weibo.cn/api/config` 的登录态探针（v1.6.7 引入，v1.6.9 收窄语义）。
+
+    【v1.6.9 重大修正】本函数**只能做正向确认，不能判定失效**。
+
+    v1.6.7 曾把这里的 `data.login == false` 当成「已失效」写库，结果实测到
+    「功能一切正常、账户状态正常、抓取全部成功，有效期列却显示实测已失效，
+    点一次『检测』又恢复正常」——根因是它违反了本项目早就写明的规则
+    （见 check_account 第 3 步）：**m.weibo.cn 与 weibo.com 不同源，网页端登录
+    拿到的 Cookie 到移动端接口上本来就回答 login=false**。那不是失效，是口径差异。
+    真正有资格判失效的只有同源接口 → probe_login_web()。
+
+    返回 {"ok":bool(探针本身跑通), "login":True/None, "status":
+          valid/unknown/risk_control/network_error, "detail":str}
+    `login` 只可能是 True 或 None —— 本函数永远不会返回 False。
+    """
+    if not cookie:
+        return {"ok": False, "login": None, "status": "unknown",
+                "detail": "Cookie 为空，跳过移动端探针"}
+    try:
+        s = _session(cookie, referer=f"{M_BASE}/", mobile=True)
+        s.headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+        })
+        r = s.get(CONFIG_URL, timeout=10)
+        if _looks_risk_control(r.status_code, r.text):
+            return {"ok": False, "login": None, "status": "risk_control",
+                    "detail": f"移动端探针被风控拦截（HTTP {r.status_code}）"}
+        try:
+            j = r.json()
+        except Exception:
+            return {"ok": False, "login": None, "status": "unknown",
+                    "detail": f"移动端探针返回非 JSON（HTTP {r.status_code}）"}
+        d = j.get("data") if isinstance(j, dict) else None
+        if not isinstance(d, dict) or "login" not in d:
+            return {"ok": False, "login": None, "status": "unknown",
+                    "detail": "移动端探针响应缺少 data.login 字段"}
+        if bool(d.get("login")):
+            return {"ok": True, "login": True, "status": "valid",
+                    "detail": "移动端确认已登录"}
+        # 关键：跨域口径的「未登录」**不写库**，也不当失效，只当「这一路测不出来」
+        return {"ok": True, "login": None, "status": "unknown",
+                "detail": "移动端回答未登录（跨域口径，不作为失效依据）"}
+    except Exception as e:
+        return {"ok": False, "login": None, "status": "network_error",
+                "detail": f"移动端探针异常：{e}"}
+
+
+def probe_login_web(cookie: str, uid: str = "") -> dict:
+    """同源登录态实测：`weibo.com/ajax/profile/info`（v1.6.9 新增）。
+
+    与 Cookie **同源**，因此它是唯一有资格判定「已失效」的轻量接口 ——
+    这正是 check_account 第 2 步的口径。移动端探针只敢确认有效，不敢否定；
+    要发现「真的失效了」，必须走这里。
+
+    返回结构与 probe_login 一致，`login` 可为 True / False / None：
+      valid        → ok=True,  login=True   （同源接口正常返回用户对象）
+      expired      → ok=True,  login=False  （显式未登录 ok=-100 / 登录墙）
+      risk_control / network_error / unknown → login=None（测不出来，不写库）
+    """
+    if not cookie:
+        return {"ok": False, "login": None, "status": "expired",
+                "detail": "Cookie 为空"}
+    if not uid:
+        return {"ok": False, "login": None, "status": "unknown",
+                "detail": "缺少 uid，无法做同源实测"}
+    try:
+        s = _session(cookie, referer=f"{WEB_BASE}/u/{uid}")
+        s.headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+        })
+        r = s.get(f"{WEB_BASE}/ajax/profile/info", params={"uid": uid}, timeout=12)
+        if _looks_risk_control(r.status_code, r.text):
+            return {"ok": False, "login": None, "status": "risk_control",
+                    "detail": f"同源实测被风控拦截（HTTP {r.status_code}）"}
+        j = _safe_json(r)
+        ok_flag = j.get("ok") if isinstance(j, dict) else None
+        debug(f"同源实测 uid={uid} · HTTP {r.status_code} · ok={ok_flag} · "
+              f"body={(r.text or '')[:160]!r}", CAT_HTTP)
+        if _looks_not_login(r.status_code, r.text, j):
+            return {"ok": True, "login": False, "status": "expired",
+                    "detail": f"同源接口判定未登录（HTTP {r.status_code} · ok={ok_flag}）"}
+        u = _find_user_obj(j.get("data") if isinstance(j, dict) else None)
+        if u:
+            return {"ok": True, "login": True, "status": "valid",
+                    "detail": "同源接口确认登录态有效"}
+        return {"ok": False, "login": None, "status": "unknown",
+                "detail": f"同源接口未返回用户对象（HTTP {r.status_code} · ok={ok_flag}）"}
+    except Exception as e:
+        return {"ok": False, "login": None, "status": "network_error",
+                "detail": f"同源实测异常：{e}"}
+
+
+def keepalive_web(cookie: str, entries=None) -> dict:
     """网页端 weibo.com 会话保活（轻量包装 warm_session）。
 
     返回与 keepalive_mobile 同构的 dict，便于上层统一处理。
     """
-    w = warm_session(cookie)
+    w = warm_session(cookie, entries=entries)
     return {
         "ok": w.get("ok", False),
         "cookie": w.get("cookie", cookie),
+        "entries": w.get("entries") or _norm_entries(entries),
         "status": w.get("status", "unknown"),
         "detail": w.get("error") or "网页端会话已保活",
         "http": 0,
@@ -836,19 +1171,23 @@ def keepalive_web(cookie: str) -> dict:
     }
 
 
-def keepalive(cookie: str) -> dict:
+def keepalive(cookie: str, entries=None) -> dict:
     """双通道会话保活：网页端 + 移动端。
 
     微博网页端登录态有「7 天服务端硬过期」上限（无法绕过），但活跃会话会被滑动续期；
     移动端 m.weibo.cn 是独立系统，需单独保活。两者任一成功即视为保活成功，并把各自
     捕获的续期 Cookie 合并回主 Cookie 串（先网页、再移动端），最大化延长 usable 寿命。
 
-    返回 {"ok":bool, "cookie":合并后续期 cookie, "web":{...}, "mobile":{...},
-          "status":..., "detail":...}
+    entries 可选（v1.6.5）：带域条目在两条通道间传递，网页端续期落在 `.weibo.com`、
+    移动端落在 `.weibo.cn`，同名 SUB / WBPSESS 互不覆盖。
+
+    返回 {"ok":bool, "cookie":合并后续期 cookie, "entries":带域条目,
+          "web":{...}, "mobile":{...}, "status":..., "detail":...}
     """
-    web = keepalive_web(cookie)
-    mobile = keepalive_mobile(web.get("cookie", cookie))
+    web = keepalive_web(cookie, entries=entries)
+    mobile = keepalive_mobile(web.get("cookie", cookie), entries=web.get("entries"))
     merged = mobile.get("cookie", web.get("cookie", cookie))
+    merged_entries = mobile.get("entries") or web.get("entries") or _norm_entries(entries)
     ok = web.get("ok") or mobile.get("ok")
     if web.get("ok") and mobile.get("ok"):
         status, detail = "ok", "网页端 + 移动端会话均已保活"
@@ -859,8 +1198,8 @@ def keepalive(cookie: str) -> dict:
     else:
         status = web.get("status") or mobile.get("status") or "unknown"
         detail = f"网页端：{web.get('detail', '')}；移动端：{mobile.get('detail', '')}"
-    return {"ok": ok, "cookie": merged, "web": web, "mobile": mobile,
-            "status": status, "detail": detail}
+    return {"ok": ok, "cookie": merged, "entries": merged_entries,
+            "web": web, "mobile": mobile, "status": status, "detail": detail}
 
 
 # 从 weibo.com 首页内联配置中提取「当前登录账户自己的 UID」的常见写法。
