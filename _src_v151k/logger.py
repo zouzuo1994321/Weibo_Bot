@@ -153,6 +153,48 @@ def _now():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+SIDE_LOG_MAX_BYTES = 1024 * 1024
+
+
+def rotate_side_logs():
+    """清理/轮转「旁路诊断日志」——目前只有 pywebview 注入追踪的 `_inj.log`。
+
+    【v1.6.18】`_inj.log` 由 pywebview 里的一个**临时诊断补丁**直接
+    `open(..., 'a')` 写入，完全没有轮转。它 95% 的内容是
+    `evaluate_js OK len=…`（主窗每次 evaluate_js 都记一行，几秒一条），
+    39 天攒到 **7.1MB / 13.7 万行**，全部躺在用户的数据目录里。
+    这里在启动时把超过 1MB 的整份挪成 `.1`（只留一份历史，与 app.log 同规矩）。
+
+    注意：补丁把路径**写死**在 `%LOCALAPPDATA%\\微博bot小助手\\data\\_inj.log`，
+    即使用户把数据目录改到别处它也仍然写那儿 —— 所以两个位置都要查。
+    """
+    cands = set()
+    try:
+        cands.add(os.path.join(os.path.dirname(LOG_PATH), "_inj.log"))
+    except Exception:
+        pass
+    try:
+        cands.add(os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                               "微博bot小助手", "data", "_inj.log"))
+    except Exception:
+        pass
+    for p in cands:
+        try:
+            if not p or not os.path.exists(p):
+                continue
+            if os.path.getsize(p) < SIDE_LOG_MAX_BYTES:
+                continue
+            bak = p + ".1"
+            try:
+                if os.path.exists(bak):
+                    os.remove(bak)
+            except Exception:
+                pass
+            os.replace(p, bak)
+        except Exception:
+            pass
+
+
 def _rotate_if_needed():
     """文件超过上限则轮转：app.log -> app.log.1（覆盖旧的历史文件）。"""
     try:

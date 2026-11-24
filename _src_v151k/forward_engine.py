@@ -49,6 +49,13 @@ def get_poll_progress():
 # 采用非阻塞加锁：若已有轮询在进行，本次直接跳过（返回跳过说明），而非排队等待。
 _run_lock = threading.Lock()
 
+# 【v1.6.17】本轮「判空」的对象集合 —— 接口正常返回、只是该账号近半年没有公开微博。
+# 判空不是故障：一色雨的账号资料页有 297 条微博，但最新一条停在 2025-08-19，
+# mymblog 按可见窗口返回空 list。旧版逐对象记 WARN「拉取失败」，两天 142 行、
+# 占全部 HTTP 告警 98%，把真正的故障埋了。现在改由 run_once 每轮汇总一行。
+# 用集合而非计数：同一对象本轮被重复拉取不会重复算。
+_round_empty_uids = set()
+
 
 def manual_run_async(force_immediate=False):
     """后台异步执行一轮完整轮询，并实时更新 _poll_progress 供 frontend 轮询。
@@ -101,7 +108,7 @@ def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _compute_forward_offset(cfg):
+def _compute_forward_offset(cfg, slot=None):
     """计算转发时间随机偏移量（秒）。
 
     目标：转发不在轮询触发时刻「齐步走」，而是在「设定间隔 ±poll_jitter_ratio」
@@ -109,6 +116,17 @@ def _compute_forward_offset(cfg):
     设定间隔的 ±15%，保证转发在合理时间内可见地完成（不再延后到 ~27 分钟才执行）。
 
     例如：间隔 30 分钟、ratio=0.15 → 实际延后 0 ~ 4.5 分钟随机触发。
+
+    【v1.6.17】`slot=(序号, 总数)` 时改用**分层抽样**。
+    旧版对每条转发各自独立取 `uniform(0, cap)`，N 次独立抽样必然扎堆：
+    真机两天实测 179 个圈，相邻间隔**最短 0 秒**、`<10 秒` 占 15.1%、中位仅 30 秒。
+    后果有三：① 进度环「一圈=一条」时，0~2 秒的圈看上去仍是一闪；
+    ② 两条落到同一秒，`forward_runs` 去重把 2 圈折叠成 1 圈；
+    ③ 5 条挤在 2 分半内发出，本身就是「批量转发」特征。
+
+    改成把窗口均分成 N 段、每段只取中间 60%（0.2~0.8 段长）后：
+    - 相邻两条的最小间隔 = 段长 × 0.4（15 分钟/5 条 → 27×0.4 ≈ 10.8 秒）；
+    - 平均间隔 = 段长，整体仍铺满原窗口，既散开又不改变「多久内发完」的上限。
     """
     interval = max(1, int(cfg.get("interval_minutes", 30))) * 60
     ratio = cfg.get("poll_jitter_ratio", 0.15)
@@ -117,18 +135,46 @@ def _compute_forward_offset(cfg):
     except Exception:
         ratio = 0.15
     cap = interval * ratio  # 延后上限 = 设定间隔 × ±ratio（默认 ±15%）
-    return random.uniform(0, max(0, cap))
+    cap = max(0.0, cap)
+    if slot:
+        try:
+            idx, total = int(slot[0]), max(1, int(slot[1]))
+        except Exception:
+            idx, total = 0, 1
+        idx = max(0, min(total - 1, idx))
+        step = cap / total
+        return random.uniform(idx * step + step * 0.2,
+                              idx * step + step * 0.8)
+    return random.uniform(0, cap)
 
 
-def _schedule_forward(delay, fn):
-    """延迟 delay 秒后在后台线程执行转发（用于工作时段内随机偏移）。"""
+def _schedule_forward(delay, fn, meta=None):
+    """延迟 delay 秒后在后台线程执行转发（用于工作时段内随机偏移）。
+
+    【v1.6.17】到期执行**必须留痕**。旧版只在异常时 `error()`，成功路径一个字不写，
+    于是排程点之后日志一片空白 —— 排查时极易误判成「排程了但根本没执行」。
+    现在无论成功、跳过还是失败都记一行，带上对象与耗时。
+    """
+    meta = meta or {}
+
     def _run():
         time.sleep(delay)
+        t0 = time.time()
+        tag = "UID=%s（%s）" % (meta.get("uid", "?"), meta.get("screen_name") or "-")
         try:
-            fn()
+            r = fn() or {}
+            cost = int((time.time() - t0) * 1000)
+            act = r.get("action") or "unknown"
+            det = r.get("detail") or ""
+            line = (f"排程到期执行 · {tag} · 动作={act} · 耗时 {cost}ms · {det}")
+            if act in ("forwarded", "skipped"):
+                info(line, CAT_FWD)
+            else:
+                warn(line, CAT_FWD)
         except Exception as e:
-            error(f"延迟转发执行失败：{e}")
-    threading.Thread(target=_run, daemon=True).start()
+            error(f"排程到期执行失败 · {tag} · {e}", CAT_FWD)
+
+    threading.Thread(target=_run, daemon=True, name="fwd-delayed").start()
 
 
 # ---------------- 每轮排程数量（v1.6.1） ----------------
@@ -242,6 +288,24 @@ def _writeback_cookie(acc_id, old_cookie, new_cookie):
         debug(f"Cookie 续期回写失败：{e}", CAT_HTTP)
 
 
+def _is_no_permission(msg):
+    """该失败是否属于「内容不可转发」（而非我们的链路上出问题）。
+
+    【v1.6.17】微博对「作者设置了可见性」的微博回 `ok=0` +
+    `由于作者设置了可见性，你没有权限转发此微博`。这既不是登录态失效、也不是网络
+    故障，我们做什么都转发不了 —— 归到 failed 会让历史页的失败数虚高，也容易让人
+    以为账号出问题。单独按「跳过」记，理由写清楚。
+    """
+    s = str(msg or "")
+    return any(k in s for k in (
+        "没有权限转发", "设置了可见性", "无权转发", "不能转发此微博",
+        # 【v1.6.18】11-23 实测：同一个作者把可见性改成「对方设置」口径后，
+        # 回包是 `由于对方设置，你无法进行操作`，旧关键词一个都没命中，
+        # 于是又被记成 failed（两天 3 条全栽在这句上）。
+        "由于对方设置", "无法进行操作", "无法进行此操作",
+        "该微博已被删除", "微博不存在"))
+
+
 def _repost_now(acc_id, acc_name, cookie, uid, screen_name, post, comment, ftype, persona=""):
     """实际执行转发 + 入库（供立即转发或延迟转发调用）。含重复转发兜底。"""
     db = get_history_db()
@@ -255,10 +319,19 @@ def _repost_now(acc_id, acc_name, cookie, uid, screen_name, post, comment, ftype
         _writeback_cookie(acc_id, cookie, r.get("cookie"))
         return {"action": "forwarded", "detail": f"已转发（{ftype}）：{comment or '纯转发'}"}
     else:
+        # 【v1.6.17】「作者设置了可见性」这类不可转发内容按「跳过」记，不记 failed：
+        # 两天真机 3 条失败全是它，记成失败会让失败率虚高、也误导排查方向。
+        raw = r.get("error", "未知错误")
+        if _is_no_permission(raw):
+            db.add_forward(acc_id, acc_name, uid, screen_name, post["id"],
+                           post["text"], comment, ftype,
+                           "skipped", reason=f"内容不可转发：{raw}", persona=persona)
+            return {"action": "skipped",
+                    "detail": f"内容不可转发（作者设置了可见性，已跳过）：{raw}"}
         db.add_forward(acc_id, acc_name, uid, screen_name, post["id"],
                        post["text"], comment, ftype,
-                       "failed", reason=r.get("error", "未知错误"), persona=persona)
-        return {"action": "failed", "detail": f"转发失败：{r.get('error', '未知错误')}"}
+                       "failed", reason=raw, persona=persona)
+        return {"action": "failed", "detail": f"转发失败：{raw}"}
 
 
 def _download_post_images(images, uid, post_id, cookie):
@@ -326,10 +399,26 @@ def fetch_uid(uid, cookie, item):
     """
     resp = get_latest_posts(uid, cookie, page=1, count=10)
     if not resp.get("ok"):
+        st = resp.get("status") or "error"
+        # 【v1.6.17】判空单独处理：接口是通的，只是这个账号近半年没有公开微博。
+        # 监控状态不该亮红（那会变成「功能正常却显示故障」的翻版），
+        # 告警也不该逐对象刷屏，统一交给 run_once 汇总。
+        if st == "empty":
+            _round_empty_uids.add(uid)
+            # 接口是通的（HTTP 200 / ok=1），只是这个账号近半年没有公开微博。
+            # 状态记「在线」并推进「最近检查」，否则监控列表会一直挂着旧的检查时间，
+            # 看上去像「已经不监控了」；也不该标红 —— 那是「功能正常却显示故障」。
+            try:
+                get_monitor_manager().update(uid, {
+                    "status": "online", "last_check": _now()})
+            except Exception:
+                pass
+            debug(f"抓取无近期内容 UID={uid} · 近半年没有可转发的公开微博（非故障）",
+                  CAT_HTTP)
+            return [], [], item.get("screen_name", ""), "", False
         get_monitor_manager().update(uid, {
             "status": "error", "last_check": _now()})
         # v1.1.1：按失败性质给出可操作日志，而不是笼统一句「拉取失败」
-        st = resp.get("status") or "error"
         reason = resp.get("reason") or resp.get("error") or "未知原因"
         if st == "cookie_expired":
             error(f"抓取失败 UID={uid} · 原因：Cookie 已失效，"
@@ -383,7 +472,8 @@ def fetch_uid(uid, cookie, item):
             resp.get("renewed_cookie", ""), True)
 
 
-def _forward_one(acc_id, acc_name, cookie, uid, screen_name, chosen, force_immediate=False):
+def _forward_one(acc_id, acc_name, cookie, uid, screen_name, chosen, force_immediate=False,
+                 slot=None):
     """对指定微博执行一次转发（含 AI 生成、黑名单、repost、历史记录）。
 
     转发时间策略：若开启「转发时间随机偏移」且非强制立即（force_immediate），
@@ -391,6 +481,9 @@ def _forward_one(acc_id, acc_name, cookie, uid, screen_name, chosen, force_immed
     （后台线程，默认至多延后 4.5 分钟 / 30 分钟间隔），避免多账号/多对象在轮询
     触发时刻「齐步走」；force_immediate=True 时（如用户手动「立即转发」、
     「立即轮询一次」）则立即转发，给用户即时反馈。
+
+    【v1.6.17】`slot=(本轮第几条, 本轮共几条)` 透传给 `_compute_forward_offset`
+    做分层抽样 —— 否则 N 条转发各自独立取随机偏移会扎堆（真机实测最短间隔 0 秒）。
     """
     cfg = get_config()
     blacklist = cfg.get("blacklist", []) or []
@@ -421,12 +514,15 @@ def _forward_one(acc_id, acc_name, cookie, uid, screen_name, chosen, force_immed
 
     # 转发时间随机偏移：延迟到工作时段内随机时刻执行
     if (not force_immediate) and cfg.get("forward_time_jitter", True):
-        offset = _compute_forward_offset(cfg)
+        offset = _compute_forward_offset(cfg, slot=slot)
         if offset > 0:
             run_at = datetime.now() + timedelta(seconds=offset)
             post = dict(chosen)  # 快照，避免后续被复用覆盖
             _schedule_forward(offset, lambda: _repost_now(
-                acc_id, acc_name, cookie, uid, screen_name, post, comment, ftype, persona))
+                acc_id, acc_name, cookie, uid, screen_name, post, comment, ftype, persona),
+                meta={"uid": uid, "screen_name": screen_name,
+                      "post_id": post.get("id", ""),
+                      "run_at": run_at.strftime("%H:%M:%S")})
             # 【v1.4.20】带回实际转发执行时间（浮点秒），调度器据此暴露 next_forward_run，
             # 供前端「本日转发次数」进度环把 100% 对齐到真正的转发时刻。
             return {"action": "scheduled",
@@ -481,6 +577,7 @@ def run_once(force_immediate=False):
         results = {}
         candidates = []
         ok_fetches = 0
+        _round_empty_uids.clear()   # 【v1.6.17】每轮重新统计判空对象
         for it in items:
             uid = it["uid"]
             _poll_progress["current"] = it.get("screen_name") or uid
@@ -541,7 +638,18 @@ def run_once(force_immediate=False):
                 pass
 
         _poll_progress["phase"] = "forward"
-        info(f"本轮抓取完成 · 候选池 {len(candidates)} 条（已剔除历史已转发）· 覆盖 {len(results)} 个对象", CAT_FWD)
+        # 【v1.6.17】判空对象汇总成一行：既不掩盖问题（看得到有几个对象没内容），
+        # 又不会像旧版那样每个对象两条 WARN 把真故障埋掉。
+        if _round_empty_uids:
+            _names = []
+            for _it in items:
+                if _it.get("uid") in _round_empty_uids:
+                    _names.append(_it.get("screen_name") or _it.get("uid", ""))
+            _head = "、".join(_names[:5]) + ("…" if len(_names) > 5 else "")
+            info(f"本轮 {len(_round_empty_uids)} 个对象近半年无公开微博（接口正常，非故障）：{_head}",
+                 CAT_FWD)
+        info(f"本轮抓取完成 · 候选池 {len(candidates)} 条（已剔除已处理：成功/跳过/失败）"
+             f"· 覆盖 {len(results)} 个对象", CAT_FWD)
         # 【v1.6.12】仅转发含图博文：必须在「排程挑选」之前收窄候选池，
         # 否则随机挑到无图微博后再丢弃，会把本轮的条数悄悄做少。
         _cfg_round = get_config()
@@ -581,13 +689,17 @@ def run_once(force_immediate=False):
                   f"→ 实际选中 {len(chosen_items)} 条", CAT_FWD)
         sched_n = direct_n = skip_n = fail_n = 0
         picked_uids = set()
-        for item in chosen_items:
+        # 【v1.6.17】把「第几条 / 共几条」传下去做分层抽样，保证 N 条排程在偏移窗口
+        # 里各占一段、不会扎堆到同一秒（进度环才能一圈圈地走）。
+        _n_chosen = len(chosen_items)
+        for _idx, item in enumerate(chosen_items):
             uid = item["uid"]
             screen_name = item["screen_name"]
             post = item["post"]
             try:
                 res = _forward_one(acc["id"], acc.get("display_name", ""), cookie,
-                                   uid, screen_name, post, force_immediate=force_immediate)
+                                   uid, screen_name, post, force_immediate=force_immediate,
+                                   slot=(_idx, _n_chosen))
             except Exception as e:
                 error(f"转发 UID={uid} 异常：{e}", CAT_FWD)
                 res = {"action": "failed", "detail": f"转发异常：{e}"}

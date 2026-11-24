@@ -157,10 +157,13 @@ h2 { margin: 0 0 6px; font-size: 22px; font-weight: 700; }
    【v1.6.13】「仅转发含图博文」移到「转发方式」卡，两卡各只剩一行；
    本组样式随之成为两张卡共用的行样式。 */
 .fwd-opt-list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
-.row.fwd-opt-row { flex-wrap: nowrap; align-items: flex-start; gap: 10px; }
-/* 开关（24px 高）与标题行盒（19px）中心对齐：24-19=5，故上移 2px。
-   实测该值下圆心与标题行中心偏差 0.5px；若用 +2px 会偏下 4.5px（肉眼可辨）。 */
-.row.fwd-opt-row > .switch { flex-shrink: 0; margin-top: -2px; }
+/* 【v1.6.16】开关改为与**整行**垂直居中对齐。
+   旧实现是 align-items:flex-start + 开关 margin-top:-2px —— 那是「开关圆心对齐标题行」
+   的做法：说明文字一旦折成两行，开关就贴在行首、顶上那一截，肉眼明显偏高。
+   现在交给 align-items:center 让开关与文字块整体居中，去掉 -2px 的位移补偿。
+   两张卡的这一行共用本类（排程波动 / 仅转发含图博文），一处改动两处生效。 */
+.row.fwd-opt-row { flex-wrap: nowrap; align-items: center; gap: 10px; }
+.row.fwd-opt-row > .switch { flex-shrink: 0; }
 .row.fwd-opt-row > div { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .row.fwd-opt-row .muted { font-size: 12px; line-height: 1.5; }
 /* 排程数量为 1 时「排程波动」不产生任何差别，降透明度提示（仍可点击） */
@@ -396,7 +399,10 @@ th.th-tag { padding-left: 21px; }
 }
 /* 【v1.5.1】生长期（fwd-active）只亮进度环本身，不再给卡片外框上高光——
    用户反馈「启动轮询不用显示高光」：轮询刚开始跑时满圈橙光像“出错了”，
-   干扰 readings。外框高光仅保留给 fwd-done（到达排程转发时刻的满环驻留期）。 */
+   干扰 readings。外框高光仅保留给 fwd-done。
+   【v1.6.16】fwd-done 的语义变了：不再是「满环驻留 10s + 渐隐」，而是
+   「这一条微博发出去了」的 900ms 短促高亮（一圈 = 一条，见 app.js 注释）。
+   原来配套的「渐隐」两条规则随之成了死样式，已删。 */
 .stat-forward.fwd-active .fwd-ring-prog { opacity: 1; }
 .stat-forward.fwd-done .fwd-ring-prog {
   filter: drop-shadow(0 0 11px rgba(255,130,0,.95));
@@ -404,12 +410,8 @@ th.th-tag { padding-left: 21px; }
 .stat-forward.fwd-done {
   border-color: rgba(255,130,0,.7);
   box-shadow: 0 0 0 1px rgba(255,130,0,.5), 0 0 22px rgba(255,130,0,.28);
-}
-.stat-forward.fwd-fading .fwd-ring-prog { opacity: 0 !important; }
-.stat-forward.fwd-fading {
-  border-color: var(--border);
-  box-shadow: none;
-  transition: border-color .6s ease, box-shadow .6s ease;
+  /* 高亮进入/退出都要柔和，否则 900ms 的脉冲会像闪一下故障灯 */
+  transition: border-color .18s ease, box-shadow .18s ease;
 }
 
 .log-box { background: #0c0e12; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: "Consolas", "SFMono-Regular", monospace; font-size: 12px; min-height: 120px; max-height: 460px; overflow-y: auto; white-space: pre-wrap; line-height: 1.6; }

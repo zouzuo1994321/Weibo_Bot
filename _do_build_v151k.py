@@ -265,7 +265,7 @@ def main():
         print("  （不先退出的话，dist 会是新的，但根目录/history 会覆盖失败，三处错位）")
         sys.exit(3)
 
-    print("开始 v1.6.13 打包（「仅转发含图博文」归位到转发方式 + 「只看有图」默认开启）…")
+    print("开始 v1.6.18 打包（内置浏览器取 Cookie 不再卡 20 秒 + 图床 403 不再全局冷却 + 转发失败归类 + 诊断日志轮转）…")
     check_ui_syntax()
     sync_changelog(internal)
     write_spec()

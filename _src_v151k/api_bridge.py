@@ -708,7 +708,9 @@ def _empty_state():
         "monitors": [],
         "scheduler": {"running": False, "interval_minutes":
                       _cfg.get("interval_minutes", 30),
-                      "in_working_hours": False, "last_run": None},
+                      "in_working_hours": False, "last_run": None,
+                      # 【v1.6.16】首屏兜底结构补齐进度环要用的字段
+                      "forward_runs": [], "forward_plan_at": None},
         "stats": {},
         "personas": _personas,
         "license": {},
@@ -1682,12 +1684,43 @@ class Api:
         ok, msg = get_account_manager().add_account(remark, cookie, entries)
         if ok:
             info(f"已添加账户：{remark}")
+            # 【v1.6.14 · D3】添加后立刻在后台补解析账户自身 UID。
+            # 没有 uid，同源实测（唯一有权判失效的通道）一次都跑不起来 ——
+            # 用户报告里 336 次「登录态实测跳过」全部源于此。这里用刚拿到的
+            # Cookie 打一次首页即可，几秒钟的事，且放后台不阻塞 UI。
+            try:
+                _thr.Thread(target=self._backfill_uid_bg,
+                            args=(msg,), daemon=True,
+                            name="uid-backfill").start()
+            except Exception:
+                pass
             _state_dirty()   # 【v1.4.3】立即失效状态缓存，前端亚秒级看到新账户
             # 【v1.4.4】健康快照立即重算：新账户「未检测」= 黄色提示，徽章即刻同步
             _recompute_account_health_now()
         else:
             warn(f"添加账户失败：{msg}")
         return {"ok": ok, "message": msg}
+
+    def _backfill_uid_bg(self, acc_id):
+        """后台补解析并落盘账户自身 UID（幂等，失败静默）。"""
+        try:
+            am = get_account_manager()
+            acc = next((a for a in am.list_accounts() if a["id"] == acc_id), None)
+            if not acc or acc.get("wb_uid"):
+                return
+            cookie = am.get_cookie(acc_id)
+            if not cookie or "SUB=" not in cookie:
+                return
+            from weibo_client import get_self_uid
+            uid, _renewed = get_self_uid(cookie)
+            if uid:
+                am.set_wb_uid(acc_id, uid)
+                _state_dirty()
+            else:
+                warn(f"账户 {acc_id} 未能从首页解析到自身 UID，"
+                     f"同源实测将在下次保活时重试", CAT_CORE)
+        except Exception as e:
+            debug(f"补解析账户自身 UID 失败：{e}", CAT_CORE)
 
     def remove_account(self, acc_id):
         ok = get_account_manager().remove_account(acc_id)
@@ -1819,6 +1852,91 @@ class Api:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def _login_window_alive(self):
+        """内置登录窗口是否**真的**还活着。
+
+        【v1.6.16】用户反馈「打开过一次就再也打不开」。根因不在我们没弹窗，而在
+        判定条件错了：pywebview 把窗口关掉之后**不会**把 `window.gui` 置空，而
+        `Window.show()` 的实现是 `BrowserView.instances.get(uid)` —— 拿不到实例就
+        静默 return，既不抛异常也不弹窗。旧代码正是「判 gui 非空 → show() → 返回 ok」
+        这个组合，于是窗口早已销毁时照样报成功，界面上什么都没有。
+
+        真正会在关闭时被移除的是 `webview.windows` 这个公开列表（销毁时
+        `windows.remove(window)`），所以只有它够格当存活判据。
+        """
+        w = self.login_window
+        if w is None:
+            return False
+        try:
+            import webview
+            return w in webview.windows
+        except Exception:
+            # 取不到列表时退回保守判断：有 gui 就当活着
+            return getattr(w, "gui", None) is not None
+
+    def _skip_bridge_inject_for_login_window(self):
+        """让内置登录窗**不做** pywebview 的 JS 桥注入。
+
+        【v1.6.18】登录页是 `weibo.com/login.php`，而注入线程的就绪条件是
+        「readyState==complete **且** href 含 `index.html`」——对它永不成立，
+        于是线程空转 60×0.5s = 30 秒，其间要打 ~120 次跨线程 `evaluate_js`
+        （每次都要 `Invoke` 到 GUI 线程）。这段时间正好是用户输账号密码的时间，
+        登录窗会明显发沉；而且登录窗根本不需要桥（建窗时没传 js_api）。
+        这里在**建窗之前**给平台类的 `_schedule_inject` 套一层：只对
+        「child_ 开头的子窗 + URL 是微博」直接返回，其它窗口一律走原逻辑。
+        任何一环取不到（换了 pywebview 版本 / 非 edgechromium 后端）就静默放弃，
+        退回官方行为，不影响功能。
+        """
+        try:
+            from webview.platforms import edgechromium as _ec
+        except Exception:
+            return
+        _cls = getattr(_ec, "EdgeChrome", None)
+        _orig = getattr(_cls, "_schedule_inject", None) if _cls else None
+        if _orig is None or getattr(_orig, "_wbb_skip", False):
+            return
+
+        def _patched(self):
+            try:
+                cur = str(getattr(self, "url", "") or "")
+                uid = str(getattr(getattr(self, "pywebview_window", None),
+                                  "uid", "") or "")
+            except Exception:
+                cur = uid = ""
+            if uid.startswith("child_") and ("weibo.com" in cur or "weibo.cn" in cur):
+                try:
+                    diag("LOGIN_WIN", "inject_skipped url=%s" % cur[:80])
+                except Exception:
+                    pass
+                return
+            return _orig(self)
+
+        _patched._wbb_skip = True
+        try:
+            _cls._schedule_inject = _patched
+        except Exception:
+            pass
+        # 【v1.6.18】同时给 `_inj.log` 降噪：补丁里每次 `evaluate_js` 成功且脚本
+        # >1000 字符就记一行 `evaluate_js OK len=…`，主窗几秒一次，
+        # 39 天攒到 13.7 万行 / 7.1MB（占该文件 95%）。这里只丢掉这一类，
+        # INJECT_* / GENJS_* / VERIFY* / TIMEOUT / PROCESS_FAILED 全部保留 ——
+        # 排查注入问题时真正要看的就是那几条。
+        try:
+            _orig_log = getattr(_ec, "_injlog", None)
+            if _orig_log is not None and not getattr(_orig_log, "_wbb_quiet", False):
+                def _quiet(msg, _f=_orig_log):
+                    try:
+                        if str(msg).startswith("evaluate_js OK"):
+                            return
+                    except Exception:
+                        pass
+                    return _f(msg)
+
+                _quiet._wbb_quiet = True
+                _ec._injlog = _quiet
+        except Exception:
+            pass
+
     def open_login_browser(self):
         """内置浏览器登录：打开独立窗口加载微博登录页。"""
         import webview
@@ -1831,21 +1949,104 @@ class Api:
             webview.settings['OPEN_EXTERNAL_LINKS_IN_BROWSER'] = False
         except Exception:
             pass
-        if self.login_window is not None and self.login_window.gui is not None:
+        # 【v1.6.18】登录窗不需要桥，别让注入线程在那空转 30 秒（见方法注释）。
+        self._skip_bridge_inject_for_login_window()
+        # 【v1.6.16】窗口还活着就显示到前台；已经关掉就重建一个。
+        alive = self._login_window_alive()
+        # 留痕：下次用户再说「打不开」，直接看这行就能知道走的是 show 还是 recreate。
+        diag("LOGIN_WIN", "action=%s alive=%s" % ("show" if alive else "recreate", alive))
+        if alive:
             try:
                 self.login_window.show()
-                return {"ok": True}
+                # show() 在部分后端不会把窗口提到最前，用户会以为「点了没反应」。
+                # 这里先 restore 再置顶一瞬，随后立刻取消置顶，避免一直压着主窗口。
+                try:
+                    self.login_window.restore()
+                except Exception:
+                    pass
+                try:
+                    self.login_window.on_top = True
+                    # 注意：本模块只 `import threading as _thr`（见文件头），
+                    # 写 `threading.Timer` 会编译通过、运行才 NameError（windowed exe 里静默）。
+                    _thr.Timer(0.6, self._login_untop).start()
+                except Exception:
+                    pass
+                return {"ok": True, "message": "已切回内置浏览器窗口"}
             except Exception:
-                pass
+                # 显示失败 → 当作已死，走重建
+                self.login_window = None
+        self.login_window = None
         try:
-            self.login_window = webview.create_window(
+            w = webview.create_window(
                 "微博登录 - 请在窗口内登录",
                 url="https://weibo.com/login.php",
                 width=1000, height=720,
             )
+            self.login_window = w
+            # 关窗即清引用：下次点击必然走「重建」，而不是对死窗口 show()。
+            try:
+                w.events.closed += self._on_login_window_closed
+            except Exception:
+                pass
             return {"ok": True, "message": "已打开内置浏览器，登录后点击『获取Cookie』"}
         except Exception as e:
+            self.login_window = None
             return {"ok": False, "error": str(e)}
+
+    def _login_untop(self):
+        try:
+            if self.login_window is not None and self._login_window_alive():
+                self.login_window.on_top = False
+        except Exception:
+            pass
+
+    def _on_login_window_closed(self):
+        """用户点 X 关掉登录窗时清掉引用（GUI 线程回调，只做赋值，够安全）。"""
+        self.login_window = None
+
+    def _read_login_cookies(self):
+        """从内置登录窗读 Cookie，**绕开** pywebview 的 `loaded` 事件等待。
+
+        返回 `{"ok": True, "cookies": [...], "path": "direct", "cost_ms": N}`
+        或   `{"ok": False, "error": "..."}`。
+
+        【v1.6.18】修「点『获取Cookie』要等很久 → 弹 Main window failed to start
+        → 必须点第二次才成功」。
+        根因链：
+          1. `Window.get_cookies()` 挂着 `@_loaded_call`，实现是
+             `if not loaded.wait(20): raise WebViewException('Main window failed to start')`；
+          2. `loaded` 只在 `generate_js_object()`（桥注入完成）时被 set 一次；
+          3. 注入线程的等待条件是「`document.readyState == complete` **且** href 含
+             `index.html`」，而内置登录窗加载的是 `weibo.com/login.php` —— 条件永不成立，
+             线程要空转 60×0.5s = **30 秒**才走到注入那一步；
+          4. 于是窗口刚打开那 30 秒内点『获取Cookie』，必然先白等 20 秒再抛异常；
+             等注入终于跑完（loaded 已 set）再点就成功 —— 正是「得点第二次」。
+        `Window.get_cookies()` 的实现只有一行 `self.gui.get_cookies(self.uid)`，
+        平台层的 `get_cookies(uid)` 既不查 `loaded` 也没有超时，
+        所以直接走平台层即可（`winforms.get_cookies` → `BrowserView.get_cookies`）。
+        """
+        w = self.login_window
+        gui = getattr(w, "gui", None)
+        uid = getattr(w, "uid", None)
+        t0 = time.time()
+        if gui is not None and uid is not None:
+            try:
+                cookies = gui.get_cookies(uid) or []
+                return {"ok": True, "cookies": list(cookies),
+                        "path": "direct", "cost_ms": int((time.time() - t0) * 1000)}
+            except Exception as e:
+                # WebView2 还没就绪（CoreWebView2 为 None）会走到这里。
+                # 不能就此回退到带 20 秒等待的官方接口，先记下来再决定。
+                diag("WV_COOKIE_READ", "path=direct FAILED %r" % (e,))
+        # 平台层拿不到（gui 未就绪 / 后端不支持 get_cookies）→ 退回官方接口。
+        # 此时若 loaded 未 set，最坏仍会等 20 秒，但至少是「有路可走」而不是直接失败。
+        try:
+            cookies = w.get_cookies() or []
+            return {"ok": True, "cookies": list(cookies),
+                    "path": "fallback", "cost_ms": int((time.time() - t0) * 1000)}
+        except Exception as e:
+            return {"ok": False,
+                    "error": f"读取 Cookie 失败（内置浏览器可能还在加载，请稍等 2 秒再点一次）：{e}"}
 
     def capture_login_cookies(self):
         """从内置登录窗口读取 Cookie。
@@ -1861,14 +2062,22 @@ class Api:
         添加账户时按域落库。
         """
         import webview
-        if self.login_window is None:
-            return {"ok": False, "error": "请先打开内置浏览器并完成登录"}
-        try:
-            cookies = self.login_window.get_cookies()
-        except Exception as e:
-            return {"ok": False, "error": f"读取 Cookie 失败：{e}"}
+        # 【v1.6.16】不能只判引用是否为空：窗口被关掉后引用还在，
+        # 于是这里会去一个死窗口上 get_cookies()，报「读取 Cookie 失败」。
+        if not self._login_window_alive():
+            return {"ok": False, "error": "内置浏览器窗口已关闭，请重新点击『内置浏览器登录』"}
+        # 【v1.6.18】不再调 self.login_window.get_cookies()（挂 @_loaded_call，
+        # 登录页那 30 秒里必然先白等 20 秒再抛 Main window failed to start）。
+        _r = self._read_login_cookies()
+        if not _r.get("ok"):
+            diag("WV_COOKIE_READ", "path=%s FAILED" % _r.get("path", "?"))
+            return {"ok": False, "error": _r.get("error")}
+        cookies = _r["cookies"]
+        # 留痕：下次再有人反馈「取不到 Cookie」，看这行就知道走的哪条路、耗时多少。
+        diag("WV_COOKIE_READ", "path=%s cost=%dms n=%d"
+             % (_r.get("path"), _r.get("cost_ms", -1), len(cookies)))
         if not cookies:
-            return {"ok": False, "error": "未读取到 Cookie，请确认已登录"}
+            return {"ok": False, "error": "未读取到 Cookie，请确认已登录后再点『获取Cookie』"}
 
         entries = []
         parts = []
@@ -1920,9 +2129,13 @@ class Api:
                 "logged_in": logged}
 
     def close_login_browser(self):
-        if self.login_window is not None:
+        # 【v1.6.16】必须把引用清掉。旧实现只 destroy 不清引用，下次 open 会拿到
+        # 一个已销毁的对象去 show()，而 show() 是静默 no-op —— 这就是「打不开」。
+        w = self.login_window
+        self.login_window = None
+        if w is not None:
             try:
-                self.login_window.destroy()
+                w.destroy()
             except Exception:
                 pass
         return {"ok": True}

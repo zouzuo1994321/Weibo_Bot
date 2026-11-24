@@ -8,6 +8,7 @@ import html
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime
 from urllib.parse import quote
@@ -117,6 +118,33 @@ def _looks_risk_control(status: int, text: str = "") -> bool:
         return True
     t = (text or "")[:800]
     return ("验证码" in t) or ("访问过于频繁" in t) or ("请求过于频繁" in t)
+
+
+def _homepage_is_wall(r) -> bool:
+    """判断「打开 weibo.com 首页」这一次访问是否落到了登录墙。
+
+    【v1.6.15】为什么不能直接用 `_looks_not_login()`：
+    它的特征词里含 `passport` / `login.php`，而新版首页是一个 7KB 的 JS 外壳，
+    内联配置里就带着 passport 的 SSO 地址 —— 于是**一份完全正常的登录态首页**
+    会被判成登录墙。这个误判同时打死了两条链路：
+      · `get_self_uid()` 提前返回空 uid → 同源实测永远跑不了（D3）；
+      · `warm_session()` 提前返回「已失效」→ 滑动续期根本没做（7 天到期的真凶之一）。
+
+    正确口径：URL 类特征（login / passport / sso）应该在**最终落地 URL** 上匹配，
+    而不是在页面正文里做子串匹配；正文只认真正的人话提示。
+    """
+    try:
+        final = (getattr(r, "url", "") or "").lower()
+    except Exception:
+        final = ""
+    if any(k in final for k in ("login.php", "/login", "passport", "sso/")):
+        return True
+    status = getattr(r, "status_code", 0)
+    if status in (302, 401):
+        return True
+    text = (getattr(r, "text", "") or "")[:3000]
+    return any(m in text for m in ("通行证", "安全验证", "请登录", "重新登录",
+                                   "Í¨ÐÐÖ¤"))
 
 
 # ---------------------------------------------------------------------------
@@ -541,9 +569,126 @@ def _ensure_ca_bundle():
         debug(f"CA 证书包自愈异常：{e}", CAT_HTTP)
 
 
+# ---------------------------------------------------------------------------
+# 全局请求节流（v1.6.14 · D2）
+#
+# 只节流「微博自己的接口」，图床（sinaimg / sinajs / t.cn）与其它域名一律放行 ——
+# 图片下载是另一条链，拖慢它没有收益，反而让媒体库更新变慢。
+#
+# 命中风控后整条链路冷却：这不是「这一个请求失败了」，而是「这份 Cookie + 这个 IP
+# 正在被打」。继续请求只会延长冷却期，所以冷却期内的请求一律先等。
+# ---------------------------------------------------------------------------
+_THROTTLE_LOCK = threading.Lock()
+_THROTTLE = {
+    "interval": 0.45,      # 相邻两个微博请求的最小间隔（≈2.2 QPS，远低于旧版瞬时并发）
+    "next_at": 0.0,        # 下一个可用时刻
+    "paused_until": 0.0,   # 风控冷却截止时刻
+    "pauses": 0,           # 本次运行累计冷却次数（供日志观察）
+    "waits": 0,            # 累计被节流拦下的请求数
+}
+_THROTTLE_HOSTS = ("weibo.com", "weibo.cn", "sina.com.cn")
+_THROTTLE_SKIP = ("sinaimg.cn", "sinajs.cn", "t.cn", "weibocdn.com")
+_THROTTLE_MAX_WAIT = 30.0     # 单次最多等 30s，避免极端情况下线程假死
+
+
+def throttle_pause(seconds: float = 90.0):
+    """命中风控后对全局节流器下达冷却令。
+
+    【v1.6.18】同一波并发命中只记一条日志。
+    旧版只要本次的截止时刻比上一次晚（并发请求相差几毫秒就会晚），就再记一条，
+    于是一次风控能在同一秒刷出 6 行「全局请求冷却」（11-23 22:18:49 实测）。
+    现在只有**把冷却窗口实质延长 5 秒以上**才算新的一次。
+    """
+    with _THROTTLE_LOCK:
+        until = time.time() + max(1.0, float(seconds))
+        prev = _THROTTLE["paused_until"]
+        if until > prev:
+            _THROTTLE["paused_until"] = until
+        _should_log = until > prev + 5.0
+        if _should_log:
+            _THROTTLE["pauses"] += 1
+    if _should_log:
+        warn(f"命中微博风控 · 全局请求冷却 {seconds:.0f}s"
+             f"（累计 {_THROTTLE['pauses']} 次）", CAT_HTTP)
+
+
+def throttle_stats() -> dict:
+    """当前节流器状态（供诊断 / 状态栏展示，不暴露任何 Cookie）。"""
+    with _THROTTLE_LOCK:
+        now = time.time()
+        return {"interval": _THROTTLE["interval"],
+                "pauses": _THROTTLE["pauses"],
+                "waits": _THROTTLE["waits"],
+                "cooling": max(0.0, _THROTTLE["paused_until"] - now)}
+
+
+def _throttle_acquire(url: str = ""):
+    """按令牌桶排队；风控冷却期内先等冷却结束。"""
+    u = (url or "").lower()
+    if not u or any(s in u for s in _THROTTLE_SKIP):
+        return
+    if not any(h in u for h in _THROTTLE_HOSTS):
+        return
+    with _THROTTLE_LOCK:
+        now = time.time()
+        start = max(now, _THROTTLE["next_at"], _THROTTLE["paused_until"])
+        wait = start - now
+        _THROTTLE["next_at"] = start + _THROTTLE["interval"]
+        if wait > 0.01:
+            _THROTTLE["waits"] += 1
+    if wait > 0:
+        time.sleep(min(wait, _THROTTLE_MAX_WAIT))
+
+
+def _is_api_url(url: str) -> bool:
+    """该 URL 是否属于「微博自己的接口」（值得因为风控码而全局冷却）。
+
+    【v1.6.18】图床必须排除在外。旧版只看状态码：一张图片回 403（防盗链 / 图已删除）
+    就会触发 90 秒**全局**冷却，把轮询、保活、账户检测全部拖住 —— 这是在给一个
+    与账号无关的图片错误付整条链路的代价。11-23 22:18:49 实测：一张图 403 →
+    6 行冷却日志 → 媒体扫描与轮询同时停摆 90 秒。
+    """
+    u = (url or "").lower()
+    if not u or any(s in u for s in _THROTTLE_SKIP):
+        return False
+    return any(h in u for h in _THROTTLE_HOSTS)
+
+
+class _ThrottledAdapter(requests.adapters.HTTPAdapter):
+    """带全局限速 + 风控冷却的 HTTPAdapter。"""
+
+    def send(self, request, **kwargs):
+        url = getattr(request, "url", "") or ""
+        _throttle_acquire(url)
+        resp = super().send(request, **kwargs)
+        try:
+            # 只对微博接口的风控码冷却；图床 403（防盗链/图已删）不算账号被风控
+            if getattr(resp, "status_code", 0) in _RISK_STATUS and _is_api_url(url):
+                throttle_pause(90.0)
+        except Exception:
+            pass
+        return resp
+
+
 def _session(cookie: str, referer: str = None, mobile: bool = False) -> requests.Session:
     _ensure_ca_bundle()
     s = requests.Session()
+    # 【v1.6.14 · D2】所有微博请求共享同一个限速器。
+    #
+    # 报告里最刺眼的一组数据：媒体扫描与轮询在 11 个分钟里同时开火，紧接着出现大批
+    # HTTP 432。两条流水线各按各的排程、共用同一份 Cookie 和同一个出口 IP，
+    # 142 个监控对象 × 每个 3~6 个接口 —— 是软件自己把自己打成了风控，
+    # 然后又被 D1 误报成「Cookie 失效」。用户在界面上看到的「到期了」，
+    # 其实源头在这里。
+    #
+    # 做法：给 Session 换成带令牌桶的 adapter。这样轮询 / 检测 / 保活 / 媒体扫描
+    # **不需要各自记得去限速**，只要走 _session 就自动排队 —— 一处收口，永不复犯。
+    try:
+        _ad = _ThrottledAdapter()
+        s.mount("https://", _ad)
+        s.mount("http://", _ad)
+    except Exception:
+        pass
     if referer is None:
         referer = f"{M_BASE}/" if mobile else f"{WEB_BASE}/"
     s.headers.update({
@@ -978,12 +1123,17 @@ def warm_session(cookie: str, uid: str = "", entries=None) -> dict:
             return {"ok": False, "cookie": cookie, "entries": rows,
                     "status": "risk_control",
                     "error": f"会话预热被风控拦截（HTTP {r.status_code}）"}
-        if _looks_not_login(r.status_code, r.text):
+        # 【v1.6.15】登录墙判定改用「最终落地 URL」口径（见 _homepage_is_wall）。
+        # 旧实现用页面文本特征，`passport` / `login.php` 在新版首页外壳里就有，
+        # 于是正常登录态也会被判成失效 → 这里提前 return，**续期动作根本没执行**
+        # → Set-Cookie 拿不到 → 滑动续期从未真正发生。这正是「用着用着刚好 7 天掉线」。
+        if _homepage_is_wall(r):
             return {"ok": False, "cookie": cookie, "entries": rows,
                     "status": "cookie_expired",
-                    "error": "会话预热落到登录页，Cookie 已失效"}
+                    "error": f"会话预热落到登录页（落地 {(getattr(r, 'url', '') or '')[:80]}）"}
         rows, changed = merge_cookie_entries(rows, s)
         renewed = entries_to_cookie(rows) if changed else cookie
+        # 【v1.6.15】每次预热都留一行续期结果，便于回答「7 天到底续没续」
         if renewed != cookie:
             debug(f"会话预热完成 · Cookie 已续期（{url}）", CAT_HTTP)
         return {"ok": True, "cookie": renewed, "entries": rows, "status": "ok",
@@ -1122,10 +1272,15 @@ def probe_login_web(cookie: str, uid: str = "") -> dict:
     """
     if not cookie:
         return {"ok": False, "login": None, "status": "expired",
-                "detail": "Cookie 为空"}
+                "detail": "Cookie 为空", "uid": ""}
     if not uid:
+        # 【v1.6.14 · D3】这里**故意**不自己去首页解析 uid。
+        # 本函数是「判定类探针」，契约是：拿不到同源证据就一律 login=None、不写库。
+        # 若它自己偷偷发一次首页请求，就同时违反了「判定链路同源」与「探针不产生额外副作用」
+        # 两条规矩（离线环境下还会白等一次超时）。uid 的补解析交给调用方
+        # ——调度器 keepalive_all 与 check_login 都已在缺 uid 时先调 get_self_uid。
         return {"ok": False, "login": None, "status": "unknown",
-                "detail": "缺少 uid，无法做同源实测"}
+                "detail": "缺少 uid，无法做同源实测", "uid": ""}
     try:
         s = _session(cookie, referer=f"{WEB_BASE}/u/{uid}")
         s.headers.update({
@@ -1134,23 +1289,24 @@ def probe_login_web(cookie: str, uid: str = "") -> dict:
         })
         r = s.get(f"{WEB_BASE}/ajax/profile/info", params={"uid": uid}, timeout=12)
         if _looks_risk_control(r.status_code, r.text):
-            return {"ok": False, "login": None, "status": "risk_control",
+            return {"ok": False, "login": None, "status": "risk_control", "uid": uid,
                     "detail": f"同源实测被风控拦截（HTTP {r.status_code}）"}
         j = _safe_json(r)
         ok_flag = j.get("ok") if isinstance(j, dict) else None
         debug(f"同源实测 uid={uid} · HTTP {r.status_code} · ok={ok_flag} · "
               f"body={(r.text or '')[:160]!r}", CAT_HTTP)
         if _looks_not_login(r.status_code, r.text, j):
-            return {"ok": True, "login": False, "status": "expired",
+            return {"ok": True, "login": False, "status": "expired", "uid": uid,
                     "detail": f"同源接口判定未登录（HTTP {r.status_code} · ok={ok_flag}）"}
         u = _find_user_obj(j.get("data") if isinstance(j, dict) else None)
         if u:
-            return {"ok": True, "login": True, "status": "valid",
+            return {"ok": True, "login": True, "status": "valid", "uid": uid,
+                    "screen_name": (u.get("screen_name") or u.get("name") or ""),
                     "detail": "同源接口确认登录态有效"}
-        return {"ok": False, "login": None, "status": "unknown",
+        return {"ok": False, "login": None, "status": "unknown", "uid": uid,
                 "detail": f"同源接口未返回用户对象（HTTP {r.status_code} · ok={ok_flag}）"}
     except Exception as e:
-        return {"ok": False, "login": None, "status": "network_error",
+        return {"ok": False, "login": None, "status": "network_error", "uid": uid,
                 "detail": f"同源实测异常：{e}"}
 
 
@@ -1204,12 +1360,37 @@ def keepalive(cookie: str, entries=None) -> dict:
 
 # 从 weibo.com 首页内联配置中提取「当前登录账户自己的 UID」的常见写法。
 # 顺序按特异性从强到弱，避免误取到信息流里别人的 uid。
+#
+# 【v1.6.14 · D3】补两条通用写法 —— 这是「Cookie 7 天到期」整条链路上最要命的一环：
+# 微博改版后首页已没有 `$CONFIG['uid']=` 这类老写法，只剩 Vue 初始状态里的
+# `"uid":"5189652182"`。旧的四条 pattern 全线失配 → get_self_uid() 返回空
+# → 同源实测 /ajax/profile/info 缺 uid（该接口强制要求）→ 每次都「跳过实测，不写库」
+# → 账户只能退回跨域信号判定 → 网页端明明能用却显示已失效。
+# 用户导出的 CookieMonitor 报告里，336 次「登录态实测」**无一例外**都是这个原因。
+# 报告同时证明了：用 `"uid":<数字>` 就能从同一份首页 HTML 里稳定挖出正确 uid
+# （与同源接口返回的 data.user.id 完全一致），所以这里把它正式收进候选。
 _SELF_UID_PATTERNS = (
     r"\$CONFIG\s*\[\s*['\"]uid['\"]\s*\]\s*=\s*['\"]?(\d{5,})",
     r"CONFIG\s*\.\s*uid\s*=\s*['\"]?(\d{5,})",
     r"['\"]uid['\"]\s*:\s*['\"]?(\d{5,})['\"]?\s*,\s*['\"]nick['\"]",
     r"\$CONFIG\s*\[\s*['\"]oid['\"]\s*\]\s*=\s*['\"]?(\d{5,})",
+    # 通用 JSON / JS 对象写法：{"uid":"5189652182", ...}
+    r"['\"]uid['\"]\s*:\s*['\"]?(\d{5,})",
+    # URL 参数 / 简单赋值：?uid=5189652182 或 uid = '5189652182'
+    r"\buid\s*[=:]\s*['\"]?(\d{5,})",
 )
+
+
+def _diag_uid(msg: str):
+    """把 uid 解析结果写进 diag.log（排障时与版本、启动信息同文件，最好找）。
+
+    diag_log 是纯标准库模块，不会与 weibo_client 形成循环导入。
+    """
+    try:
+        from diag_log import diag
+        diag("UID_PARSE", msg)
+    except Exception:
+        pass
 
 
 def get_self_uid(cookie: str):
@@ -1218,6 +1399,16 @@ def get_self_uid(cookie: str):
     背景：微博已把 `/ajax/profile/info` 改为**强制要求 uid 参数** —— 不带 uid 会直接返回
     HTTP 400 `{"ok":0,"message":"缺少必要参数"}`（2026-09-14 日志实测）。而账户自身的
     UID 无法从 Cookie 里读出（SUB 是加密串），因此只能从网页端首页的内联 JS 配置里取。
+
+    【v1.6.15 · D3 第二根因】判定顺序必须「先解析、后判登录墙」。
+    旧顺序先用 `_looks_not_login()` 扫页面文本，而它的特征词里有 `passport` /
+    `login.php` —— 新版 weibo.com 首页是个 7KB 的 JS 外壳，内联配置里就带着
+    passport 的 SSO 地址。于是一份**完全正常**的登录态首页被判成「登录墙」，
+    函数在跑正则之前就返回了空 uid。
+    结果就是 v1.6.14 补了新正则也没用：uid 依然是空 → 同源实测依然跳过。
+    用户 11-21 的报告正是这个形态（336 次跳过照旧）。
+    现在改成：能从页面里读出「自己的 uid」本身就是已登录的强证据，
+    先取 uid；取不到再退回「最终落地 URL / 登录墙特征」判断原因。
 
     返回 (uid, 续期后的 cookie)；取不到时 uid 为空串。
     """
@@ -1230,18 +1421,33 @@ def get_self_uid(cookie: str):
         })
         r = s.get(f"{WEB_BASE}/", timeout=15)
         renewed = _merge_cookies(cookie, s)
-        if _looks_not_login(r.status_code, r.text):
-            return "", renewed
         text = r.text or ""
-        for pat in _SELF_UID_PATTERNS:
+        # —— 第一步：先解析 uid（成功即为已登录，无需再看登录墙）——
+        for i, pat in enumerate(_SELF_UID_PATTERNS):
             m = re.search(pat, text)
             if m:
-                debug(f"从首页解析到账户自身 UID={m.group(1)}", CAT_HTTP)
+                debug(f"从首页解析到账户自身 UID={m.group(1)}（规则 #{i + 1}）", CAT_HTTP)
+                _diag_uid(f"ok uid={m.group(1)} rule=#{i + 1} "
+                          f"http={r.status_code} bytes={len(text)}")
                 return m.group(1), renewed
-        debug("首页未解析到账户自身 UID（页面结构可能已变化）", CAT_HTTP)
+        # —— 第二步：解析不到时才判断「为什么解析不到」——
+        #       优先看最终落地 URL（被踢到登录页最直观），再看文本特征。
+        final = (getattr(r, "url", "") or "").lower()
+        is_wall = _homepage_is_wall(r)
+        has_uid_word = '"uid"' in text or "uid=" in text
+        # 【v1.6.14】失败时留下「可证伪」的现场，供下一次排障直接定位：
+        # 页面里到底有没有 uid 字样？是登录墙？还是微博又改了页面结构？
+        # 只记长度与布尔量，绝不落 Cookie / 页面正文。
+        debug(f"首页未解析到账户自身 UID（页面结构可能已变化）· "
+              f"HTTP {r.status_code} · 页面 {len(text)} 字节 · 含 uid 字样={has_uid_word} · "
+              f"落地={final[:80]} · 判登录墙={is_wall}",
+              CAT_HTTP)
+        _diag_uid(f"fail http={r.status_code} bytes={len(text)} "
+                  f"has_uid={has_uid_word} final={(final or '?')[:60]} wall={is_wall}")
         return "", renewed
     except Exception as e:
         debug(f"解析账户自身 UID 失败：{e}", CAT_HTTP)
+        _diag_uid(f"error {e}")
         return "", cookie
 
 
@@ -1380,7 +1586,13 @@ def get_latest_posts(uid: str, cookie: str, page: int = 1, count: int = 10) -> d
         return res
 
     # 首次全败：若疑似会话过期 / 风控，先预热续期再重试一次
-    if flags:
+    #
+    # 【v1.6.14 · D1b】风控时不再整套重试。
+    # 旧逻辑「只要 flags 非空就 warm_session + 重试一轮」意味着：3 个接口 × 2 轮
+    # + 1 次预热 GET = 单次轮询最多 7 个请求。被限流时这等于把油门踩到底 ——
+    # 微博的 432 是**按 Cookie/IP 的令牌桶**，失败后加倍请求只会让冷却期越长。
+    # 报告里「11 个媒体扫描与轮询重叠分钟」后面紧跟着大批 432，正是这个形态。
+    if flags and "risk" not in flags:
         w = warm_session(cookie, uid)
         if w.get("ok") and w.get("cookie") and w["cookie"] != cookie:
             debug(f"会话预热后重试抓取 uid={uid} · 失败标记={sorted(flags)}", CAT_HTTP)
@@ -1392,14 +1604,22 @@ def get_latest_posts(uid: str, cookie: str, page: int = 1, count: int = 10) -> d
                 return res2
             errs = errs + errs2
             flags |= flags2
+    elif "risk" in flags:
+        debug(f"命中风控，跳过预热重试以避免加剧限流 uid={uid}", CAT_HTTP)
 
     # 分类失败原因，给出可操作结论
-    if "not_login" in flags:
-        status = "cookie_expired"
-        reason = "Cookie 登录态已失效（微博要求重新登录）"
-    elif "risk" in flags:
+    #
+    # 【v1.6.14 · D1】风控必须**先于**未登录判定。
+    # 微博在限流/风控状态下，网页端接口会返回 HTTP 200 但 body 里 ok=-100，与
+    # 「真的未登录」在字符层面完全一样。旧顺序先判 not_login，于是每一次限流都被
+    # 稳定地报成「Cookie 登录态已失效」，用户看到的就是「明明能用却说到期了」。
+    # 因果是单向的：风控能解释未登录，未登录解释不了 HTTP 432。
+    if "risk" in flags:
         status = "risk_control"
         reason = "被微博风控拦截（HTTP 432/418/403），请降低轮询频率后重试"
+    elif "not_login" in flags:
+        status = "cookie_expired"
+        reason = "Cookie 登录态未通过（三种接口均返回未登录）"
     elif "network" in flags:
         status = "network_error"
         reason = "网络异常或接口超时"
@@ -1408,8 +1628,17 @@ def get_latest_posts(uid: str, cookie: str, page: int = 1, count: int = 10) -> d
         reason = "未获取到微博数据（该用户可能暂无公开微博）"
 
     _err = "; ".join(errs) or "拉取失败"
-    warn(f"拉取微博失败 uid={uid} page={page} · 判定={status} · 已尝试 3 种接口 · "
-         f"原因：{_err}", CAT_HTTP)
+    # 【v1.6.17】「接口正常、但这半年没有公开微博」不是故障，不能记 WARN。
+    # 一色雨（uid=6872830640）就是这种账号：资料页写着 297 条微博，但最新一条停在
+    # 2025-08-19；mymblog 按可见窗口返回空 list（HTTP 200 / ok=1 / list=[]）。
+    # 旧版把它记成「拉取微博失败」，两天刷了 142 行、占全部 HTTP 告警的 98%，
+    # 真正的故障会被淹掉。这里降为 debug，由 run_once 每轮汇总一行。
+    if status == "empty":
+        debug(f"对象无近期内容 uid={uid} page={page} · 判定=empty（接口正常）· {_err}",
+              CAT_HTTP)
+    else:
+        warn(f"拉取微博失败 uid={uid} page={page} · 判定={status} · 已尝试 3 种接口 · "
+             f"原因：{_err}", CAT_HTTP)
     return {"ok": False, "status": status, "reason": reason,
             "error": f"{reason}（{_err}）", "posts": []}
 
@@ -1869,7 +2098,37 @@ def diagnose_account(cookie: str, probe_uid: str = "", self_uid: str = "") -> di
             if st != "empty":
                 result["status"] = st
                 if st == "cookie_expired":
-                    result["message"] = ("抓取被要求重新登录 · Cookie 已失效，"
+                    # 【v1.6.14 · D1c】抓取说「未登录」不等于 Cookie 真失效，必须同源复核。
+                    #
+                    # 报告里的硬证据：2026-11-20 18:33:27 判定 cookie_expired，
+                    # 18:45:22 **同一份 Cookie** 又抓取成功 —— Cookie 没变、人也登录着，
+                    # 变的只是这十几分钟的限流状态。单次抓取失败是瞬时现象，
+                    # 而「登录态失效」是一个持续状态，用一次瞬时观测去断言持续状态必然误报。
+                    #
+                    # 现在：抓取报未登录 → 再用同源 /ajax/profile/info 复核一次，
+                    # 只有同源也明确说未登录，才允许落 cookie_expired。
+                    chk = check_login(cookie, uid=self_uid or login.get("uid") or "")
+                    if chk.get("login") is True:
+                        result["status"] = "ok"
+                        result["message"] = ("抓取被要求重新登录，但同源接口确认登录态有效"
+                                             "（疑似风控/限流，稍后自动恢复）")
+                        _u2 = chk.get("uid") or ""
+                        if _u2:
+                            result["self_uid"] = _u2
+                        if chk.get("cookie"):
+                            result["renewed_cookie"] = chk["cookie"]
+                        warn(f"抓取判未登录但同源实测有效，降级为可用 · "
+                             f"依据={chk.get('detail', '')}", CAT_HTTP)
+                        return result
+                    if chk.get("login") is None:
+                        # 同源也测不出来 → 没有证据说它失效，绝不能写库
+                        result["status"] = ("risk_control"
+                                            if chk.get("status") == "risk_control"
+                                            else "unknown")
+                        result["message"] = ("抓取失败但同源实测无法确认，暂不判失效"
+                                             f"（{chk.get('detail', '')}）")
+                        return result
+                    result["message"] = ("抓取与同源接口均判未登录 · Cookie 已失效，"
                                          "请在「账户管理」删除该账户后重新登录")
                 elif st == "risk_control":
                     result["message"] = "抓取被微博风控拦截，请降低轮询频率或稍后重试"

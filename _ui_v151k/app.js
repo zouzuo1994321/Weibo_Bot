@@ -590,22 +590,21 @@ function setText(id, v) {
   if (el.textContent !== s) el.textContent = s;
 }
 
-/* ---------------- 本日转发进度环（v1.4.18，v1.4.19 修正） ---------------- */
-/* 「本日转发次数」卡沿外框的高亮进度环：显示当前距离下一次排程转发的剩余进度。
-   调度运行中 → 环从顶部 12 点方向沿卡片四边顺时针生长；
-   到达排程转发时间（progress ≥ 1，即进度 100%）→ 高亮绕满一圈、驻留 3s、
-   再 1.5s 渐隐；next_run 推进（新周期开始）→ 清除完成态重新生长。
-   【v1.4.19】v1.4.18 用 rotate(-90) 想把起点转到顶部，但 rotate 作用在非正方形
-   矩形上会把整个环转出卡片（宽高互换）。现改为手写 <path>：路径起点本身就是
-   顶部中点、顺时针闭合，配合经典 dashoffset 技术天然从 12 点方向生长。
-   【v1.4.20】进度周期的起点/终点修正：起点用上一次轮询真实完成的 last_run，
-   终点用本次排程的实际转发时刻 next_forward_run（含抖动），未排程时回退 next_run。
-   旧逻辑用 next_run - interval 反推起点 + 以 next_run 为终点，会把 12 分钟爬取耗时
-   错算进周期、且把 100% 对齐到「下一次轮询」而非真实转发时刻，表现为「特别慢」。
-   【v1.4.22】满环驻留 10s + 渐隐 1.5s 之后彻底熄灭（连 fwd-active 一起清掉 + 环清空），
-   不再复燃；等新周期（next_run 推进）重新走进度时才重新点亮。 */
-let _fwdPrevNextRun = null;     // 上一帧的 next_run（用于检测新周期开始）
-let _fwdDoneFor = null;         // 已触发满环驻留的 next_run（每个周期只触发一次）
+/* ---------------- 本日转发进度环（v1.6.16 语义重做：一圈 = 一条转发） ---------------- */
+/* 「本日转发次数」卡沿外框的高亮环。**口径由用户定死**：
+     · 确认排程后，从当前时刻走到「预计执行时间」算**一圈**；
+     · 排 4 条就走 4 圈，排 1 条就走 1 圈，一圈跑满 = 一条微博发出去；
+     · 全部发完 → 到下一轮排程之前保持**空闲**（环熄灭）；
+     · 本轮没排到转发（无新微博）→ 同样**空闲**，不许假装有进度。
+
+   【为什么重做】旧实现（v1.4.20 起）把终点取「本轮最早一跳转发 `next_forward_run`」，
+   起点取「本轮抓取完成 `last_run`」—— 而这两者在真机里只差 **3 秒**：
+       02:51:50 本轮抓取完成 → 02:51:53 最早一跳转发
+   于是一圈只有 3 秒；而窗口一旦切到 `next_run` 兜底，一圈又变成 341 秒；抓取耗时
+   超过间隔时窗口整体落在过去，环一亮就满。三种口径混用，实测最长/最短差 **299 倍**，
+   排程发生的那一秒还会先倒退 28.7 个百分点。这就是「流光根本没有规律」。
+   现在只认一组数：`forward_runs`（本轮全部排程时刻，升序）+ `forward_plan_at`（计划起点）。
+   两端都在排程确认的那一刻确定，全程不再切换口径，因此不会跳、不会倒退。 */
 let _fwdPerim = 0;              // 路径周长（像素）
 let _fwdGeom = "";              // 【v1.6.11】上次的几何签名（宽x高），尺寸没变就不重排
 function layoutFwdRing() {
@@ -639,57 +638,46 @@ function layoutFwdRing() {
   prog.style.strokeDasharray = String(_fwdPerim);
 }
 
-function triggerFwdDone() {
-  const card = document.getElementById("statForwards");
-  const prog = document.getElementById("fwdRingProg");
-  if (!card) return;
-  card.classList.add("fwd-active", "fwd-done");
-  card.classList.remove("fwd-fading");
-  if (prog) prog.style.strokeDashoffset = "0";   // 绕满一圈
-  clearTimeout(window._fwdFadeT1);
-  clearTimeout(window._fwdFadeT2);
-  // 【v1.4.20】满环高亮驻留 10s（原 3s）。若驻留期间 next_run 推进（新周期开始），
-  // tickForwardRing 的「新周期检测」会立即清掉高亮并重新生长；否则 10s 满环后再 1.5s 渐隐。
-  window._fwdFadeT1 = setTimeout(() => card.classList.add("fwd-fading"), 10000);   // 高亮驻留 10s
-  window._fwdFadeT2 = setTimeout(() => {
-    // 【v1.4.22】渐隐结束后必须「彻底熄灭」：fwd-active 仍会让环以满环 offset（0）
-    // 重新亮起（fwd-fading 的 opacity:0 一旦移除就复燃）。现连 fwd-active 一起清掉，
-    // 并把环清空回空环状态，直到新周期（next_run 推进）重新走进度时再点亮。
-    // 守卫：若此刻已进入新周期（fwd-done/fwd-fading 已被新周期检测清掉），直接跳过，
-    // 避免误杀新周期正在生长的进度环。
-    if (!card.classList.contains("fwd-done") && !card.classList.contains("fwd-fading")) return;
-    card.classList.remove("fwd-done", "fwd-fading", "fwd-active");
-    if (prog) prog.style.strokeDashoffset = String(_fwdPerim);
-  }, 10000 + 1500);
-}
-
-/* 【v1.6.11】进度环驱动方式重构。
-   旧实现是一个无条件自我续期的 requestAnimationFrame 循环：即使调度未运行、
-   环根本不可见，也照样每帧（60fps）醒来执行一次、并写 strokeDashoffset。
-   SVG 描边的 dashoffset 每变一次都要重新计算整条路径的描边 → 每帧都在重排重绘，
-   这是软件待机时前端最稳定的 CPU/GPU 开销来源。
-
-   现在改为：
-     · **空闲即停**：调度未运行 → 不排下一帧，rAF 循环彻底结束；空闲态的 DOM
-       清理只做一次（_fwdIdleDone 守卫），不再逐帧写样式。
-     · **绘制节流**：运行中也最多 10fps（100ms 一帧）。进度环是分钟级的进度指示，
-       10fps 与 60fps 肉眼无差，描边重算次数直接降到 1/6。
-     · **看门狗兜底**：1s 一次的极轻量检查负责「调度启动时把循环拉起来」，
-       保证停掉之后一定能重新开始，不依赖任何事件时序。 */
+/* 【v1.6.16】一圈跑满 = 一条微博发出去。这里只做一次短促高亮（900ms），
+   不再像旧版那样「满环驻留 10s + 渐隐 1.5s」—— 因为排 4 条就要走 4 圈，
+   每圈之间只隔几十秒，10 秒驻留会把下一圈的开头整段吃掉。 */
 const _FWD_FRAME_MS = 100;      // 进度环最大绘制频率（10fps）
+const _FWD_PULSE_MS = 900;      // 一圈跑满时的高亮时长
 let _fwdRafId = 0;              // 当前 rAF 句柄，0 = 循环已停
 let _fwdLastFrame = 0;          // 上次真正绘制的时刻
 let _fwdIdleDone = false;       // 空闲态 DOM 是否已清理过
+let _fwdPlanKey = null;         // 当前排程计划的标识（换了计划就重置圈序号）
+let _fwdLapIdx = -1;            // 当前处在第几圈（-1 = 还没开始 / 已全部发完）
+let _fwdPulseUntil = 0;         // 本圈高亮截止时刻
+let _fwdAllDoneAt = 0;          // 最后一条的收尾高亮截止时刻
 
+/* 空闲：环熄灭、清掉所有态。这是「未排程」「已全部发完」「调度未运行」三种情况的
+   共同落点 —— 用户要求这三种都必须保持空闲，不许假装有进度。 */
 function _fwdShowIdle() {
   if (_fwdIdleDone) return;     // 已清过，不重复碰 DOM
   const card = document.getElementById("statForwards");
   const prog = document.getElementById("fwdRingProg");
-  if (card) card.classList.remove("fwd-active", "fwd-done", "fwd-fading");
+  if (card) card.classList.remove("fwd-active", "fwd-done");
   if (prog) prog.style.strokeDashoffset = String(_fwdPerim || 0);
-  _fwdPrevNextRun = null;
-  _fwdDoneFor = null;
+  _fwdPlanKey = null;
+  _fwdLapIdx = -1;
+  _fwdPulseUntil = 0;
+  _fwdAllDoneAt = 0;
   _fwdIdleDone = true;
+}
+
+/* 【v1.6.16】把后端给的 forward_runs 归一化成「升序、去重、只留合法秒级时间戳」。
+   脏数据（字符串 / 0 / NaN / 重复）一律丢掉，避免一圈算成 NaN。 */
+function _fwdNormalizeRuns(list) {
+  const out = [];
+  (list || []).forEach(function (v) {
+    const n = Number(v);
+    if (isFinite(n) && n > 1e9) out.push(n);
+  });
+  out.sort(function (a, b) { return a - b; });
+  const uniq = [];
+  out.forEach(function (n) { if (!uniq.length || n !== uniq[uniq.length - 1]) uniq.push(n); });
+  return uniq;
 }
 
 function tickForwardRing(ts) {
@@ -700,7 +688,10 @@ function tickForwardRing(ts) {
   if (!card || !prog) return;
   const sch = (STATE && STATE.scheduler) || {};
   const perim = _fwdPerim || 0;
-  if (!sch.running || !sch.next_run) {
+  const runs = _fwdNormalizeRuns(sch.forward_runs);
+  /* ★ 没有排程计划 = 空闲。注意这里**不**再看 next_run：旧实现用 next_run 兜底，
+     正是「三种口径混用」的来源之一。 */
+  if (!sch.running || !runs.length) {
     _fwdShowIdle();
     return;                                       // ★ 空闲：rAF 循环到此为止
   }
@@ -714,52 +705,81 @@ function tickForwardRing(ts) {
   }
   _fwdLastFrame = nowMs;
 
-  // 【v1.4.20】进度周期修正：
-  //   起点 = 上一次轮询真实完成时刻 last_run（"%Y-%m-%d %H:%M:%S" 字符串）；
-  //   终点 = 本次排程的实际转发时刻 next_forward_run（浮点秒，含抖动），未排程时回退 next_run。
-  //   旧逻辑用 next_run - interval 反推起点，会把 12 分钟爬取耗时错算进周期开头，
-  //   且 100% 对齐到「下一次轮询」而非真实转发时刻，表现为「特别慢」「到点不到 100%」。
-  const intervalMs = (sch.interval_minutes || 30) * 60 * 1000;
-  const endMs = (sch.next_forward_run || sch.next_run) * 1000;
-  let startMs = null;
-  if (sch.last_run) {
-    const t = Date.parse(String(sch.last_run).replace(/-/g, "/"));  // "2026-10-13 22:07:27" → 可解析时间戳
-    if (!isNaN(t)) startMs = t;
+  const now = Date.now();
+  /* 计划标识：换计划（新一轮排程）就重置圈序号，避免拿上一轮的序号比大小 */
+  const planAt = Number(sch.forward_plan_at) || 0;
+  const planKey = planAt + "|" + runs.length + "|" + runs[0];
+  if (planKey !== _fwdPlanKey) {
+    _fwdPlanKey = planKey;
+    _fwdLapIdx = -1;
+    _fwdPulseUntil = 0;
+    _fwdAllDoneAt = 0;
   }
-  if (startMs === null || startMs >= endMs) {
-    startMs = endMs - intervalMs;          // 兜底：无 last_run 或数据异常时退化为整间隔
+
+  /* 找当前圈：第一个「还没到点」的转发。全都到点了 = 这一轮已发完。 */
+  let idx = -1;
+  for (let i = 0; i < runs.length; i++) {
+    if (now < runs[i] * 1000) { idx = i; break; }
   }
-  let progress = (Date.now() - startMs) / (endMs - startMs);
+  if (idx < 0) {
+    /* 【v1.6.16】最后一条也要有「跑满」的收尾，否则最后一圈会停在 97% 直接消失，
+       用户永远看不到「这条发出去了」。给 900ms 满环高亮再回空闲。 */
+    if (_fwdLapIdx >= 0) {
+      _fwdLapIdx = -1;
+      _fwdAllDoneAt = now + _FWD_PULSE_MS;
+    }
+    if (now < _fwdAllDoneAt) {
+      card.classList.add("fwd-active", "fwd-done");
+      prog.style.strokeDashoffset = "0";
+      _fwdRafId = requestAnimationFrame(tickForwardRing);
+      return;
+    }
+    _fwdShowIdle();
+    return;                                       // ★ 全部已发布：空闲等下一轮排程
+  }
+
+  /* 圈区间：第一条从「计划起点」算起，之后每条都从「上一条的发布时间」算起。
+     这样 4 条排程 = 首尾相接的 4 圈，每圈刚好在对应那条微博发出时跑满。 */
+  const lapStart = (idx === 0
+    ? (planAt ? planAt * 1000 : runs[0] * 1000 - 1000)
+    : runs[idx - 1] * 1000);
+  const lapEnd = runs[idx] * 1000;
+  const dur = lapEnd - lapStart;
+  let progress = dur > 300 ? (now - lapStart) / dur : 1;
+  if (!isFinite(progress)) progress = 1;
   if (progress < 0) progress = 0;
   if (progress > 1) progress = 1;
-  // 新周期开始（next_run 推进）→ 清除上一周期的完成态，进度环重新生长
-  if (_fwdPrevNextRun !== null && sch.next_run !== _fwdPrevNextRun) {
-    card.classList.remove("fwd-done", "fwd-fading");
-    _fwdDoneFor = null;
-  }
-  _fwdPrevNextRun = sch.next_run;
-  // 【v1.4.19】到达排程转发时间（进度 100%）即触发「满环 + 驻留 3s + 渐隐」，
-  // 不再等 next_run 推进；每个周期（同一 next_run）只触发一次。
-  if (progress >= 1 && _fwdDoneFor !== sch.next_run) {
-    _fwdDoneFor = sch.next_run;
-    triggerFwdDone();
-  }
-  // 满环驻留 / 渐隐期间保持满环不重绘；渐隐结束后本周期已消费，不再重新点亮
-  if (_fwdDoneFor !== sch.next_run) {
-    card.classList.add("fwd-active");
+
+  /* 圈序号前进 = 上一条刚发出去 → 给 900ms 高亮（这就是「一条发布」的可见反馈） */
+  if (_fwdLapIdx >= 0 && idx > _fwdLapIdx) _fwdPulseUntil = now + _FWD_PULSE_MS;
+  _fwdLapIdx = idx;
+
+  card.classList.add("fwd-active");
+  if (now < _fwdPulseUntil) {
+    card.classList.add("fwd-done");               // 满环 + 卡片外框高光
+    prog.style.strokeDashoffset = "0";
+  } else {
+    card.classList.remove("fwd-done");
     prog.style.strokeDashoffset = String(perim * (1 - progress));
   }
   _fwdRafId = requestAnimationFrame(tickForwardRing);
 }
 
 /* 【v1.6.11】进度环看门狗：1s 一次，只在「该跑却没跑」时把循环拉起来。
-   由于 rAF 在空闲时会自然结束，必须有这个兜底来响应「点了启动」。 */
+   由于 rAF 在空闲时会自然结束，必须有这个兜底来响应「点启动 / 新排程到达」。 */
 function _fwdRingWatchdog() {
   if (document.hidden) return;                    // 最小化 / 托盘：不驱动
   const card = document.getElementById("statForwards");
   if (!card) return;
   const sch = (STATE && STATE.scheduler) || {};
-  if (!sch.running || !sch.next_run) { _fwdShowIdle(); return; }
+  const runs = _fwdNormalizeRuns(sch.forward_runs);
+  if (!sch.running || !runs.length) { _fwdShowIdle(); return; }
+  /* 计划已经全部跑完（连收尾高亮都过了）→ 维持空闲，不再拉起 rAF。
+     否则每秒都会唤醒一帧去发现「已经没事可做」，白烧 CPU。 */
+  if (Date.now() >= runs[runs.length - 1] * 1000 + _FWD_PULSE_MS) {
+    _fwdShowIdle();
+    return;
+  }
   if (!_fwdRafId) {
     _fwdLastFrame = 0;                            // 重新起跑，不等满 100ms
     _fwdRafId = requestAnimationFrame(tickForwardRing);
@@ -3993,6 +4013,67 @@ function renderAbout() {
    数据内嵌于前端，保证离线可用（本软件为单机离线运行）。
    与 README.md「版本迭代记录」保持同步维护。 */
 const CHANGELOG = [
+  {
+    ver: "v1.6.18", internal: "2611240001", date: "2026-11-24",
+    title: "内置浏览器取 Cookie 不再卡 20 秒再报错、图床 403 不再冻结全局请求、转发失败归类补齐",
+    items: [
+      "【内置浏览器取 Cookie：等很久 + 弹 Main window failed to start + 得点第二次】三个症状同一个根因，而且不在我们的取 Cookie 代码里。pywebview 的读取接口在真正读之前要先等一个「页面已就绪」事件，等不到就抛这句异常；这个事件只在**桥脚本注入完成**时被置一次，而注入线程的等待条件是「页面加载完成 **且** 地址里含 index.html」——内置登录窗打开的是 weibo.com/login.php，这条永远不成立，线程要空转 30 秒才走到注入那一步。于是窗口刚开的那半分钟里点『获取Cookie』，必然先白等 20 秒再抛错；等注入终于跑完再点就成功了，这就是「必须点第二次」。现在直接走平台层读 Cookie（同一份实现，只是不经过那层「等页面就绪」的门），实测 0ms 返回、异常彻底消失；平台层真的拿不到时才回退，并给出「内置浏览器可能还在加载，请稍等 2 秒再点一次」这种能看懂的提示。",
+      "【登录窗在前 30 秒里发沉】就是上面那段空转：它每 0.5 秒核对一次页面状态，30 秒里要打约 120 次跨线程脚本调用，而这半分钟恰好是你在输账号密码。登录窗根本不需要桥脚本（建窗时没有传任何接口），所以现在登录窗一律跳过注入；主窗与其它窗口不受影响。",
+      "【一张图片 403 → 全部请求冻结 90 秒】风控冷却原本只看状态码：图片回 403（防盗链或图已删）也当成「账号被风控」，把轮询、保活、账户检测一起按住 90 秒——这是为一个跟账号无关的图片错误付整条链路的代价。现在只有**微博自己的接口**返回风控码才冷却，图床一律不算。同一波并发命中时，冷却日志也从 6 行合并成 1 行（旧逻辑只要本次截止时刻比上次晚几毫秒就再记一条）。",
+      "【「由于对方设置，你无法进行操作」不再算失败】两天里 3 条失败全是同一个作者换了措辞：旧关键词表里有「没有权限转发」「设置了可见性」，这句一个都没命中，于是又被记成失败。现在补上「由于对方设置 / 无法进行操作」，与「作者设置了可见性」归为同一类——我们做什么都转发不了，跟登录态、网络无关，记「跳过」而不是「失败」，历史页的失败率不再虚高。",
+      "【诊断日志无上限】内置浏览器那段调试追踪写出的 _inj.log 没有任何轮转，39 天攒了 7.1MB / 13.7 万行，其中 95% 是「每次脚本调用成功」这种噪音，全躺在数据目录里。现在启动时超过 1MB 就整份挪成 .1（只留一份历史，与 app.log 同规矩）；同时把那一类噪音行不再写入，真正要看的注入记录（尝试、失败、超时）一条不少。",
+    ]
+  },
+  {
+    ver: "v1.6.17", internal: "2611220001", date: "2026-11-22",
+    title: "按两天真机数据修六处：排程散开、到期留痕、判空降噪、轮询间隔变准",
+    items: [
+      "【先说数据】11-21 09:08 到 11-22 10:34 连续运行 25 小时、92 轮轮询、271 条排程、179 个圈。Cookie 侧：误判「已失效」0 次、风控 0 次、保活 50 次全成功；转发侧：269 条成功、3 条失败（全是「作者设置了可见性」）。也就是说上一版的修复站住了，这一版收的是剩下那些「看得见的粗糙」。",
+      "【圈长最短 0 秒 → 排程改分层抽样】旧版给每条转发各自独立取 0~135 秒的随机偏移，5 条必然扎堆在 2 分半里 —— 实测相邻间隔**最短 0 秒**、`<10 秒`占 15.1%、中位只有 30 秒。环的「一圈 = 一条」是对的，但 0~2 秒的圈看上去仍是一闪。现在把偏移窗口均分成 N 段、每段只取中间 60%，相邻两条的最小间隔 = 段长 × 0.4（15 分钟 / 5 条 ≈ 10.8 秒），整体仍铺满原窗口，「多久内发完」的上限没有变大。顺带解决两件事：两条不再落到同一秒（去重不会再把 2 圈折叠成 1 圈），也不再呈现「5 条挤在 2 分钟内」的批量特征。",
+      "【排程点之后日志一片空白 → 到期执行留痕】延迟转发以前只在异常时写日志，成功路径一个字不留。于是排查时看到的景象是「排程了 213 条，之后什么都没有」，极易误判成「根本没执行」。现在每条到期执行都会记一行：对象、动作、耗时、详情 —— 成功与跳过记普通日志，失败与异常才升级告警。",
+      "【一色雨对象刷了 142 行告警 → 判空降噪】它的资料页写着 297 条微博，但最新一条停在 2025-08-19，接口按可见窗口返回空列表。这是「近半年没有可转发的公开微博」，不是故障。旧版每个对象每轮 2 条警告，两天 142 行、占全部 HTTP 告警的 98%，把真故障埋掉了。现在判空不再把监控状态标红、不再逐条刷警告，改成每轮汇总一行，并写明是哪几个对象。",
+      "【「下次轮询约」永远偏早 → 间隔口径修正】旧的「下次轮询」时间是在抓取**之前**算的，而等待是在抓取**之后**才开始的，于是实际周期 = 设定间隔 + 本轮耗时（两天实测稳定多 2~3 分钟，抓取慢时会拖得更久）。现在按「本轮起点 + 间隔」报终点，等待时把本轮已耗时扣掉，同时保留 60 秒下限，避免抓取超时后退化成几乎不间断的连续轮询。",
+      "【「作者设置了可见性」不再算失败】两天里 3 条失败全是这条原因 —— 我们做什么都转发不了，跟登录态、网络都无关。现在单独记成「跳过（内容不可转发）」，历史页的失败率不再虚高。候选池那行日志也从「已剔除历史已转发」改成「已剔除已处理（成功 / 跳过 / 失败）」，跟真实口径对齐。",
+    ]
+  },
+  {
+    ver: "v1.6.16", internal: "2611210003", date: "2026-11-21",
+    title: "转发进度环改为「一圈 = 一条转发」+ 内置浏览器关掉后能再次打开",
+    items: [
+      "【进度环 · 先说旧版为什么「根本没有规律」】旧逻辑的起点取「本轮抓取完成」、终点取「本轮最早一跳转发」。真机日志里这两个时刻只差 3 秒（02:51:50 抓取完成 → 02:51:53 最早一跳），所以**一圈只有 3 秒**；而没有排到转发时终点又会退回「下一次轮询」，一圈变成 341 秒；抓取耗时超过轮询间隔时窗口整体落到过去，环一亮就满。三种口径混用，实测最长与最短相差 **299 倍**，排程发生的那一秒还会先倒退 28.7 个百分点 —— 这就是你看到的「没有规律」。",
+      "【新口径：一圈 = 一条转发】按你定的规则重做：确认排程后，从当前时刻走到该条的「预计执行时间」算一圈；排 4 条就走 4 圈，排 1 条就走 1 圈，**一圈跑满 = 一条微博发出去**（此时给 900ms 满环高亮）。全部发完 → 到下一轮排程之前保持空闲；本轮没排到转发（没有新微博）→ 同样空闲。三种空闲状态一律不显示进度，不再假装有进度。",
+      "【后端配合】调度器现在把本轮**整批**排程时刻（升序去重）和「计划起点」一起交给界面，不再只给最早那一跳。首圈从计划起点算起，之后每圈都从**上一条的发出时刻**接着算，因此圈与圈首尾相接、互不重叠，全程不会跳也不会倒退。",
+      "【内置浏览器 · 关掉一次就再也打不开】根因不在弹窗失败，而在判定条件错了：内置浏览器用的是 pywebview 的独立窗口，窗口被关掉之后 pywebview **不会**把窗口对象里的 `gui` 置空，而 `show()` 的实现是「拿不到平台实例就静默返回」—— 既不报错也不弹窗。旧代码正是「判 gui 非空 → show() → 报告成功」这个组合，于是窗口早就没了，界面还收到一个「成功」。现在改用 pywebview 公开的窗口列表判断存活（销毁时会真正从中移除），窗口没了就**重建**，并顺手把已有的窗口提到最前，避免「点了没反应」。『关闭登录窗口』也会把引用清干净。",
+      "【内置浏览器 · 加了一条留痕】每次点击「内置浏览器登录」都会往 diag.log 写一行 `LOGIN_WIN | action=show/recreate alive=…`。万一再遇到打不开，直接看这行就知道当时走的是「切回已有窗口」还是「重建窗口」，不用猜。",
+      "【转发设置 · 开关居中】「排程波动」「仅转发含图博文」两个开关原来贴着标题行、与两行说明不居中（旧样式用 -2px 位移去对齐标题行盒）。现在改为与整行垂直居中，实测圆心偏差 0.0px，两张卡依旧等高。",
+    ]
+  },
+  {
+    ver: "v1.6.15", internal: "2611210002", date: "2026-11-21",
+    title: "D3 第二根因：首页被误判成登录墙，uid 永远解析不出来",
+    items: [
+      "【上一版为什么没修好】v1.6.14 补了新版首页的 uid 正则，但新的报告里「登录态实测跳过 · 缺少 uid」依然是每 30 分钟一条，一条不差。逐行核对代码后找到一处**判定顺序**错误：解析 uid 之前先做了一次「这页是不是登录墙」的文本扫描，而登录墙特征词里有 `passport` / `login.php`，新版首页是一个几 KB 的 JS 外壳、内联着外部 SSO 地址，只要这两处字样出现一次，函数就在跑正则之前返回了空 uid —— 补多少正则都没用。",
+      "【说明一件事】报告里看不到主程序版本号（旧版监控工具把 diag.log 的标签段丢掉了），所以「当时跑的是不是 v1.6.14」无法从这份报告证实。这一版监控工具已经会打印**被测版本**，下次一眼可辨；无论如何，上面那个顺序错误是客观存在的，必须修。",
+      "【改法：先看能不能拿到 uid，再谈登录墙】能从页面里读出「自己的 uid」这件事本身，就已经证明这页是登录态页面 —— 那就不该在它前面拦一道文本检查。现在顺序改成：先跑 uid 正则，拿到就返回；拿不到才去判断「为什么拿不到」，而且**登录墙改看最终落地 URL**（是否被踢到 login.php / passport / sso），正文只认「请登录 / 安全验证 / 重新登录」这类人话，不再对 `passport` 这种 URL 片段做子串匹配。",
+      "【顺带修掉「7 天到期」的一个机制性原因】同一个误判也发生在「会话预热」里：它一看到首页被判登录墙就直接返回「Cookie 已失效」，**连 Set-Cookie 的续期结果都没合并**。也就是说这些年每次保活都白跑、续期结果全丢，靠的只是 Cookie 自己写的那个远期日期 —— 而微博服务端有 7 天硬期限。现在预热改用同一套「按落地 URL 判墙」的口径，续期结果能真正写回账户。",
+      "【新增 uid 解析留痕】每次解析首页 uid 都会往 diag.log 写一条 `UID_PARSE`：成功记 `uid=… rule=#几`，失败记 `HTTP / 页面字节数 / 是否含 uid 字样 / 最终落地 URL / 是否判墙`。下次再出问题，一眼就能看出是「页面里没有 uid」还是「有 uid 但没匹配上」还是「被踢去了登录页」。",
+      "【诊断工具也修了：报告里现在会写被测版本】之前的报告看不出版本号，导致「修复到底有没有生效」只能靠猜。现在监控工具会读 diag.log 的标签段（之前只读正文，`LOG_SNAPSHOT`、`WEBVIEW_START`、`WV_COOKIE_PROBE` 这些都被丢掉了），把**被测主程序版本**打到报告头和状态栏，并把 `UID_PARSE`、`WV_*` 事件纳入时间线。",
+    ]
+  },
+  {
+    ver: "v1.6.14", internal: "2611200002", date: "2026-11-20",
+    title: "按 Cookie 监控报告逐条修复登录态判定（D1–D4）",
+    items: [
+      "【为什么会有这一版】用上一版做的独立诊断工具导出了一份报告，结论比预想的更硬：一周里 **336 次「登录态实测」一次都没跑成**，全部因为账户缺 uid；同时 791 次「判定 Cookie 已失效」全部集中在同一天的同一个小时。两条放在一起看，说明问题不在微博，而在软件的判定链路上。",
+      "【D3 · 修好 uid 解析，同源实测终于能跑】微博网页端改版后，首页里已经没有 `$CONFIG['uid']=` 这种老写法，只剩 `\"uid\":\"5189652182\"` 这种新写法，而我们只认老写法 → 解析永远为空 → 唯一有权判定「真的失效了」的同源接口 `/ajax/profile/info` 因为缺参数一直没被调用过。现在补齐新写法，并且**添加账户时、每次保活时**都会自动补解析并落盘，缺一次补一次，之后永久免费。",
+      "【D1 · 风控不再被报成「Cookie 失效」】微博在限流状态下，接口会返回 HTTP 200 但内容写着「未登录」，和真的没登录长得一模一样；旧逻辑先看「未登录」再看「风控」，于是每一次限流都被稳定地报成「Cookie 已失效」。因果是单向的 —— 风控能解释未登录，未登录解释不了 HTTP 432，所以现在先判风控。",
+      "【D1b · 被限流时不再加倍请求】旧逻辑是「第一次失败就预热一次再整套重试」，被限流时单次轮询最多打到 7 个请求，等于越失败越用力、冷却期越长。现在命中风控就直接收手，等冷却期过去。",
+      "【D1c · 判失效必须先过同源复核】报告里最硬的一条证据：18:33 判「Cookie 已失效」，18:45 同一份 Cookie 又抓取成功 —— Cookie 根本没变，变的只是那十几分钟的限流状态。现在「抓取说未登录」只算线索，必须再由同源接口复核一次；同源也确认未登录才写失效，测不出来就一个字都不写库。",
+      "【D2 · 给所有微博请求装一个总水阀】媒体扫描和轮询原来各按各的排程跑，共用同一份 Cookie 和同一个出口 IP，报告里两者在 11 个分钟里同时开火，紧接着就是成片的 HTTP 432 —— 是软件自己把自己打进了风控。现在所有请求共用一个限速器（约每秒 2 个），命中风控后整条链路自动冷却 90 秒；图床下载不参与限速，媒体库更新速度不受影响。",
+      "【D4 · 退出落盘：实测推翻了原先的推断，改为「全程留痕」】报告显示内置浏览器的 Cookie 库里**一条记录都没有**，最初的推断是「退出时进程被硬杀，浏览器来不及存盘」。为此专门做了一个独立实验（全新 profile + 加载微博 + 正常关窗）：结果 Cookie 在窗口关闭后 **0.05 秒就已经在磁盘上**了 —— 说明 WebView2 是边跑边落盘的，硬杀并不是必然原因。所以这一版不再宣称「已修好」，而是改成**可观测**：退出前仍保留 0.25 秒余量（实测 0.05 秒即落盘，5 倍余量足够，又不拖慢退出），并在启动、关窗、退出三个时点各记一条「库里到底有几条 Cookie、文件最后改动时间」。下次导出的报告会直接告诉我们那 0 条是「从没写过」还是「写进去又被清空了」—— 这比继续猜有用。",
+      "【新增可直接回答「7 天到底续没续」的日志】以前只能看到「保活成功」这种间接结论。现在每次保活都会记一行「SUB 到期时间：前 → 后」，如果它不再往后走，说明微博那边的滑动续期确实没生效 —— 这一行就是下次排障的第一现场。",
+    ]
+  },
   {
     ver: "v1.6.13", internal: "2611130009", date: "2026-11-13",
     title: "「仅转发含图博文」归位到转发方式 + 「只看有图」默认开启",

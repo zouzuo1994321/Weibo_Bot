@@ -11,7 +11,7 @@ import os
 import sys
 from datetime import datetime
 
-MAJOR = "v1.6.13"
+MAJOR = "v1.6.18"
 
 def _base_dir():
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):

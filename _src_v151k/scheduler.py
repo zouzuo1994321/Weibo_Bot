@@ -30,6 +30,31 @@ def _in_working_hours() -> bool:
     return now >= start or now <= end
 
 
+def _sub_expires(entries) -> int:
+    """取带域条目里 SUB 的 expires（秒级时间戳）。取不到返回 0。
+
+    【v1.6.14】这是判断「滑动续期到底有没有生效」的唯一硬指标：
+    微博服务端对网页端登录态有 7 天硬期限，只要期间有过真实请求，SUB 的过期时间
+    就应该**往后走**。光看 HTTP 200 没用（风控也是 200），必须比对前后数值。
+    用户导出的报告里只有一次采样（06_history.jsonl 为空），所以本期把这对数字
+    写进运行日志，下一次报告就能直接读出「7 天内到底续没续」。
+    """
+    for e in entries or []:
+        try:
+            if (e.get("name") or "") == "SUB":
+                return int(e.get("expires") or 0)
+        except Exception:
+            continue
+    return 0
+
+
+def _fmt_ts(ts: int) -> str:
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "无"
+    except Exception:
+        return "无"
+
+
 class Scheduler:
     def __init__(self):
         self._running = False
@@ -47,6 +72,12 @@ class Scheduler:
         # next_run 是「下一次轮询」；真正下一次「发出去」的时刻是这个字段。
         # 前端进度环用它对齐 100%，未排程时回退到 next_run。
         self.next_forward_run = None
+        # 【v1.6.16】本轮**全部**排程时刻（升序、去重，浮点秒）与计划起点。
+        # 前端进度环的口径改为「一圈 = 一条转发」：排 N 条就走 N 圈，
+        # 每条在自己的预计执行时刻跑满。只暴露最早一跳是不够的 ——
+        # 那样排 5 条也只有一圈，而且那圈只有 3 秒（详见 app.js tickForwardRing 注释）。
+        self.forward_runs = []
+        self.forward_plan_at = None
 
     def is_running(self):
         """只有标记为运行中、且后台线程确实存活，才算真正在运行。
@@ -77,6 +108,11 @@ class Scheduler:
     def _loop(self):
         while self._running:
             interval = None
+            # 【v1.6.17】本轮起点。旧版把 next_run 算在 run_once **之前**、却把睡眠放在
+            # run_once **之后**，实际周期 = 设定间隔 + 本轮抓取耗时（真机两天实测稳定
+            # 多 2~3 分钟），心跳里「下次轮询约」永远偏早。现在用起点 + 间隔报终点，
+            # 并在结尾把本轮已耗时从等待里扣掉，让「轮询起始 → 下一轮起始」= 设定间隔。
+            t_start = time.time()
             try:
                 cfg = get_config()
                 base = max(1, int(cfg.get("interval_minutes", 30)))
@@ -89,8 +125,11 @@ class Scheduler:
                 jitter = base * ratio
                 interval = max(1, int(round(base + random.uniform(-jitter, jitter))))
                 with self._lock:
-                    self.next_run = (datetime.now().timestamp() + interval * 60)
+                    self.next_run = t_start + interval * 60
                     self.next_forward_run = None   # 【v1.4.20】新一轮开始，旧排程视为已消费
+                    # 【v1.6.16】上一轮的排程计划一并作废，前端据此回到空闲态
+                    self.forward_runs = []
+                    self.forward_plan_at = None
                 next_run_str = datetime.fromtimestamp(self.next_run).strftime("%H:%M")
                 in_wh = _in_working_hours()
                 info(f"调度器心跳 · 下次轮询约 {next_run_str}（间隔 {interval} 分钟）"
@@ -128,8 +167,22 @@ class Scheduler:
                     interval = max(1, int(get_config().get("interval_minutes", 30)))
                 except Exception:
                     interval = 30
+            # 【v1.6.17】扣掉本轮已耗时，保证「起始 → 下一轮起始」= 设定间隔。
+            # 抓取耗时超过间隔时（媒体扫描可达 20~30 分钟）不留负数等待，
+            # 但至少留 60 秒喘息，避免退化成几乎不间断的连续轮询（那是风控特征）。
+            _elapsed = time.time() - t_start
+            _remain = interval * 60 - _elapsed
+            if _remain < 60:
+                debug(f"本轮耗时 {int(_elapsed)}s 已达/超过间隔 {interval} 分钟，"
+                      f"仅等待 60s 喘息后进入下一轮", CAT_SCHED)
+                _remain = 60
+                # 抓取超时（媒体扫描可达 20~30 分钟）时 next_run 会落在过去，
+                # 界面上就成了「下次轮询：一小时前」。这里把它重设到喘息结束时刻，
+                # 保证显示的时间永远是**未来**的。
+                with self._lock:
+                    self.next_run = time.time() + 60
             waited = 0
-            while self._running and waited < interval * 60:
+            while self._running and waited < _remain:
                 time.sleep(5)
                 waited += 5
 
@@ -140,13 +193,42 @@ class Scheduler:
         由 _forward_one 的返回值合并进对应 UID 项），任一项带
         action=="scheduled" 且有 run_at 即视为本轮已排程。
         【v1.6.1】一轮可能排程多条，进度环应对齐**最早**那一跳（真正的「下一次转发」）。
+
+        【v1.6.16】改为**把整批排程时刻全部留下**（升序去重），并把这次排程的
+        「计划起点」记成 last_run（= 本轮抓取完成的那一刻）。前端据此把
+        「起点 → 第 1 条 → 第 2 条 → …」接成一条条首尾相接的圈：
+        排 4 条就走 4 圈，每圈在该条微博发出时跑满；全部发完 → 空闲。
         """
         try:
-            stamps = [r.get("run_at") for r in (res.get("results") or [])
-                      if r.get("action") == "scheduled" and r.get("run_at")]
-            if stamps:
-                with self._lock:
-                    self.next_forward_run = min(stamps)
+            stamps = []
+            for r in (res.get("results") or []):
+                if r.get("action") == "scheduled" and r.get("run_at"):
+                    try:
+                        v = float(r["run_at"])
+                    except Exception:
+                        continue
+                    if v > 0:
+                        stamps.append(v)
+            if not stamps:
+                return
+            stamps.sort()
+            uniq = []
+            for v in stamps:
+                if not uniq or v != uniq[-1]:
+                    uniq.append(v)
+            with self._lock:
+                self.forward_runs = uniq
+                self.next_forward_run = uniq[0]
+                # 计划起点：优先用 last_run（本轮抓取完成时刻），解析不出就取当前时刻。
+                # 两者相差在毫秒级 —— 本函数紧跟 last_run 赋值之后调用。
+                plan_at = None
+                if self.last_run:
+                    try:
+                        plan_at = datetime.strptime(
+                            self.last_run, "%Y-%m-%d %H:%M:%S").timestamp()
+                    except Exception:
+                        plan_at = None
+                self.forward_plan_at = plan_at if plan_at else time.time()
         except Exception:
             pass
 
@@ -252,14 +334,38 @@ class Scheduler:
                                 "detail": "缺少登录凭证", "renewed": False})
                 continue
             try:
+                _sub_before = _sub_expires(am.get_cookie_entries(acc["id"]))
                 res = keepalive(cookie, entries=am.get_cookie_entries(acc["id"]))
                 if res.get("ok") and (res.get("entries") or res.get("cookie")):
                     am.update_cookie(acc["id"], res.get("cookie") or "",
                                      "保活探针已自动续期 Cookie（会话保活）",
                                      entries=res.get("entries"))
+                # 【v1.6.14】把「SUB 到期时间前 → 后」记进日志：
+                # 这是「7 天硬期限」唯一可证伪的观测点，下次导报告可直接读。
+                _sub_after = _sub_expires(res.get("entries") or [])
+                if _sub_before or _sub_after:
+                    _delta = _sub_after - _sub_before
+                    info(f"保活留痕 {name} · SUB 到期 {_fmt_ts(_sub_before)} → "
+                         f"{_fmt_ts(_sub_after)}"
+                         + (f" · 延后 {_delta / 86400:.2f} 天" if _delta > 0 else
+                            (" · 未变化" if _delta == 0 else f" · 提前 {-_delta / 86400:.2f} 天")),
+                         CAT_SCHED)
                 # 实测登录态（用保活后的最新 Cookie，比原 Cookie 更接近服务端认知）
                 live_cookie = res.get("cookie") or cookie
                 uid = acc.get("wb_uid") or ""
+                # 【v1.6.14 · D3】同源实测必须带 uid，而账户里这个字段长期是空的
+                # （添加账户时从不写入），导致 336 次实测全部「跳过」。这里在缺 uid 时
+                # 先补解析一次并立刻落盘：第一次多 1 个首页请求，之后永久免费。
+                if not uid:
+                    try:
+                        from weibo_client import get_self_uid
+                        uid, _c2 = get_self_uid(live_cookie)
+                        if uid:
+                            am.set_wb_uid(acc["id"], uid)
+                            if _c2 and _c2 != live_cookie:
+                                live_cookie = _c2
+                    except Exception as _e:
+                        debug(f"补解析自身 UID 失败：{_e}", CAT_SCHED)
                 web = probe_login_web(live_cookie, uid)
                 probe = web
                 # 同源测不出来才退回移动端；移动端只能把「有效」补上来，不能推翻
@@ -303,6 +409,9 @@ class Scheduler:
             "last_run": self.last_run,
             "next_run": self.next_run,
             "next_forward_run": self.next_forward_run,   # 【v1.4.20】下一次实际转发时刻
+            # 【v1.6.16】本轮全部排程时刻（升序）+ 计划起点，供进度环「一圈=一条」
+            "forward_runs": list(self.forward_runs or []),
+            "forward_plan_at": self.forward_plan_at,
             "in_working_hours": _in_working_hours(),
             "last_result": self.last_result,
             "last_keepalive": self.last_keepalive,

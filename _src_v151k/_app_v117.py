@@ -325,6 +325,13 @@ def main():
     # 【v1.6.9】启动快照：把「这是哪个构建、跑在哪个数据目录、关键开关是什么」一次记全。
     # 用户常在别的机器上跑（问题现场不在开发机），没有这几行就无法判断日志属于哪个版本，
     # 也没法确认是否命中「老数据 / 老配置」这类只在对方环境成立的路径。
+    # 【v1.6.18】顺手压一下旁路诊断日志：`_inj.log`（pywebview 注入追踪）没有轮转，
+    # 实测 39 天攒到 7.1MB / 13.7 万行，95% 是每次 evaluate_js 一行的噪音。
+    try:
+        from logger import rotate_side_logs
+        rotate_side_logs()
+    except Exception as _e:
+        diag("SIDE_LOG_ROTATE_FAIL", str(_e))
     try:
         from version import get_version
         _v = get_version()
@@ -473,6 +480,9 @@ def main():
         diag("WV_STORAGE_FAIL", str(_e))
         _wv_storage = None      # 落回 %APPDATA%\pywebview，仍是非私有模式
 
+    # 【v1.6.14 · D4】启动时先量一次「profile 里到底有没有 Cookie」，
+    # 报告里 0 条这件事从此每次启动都会留痕，便于对比修复是否生效。
+    _wv_cookie_probe("启动前")
     diag("WEBVIEW_START", "blocking")
     webview.start(private_mode=False, storage_path=_wv_storage)
 
@@ -488,7 +498,49 @@ def main():
     # 【v1.5.0 Part2-B】窗口关闭（含托盘「退出」的 destroy 路径）后
     # 落盘收尾 + 硬退出，根治 ~12.5s 的 WebView2 拆环境拖尾。
     diag("WINDOW_CLOSED", "webview.start returned")
+    _wv_cookie_probe("窗口关闭后")
     _hard_exit(api)
+
+
+def _wv_cookie_probe(tag=""):
+    """【v1.6.14 · D4】记录内置浏览器 profile 里**真正落盘**的 Cookie 数量。
+
+    背景：用户导出的 CookieMonitor 报告显示，内置浏览器的 Cookies 库里
+    「微博域 0 条、全库 0 条」—— 也就是登录过，但一个 Cookie 都没写进磁盘。
+    最可能是 os._exit(0) 硬杀时 WebView2 还没把内存里的 Cookie 刷盘。
+
+    我们无法从 pywebview 层确认刷盘时机，所以改成**每次启动/退出都留一条读数**：
+    下次再看报告就知道「到底有没有落盘、落在哪一次」。只读 Chromium 的明文元数据列
+    （host_key / name / expires_utc），不碰加密的 value，也不因此产生任何写操作。
+    """
+    import sqlite3
+    db = os.path.join(DATA_DIR, "webview", "EBWebView", "Default", "Network", "Cookies")
+    if not os.path.exists(db):
+        diag("WV_COOKIE_PROBE", f"{tag} Cookies 库不存在（{db}）")
+        return
+    try:
+        st = os.stat(db)
+        mt = time.strftime("%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+    except Exception:
+        st, mt = None, "?"
+    try:
+        uri = "file:%s?mode=ro&immutable=1" % db.replace("\\", "/").replace("#", "%23")
+        con = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            total = con.execute("SELECT COUNT(*) FROM cookies").fetchone()[0]
+            rows = con.execute(
+                "SELECT name, is_persistent FROM cookies "
+                "WHERE host_key LIKE '%weibo%' OR host_key LIKE '%sina%'"
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception as e:
+        diag("WV_COOKIE_PROBE_FAIL", f"{tag} {e}")
+        return
+    names = sorted({(r[0] or "") for r in rows})
+    diag("WV_COOKIE_PROBE",
+         f"{tag} 库 {getattr(st, 'st_size', 0)}B mtime={mt} · 全库 {total} 条 · "
+         f"微博域 {len(rows)} 条 · 键={names}")
 
 
 def _hard_exit(api):
@@ -506,6 +558,17 @@ def _hard_exit(api):
       - 所有后台线程均为 daemon=True，无非守护线程需要等待。
     """
     diag("SHUTDOWN_BEGIN")
+    # 【v1.6.14 · D4】给 WebView2 留一点收尾时间（0.25s）。
+    #
+    # 报告显示内置浏览器 profile 里 0 条 Cookie，最初推断是 os._exit(0) 硬杀导致
+    # 来不及落盘。为此做了独立实验（全新 profile + 加载微博 + 正常关窗）：
+    # Cookie 在窗口关闭后 **0.05s** 就已经在磁盘上了 —— WebView2 是边跑边落盘，
+    # 硬杀并非必然原因。所以这里只保留一个 5 倍余量的缓冲，不再等 0.9s
+    # （退出速度是 v1.5.0 花力气修掉的顽疾，不能为了一个存疑的原因退回去）。
+    # 真正有价值的是下面三次采样：下次报告能直接判定「从没写过」还是「被清空了」。
+    diag("WV_DRAIN", "wait 0.25s for WebView2 teardown")
+    time.sleep(0.25)
+    _wv_cookie_probe("硬退出前")
     try:
         api._stop_tray()
     except Exception:

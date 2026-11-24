@@ -1036,8 +1036,10 @@ def run_one(data_dir, out_json):
         """D 组：前端进度环空闲时必须停止 rAF，而不是每帧空转。"""
         js = open(os.path.join(UI, "app.js"), encoding="utf-8").read()
         # 空闲分支必须「return」而不是「requestAnimationFrame 续期」
+        # 【v1.6.16】空闲条件由「!sch.next_run」改为「!runs.length」——
+        # 进度环不再看 next_run（它比真实下一轮早 11 分钟，本就是错的终点）。
         idle_branch = re.search(
-            r"if \(!sch\.running \|\| !sch\.next_run\) \{(.{0,400}?)\n  \}",
+            r"if \(!sch\.running \|\| !runs\.length\) \{(.{0,400}?)\n  \}",
             js, re.S)
         body = idle_branch.group(1) if idle_branch else ""
         no_loop = "requestAnimationFrame" not in body
@@ -1290,6 +1292,378 @@ def run_one(data_dir, out_json):
     chk("S25", "fwd_cards_equal_height", _fwd_cards_equal_height)
     chk("S25", "hist_img_default", _hist_img_default)
 
+    # ---------------- S27 转发设置行的开关对齐（v1.6.16） ----------------
+    # 用户截图指出「排程波动」的开关贴在上边、与两行说明不居中。
+    # 根因是旧样式 align-items:flex-start + margin-top:-2px（那是「对齐标题行」的做法，
+    # 说明文字一旦折行就明显偏高）。现在改为整行居中，且不许再出现那 -2px 位移补偿。
+    def _fwd_opt_row_centered():
+        css = open(os.path.join(UI, "style.css"), encoding="utf-8").read()
+        row = re.search(r"\.row\.fwd-opt-row \{([^}]*)\}", css)
+        sw = re.search(r"\.row\.fwd-opt-row > \.switch \{([^}]*)\}", css)
+        centered = bool(row) and "align-items: center" in row.group(1)
+        no_start = bool(row) and "align-items: flex-start" not in row.group(1)
+        no_nudge = bool(sw) and "margin-top" not in sw.group(1)
+        # 两张卡这一行共用同一个类，改一处两处生效 —— 不允许任何一边单独覆盖回 flex-start
+        stray = re.findall(r"fwd-opt-row[^{]*\{[^}]*align-items:\s*flex-start", css)
+        good = centered and no_start and no_nudge and not stray
+        return (good, "整行居中=%r 无flex-start=%r 无-2px补偿=%r 散落覆盖=%d"
+                % (centered, no_start, no_nudge, len(stray)))
+
+    chk("S27", "fwd_opt_row_centered", _fwd_opt_row_centered)
+
+    # ---------------- S28 进度环「一圈 = 一条转发」（v1.6.16） ----------------
+    # 用户口径：确认排程后从当前时刻走到该条的预计执行时间算一圈，排 N 条走 N 圈，
+    # 全部发完到下一轮排程前保持空闲，没排到转发也保持空闲。
+    # 旧实现（v1.6.15）把终点取 next_forward_run、起点取 last_run，两者真机只差 3 秒，
+    # 一圈 3 秒；再叠加 next_run 兜底，一圈在 3/341/896/0 秒之间乱跳，最长最短差 299 倍。
+    _JS_SRC = open(os.path.join(UI, "app.js"), encoding="utf-8").read()
+    _CSS_SRC = open(os.path.join(UI, "style.css"), encoding="utf-8").read()
+    _SCH2 = open(os.path.join(SRC, "scheduler.py"), encoding="utf-8").read()
+
+    def _sched_exposes_runs():
+        """后端必须把整批排程时刻 + 计划起点暴露出去。"""
+        st = re.search(r"def status\(self\):(.*?)\n\n", _SCH2, re.S)
+        body = st.group(1) if st else ""
+        has_runs = '"forward_runs"' in body
+        has_at = '"forward_plan_at"' in body
+        cap = re.search(r"self\.forward_runs = uniq", _SCH2) is not None
+        sorts = "stamps.sort()" in _SCH2
+        return (has_runs and has_at and cap and sorts,
+                "status 含 runs=%r at=%r 采集去重=%r 排序=%r" % (has_runs, has_at, cap, sorts))
+
+    def _ring_uses_only_plan():
+        """进度环只能认 forward_runs / forward_plan_at，不许再回退到 next_run/next_forward_run。"""
+        i0 = _JS_SRC.find("function tickForwardRing")
+        i1 = _JS_SRC.find("function _fwdRingWatchdog")
+        body = _JS_SRC[i0:i1] if 0 < i0 < i1 else ""
+        uses_runs = "sch.forward_runs" in body
+        uses_at = "forward_plan_at" in body
+        no_next = "sch.next_run" not in body and "next_forward_run" not in body
+        idle_on_empty = "!runs.length" in body
+        return (uses_runs and uses_at and no_next and idle_on_empty,
+                "用 runs=%r 用 plan_at=%r 不再看 next_run=%r 空计划即空闲=%r"
+                % (uses_runs, uses_at, no_next, idle_on_empty))
+
+    def _ring_lap_per_run():
+        """圈序号必须按「第一个还没到点的转发」推进，且末条要有收尾高亮。"""
+        i0 = _JS_SRC.find("function tickForwardRing")
+        i1 = _JS_SRC.find("function _fwdRingWatchdog")
+        body = _JS_SRC[i0:i1] if 0 < i0 < i1 else ""
+        loop = re.search(r"for \(let i = 0; i < runs\.length; i\+\+\) \{\s*\n\s*if \(now < runs\[i\] \* 1000\)",
+                         body)
+        lap_from_prev = "runs[idx - 1] * 1000" in body
+        tail = "_fwdAllDoneAt" in body
+        return (bool(loop) and lap_from_prev and tail,
+                "找当前圈=%r 圈起点接上一条=%r 末条收尾=%r"
+                % (bool(loop), lap_from_prev, tail))
+
+    def _ring_fading_removed():
+        """fwd-fading 已随「驻留 10s + 渐隐」一起废弃，死样式与死变量都不许留。"""
+        dead_css = "fwd-fading" in _CSS_SRC
+        dead_var = ("_fwdDoneFor" in _JS_SRC or "_fwdPrevNextRun" in _JS_SRC
+                    or "function triggerFwdDone" in _JS_SRC)
+        return (not dead_css and not dead_var,
+                "残留 CSS=%r 残留变量=%r" % (dead_css, dead_var))
+
+    chk("S28", "sched_exposes_forward_runs", _sched_exposes_runs)
+    chk("S28", "ring_uses_only_plan", _ring_uses_only_plan)
+    chk("S28", "ring_lap_per_run", _ring_lap_per_run)
+    chk("S28", "ring_fading_removed", _ring_fading_removed)
+
+    # ---------------- S29 内置浏览器「关掉后能再次打开」（v1.6.16） ----------------
+    # 根因：pywebview 关窗后不清 window.gui，而 Window.show() 是
+    # BrowserView.instances.get(uid) —— 拿不到就静默 return。
+    # 旧代码「判 gui 非空 → show() → 返回 ok」于是在窗口已销毁时照样报成功。
+    _API_SRC = open(os.path.join(SRC, "api_bridge.py"), encoding="utf-8").read()
+
+    def _login_window_liveness():
+        has_helper = "def _login_window_alive" in _API_SRC
+        uses_list = bool(re.search(r"return w in webview\.windows", _API_SRC))
+        i0 = _API_SRC.find("def open_login_browser")
+        i1 = _API_SRC.find("def _login_untop", i0)
+        body = _API_SRC[i0:i1] if 0 < i0 < i1 else ""
+        guarded = "_login_window_alive()" in body
+        no_gui_check = "login_window.gui is not None" not in body
+        return (has_helper and uses_list and guarded and no_gui_check,
+                "辅助函数=%r 用 windows 列表=%r 调用=%r 不再判 gui=%r"
+                % (has_helper, uses_list, guarded, no_gui_check))
+
+    def _close_nulls_ref():
+        i0 = _API_SRC.find("def close_login_browser")
+        i1 = _API_SRC.find("def ", i0 + 10)
+        body = _API_SRC[i0:i1] if 0 < i0 < i1 else ""
+        return ("self.login_window = None" in body,
+                "关窗时清引用=%r" % ("self.login_window = None" in body))
+
+    def _capture_checks_alive():
+        i0 = _API_SRC.find("def capture_login_cookies")
+        i1 = _API_SRC.find("def close_login_browser", i0)
+        body = _API_SRC[i0:i1] if 0 < i0 < i1 else ""
+        good = "_login_window_alive()" in body and "self.login_window is None" not in body
+        return (good, "读 Cookie 前校验存活=%r" % good)
+
+    chk("S29", "login_window_liveness", _login_window_liveness)
+    chk("S29", "login_close_nulls_ref", _close_nulls_ref)
+    chk("S29", "login_capture_checks_alive", _capture_checks_alive)
+
+    # ---------------- S30 依据两天真机数据修的六项（v1.6.17） ----------------
+    # 数据来源：2026-11-21 09:08 → 11-22 10:34 连续运行 25 小时（92 轮轮询、
+    # 271 条排程、179 个相邻间隔）。逐条对应现场观测：
+    #   1) 圈长最短 0 秒、<10 秒占 15.1% → 排程偏移改分层抽样
+    #   2) 排程点之后日志一片空白 → 延迟执行补留痕
+    #   3) 一色雨对象 71 轮判空刷出 142 行 WARN（占 HTTP 告警 98%）→ 判空降噪
+    #   4) 心跳「下次轮询约」系统性偏早 2~3 分钟 → next_run 与等待口径修正
+    #   5) 「已剔除历史已转发」实际连失败/跳过也剔 → 文案改准
+    #   6) 3 条失败全是「作者设置了可见性」→ 改记 skipped
+    _FE_SRC = open(os.path.join(SRC, "forward_engine.py"), encoding="utf-8").read()
+    _WC2_SRC = open(os.path.join(SRC, "weibo_client.py"), encoding="utf-8").read()
+    _SCH2_SRC = open(os.path.join(SRC, "scheduler.py"), encoding="utf-8").read()
+
+    def _fwd_offset_stratified():
+        """① 偏移分层抽样：相邻间隔有下限，且旧口径会被判失败（可证伪）。"""
+        import forward_engine as fe
+        cfg = {"interval_minutes": 15, "poll_jitter_ratio": 0.15}
+        cap = 15 * 60 * 0.15
+        n = 5
+        step = cap / n
+        floor = step * 0.4 * 0.98
+        worst = 1e9
+        outside = 0
+        for _ in range(200):
+            offs = [fe._compute_forward_offset(cfg, slot=(i, n)) for i in range(n)]
+            if min(offs) < 0 or max(offs) > cap + 1e-6:
+                outside += 1
+            s = sorted(offs)
+            worst = min(worst, min(b - a for a, b in zip(s, s[1:])))
+        # 对照组：独立 uniform 抽样，必须能把这套判据判失败
+        import random as _r
+        caught = 0
+        for _ in range(200):
+            offs = [_r.uniform(0, cap) for _ in range(n)]
+            s = sorted(offs)
+            if min(b - a for a, b in zip(s, s[1:])) < floor:
+                caught += 1
+        ok = (worst >= floor and outside == 0 and caught >= 100)
+        return (ok, "最差间隔%.1fs 下限%.1fs 越界%d次 对照组捕获%d/200"
+                % (worst, floor, outside, caught))
+
+    def _fwd_delay_traced():
+        """② 延迟执行必须留痕：成功路径也要写日志（旧版只在异常时写）。"""
+        m = re.search(r"def _schedule_forward\((.*?)\n\n\n", _FE_SRC, re.S)
+        body = m.group(1) if m else ""
+        has_trace = "排程到期执行" in body
+        logs_ok = ("info(" in body and "warn(" in body)
+        has_cost = "耗时" in body
+        has_meta = "screen_name" in body
+        ok = bool(body) and has_trace and logs_ok and has_cost and has_meta
+        return (ok, "trace=%s info/warn=%s 耗时=%s meta=%s"
+                % (has_trace, logs_ok, has_cost, has_meta))
+
+    def _empty_quiet():
+        """③ 判空降噪：weibo_client 与 fetch_uid 的 empty 分支都必须走 debug、不走 warn。"""
+        wc = re.search(r'if status == "empty":(.{0,300}?)else:', _WC2_SRC, re.S)
+        wc_ok = bool(wc) and "debug(" in wc.group(1) and "warn(" not in wc.group(1)
+        fu = re.search(r'if st == "empty":(.{0,700}?return \[\], \[\],)', _FE_SRC, re.S)
+        fu_ok = (bool(fu) and "debug(" in fu.group(1)
+                 and "warn(" not in fu.group(1) and "_round_empty_uids" in fu.group(1))
+        summary = "个对象近半年无公开微博" in _FE_SRC
+        ok = wc_ok and fu_ok and summary
+        return (ok, "client=%s fetch=%s 每轮汇总=%s" % (wc_ok, fu_ok, summary))
+
+    def _sched_next_run_accurate():
+        """④ next_run 用本轮起点 + 间隔；等待时扣掉已耗时并有 60s 下限。"""
+        a = "self.next_run = t_start + interval * 60" in _SCH2_SRC
+        b = "_remain = interval * 60 - _elapsed" in _SCH2_SRC
+        c = "if _remain < 60" in _SCH2_SRC
+        # 旧写法必须消失：否则等于两套口径并存
+        d = "datetime.now().timestamp() + interval * 60" not in _SCH2_SRC
+        ok = a and b and c and d
+        return (ok, "起点口径=%s 扣减=%s 60s下限=%s 旧写法已删=%s" % (a, b, c, d))
+
+    def _candidate_log_wording():
+        """⑤ 候选池日志必须写清「已处理」口径（含失败/跳过），不能只写已转发。"""
+        new = "已剔除已处理" in _FE_SRC
+        old = "已剔除历史已转发" in _FE_SRC
+        return (new and not old, "新文案=%s 旧文案残留=%s" % (new, old))
+
+    def _no_permission_is_skipped():
+        """⑥ 内容不可转发按 skipped 记，不混进 failed。"""
+        helper = "def _is_no_permission" in _FE_SRC
+        marks = "没有权限转发" in _FE_SRC and "设置了可见性" in _FE_SRC
+        m = re.search(r"if _is_no_permission\(raw\):(.{0,320}?)return", _FE_SRC, re.S)
+        rec = bool(m) and '"skipped"' in m.group(1)
+        ok = helper and marks and rec
+        return (ok, "helper=%s 关键词=%s 落库skipped=%s" % (helper, marks, rec))
+
+    chk("S30", "fwd_offset_stratified", _fwd_offset_stratified)
+    chk("S30", "fwd_delay_traced", _fwd_delay_traced)
+    chk("S30", "empty_result_quiet", _empty_quiet)
+    chk("S30", "sched_next_run_accurate", _sched_next_run_accurate)
+    chk("S30", "candidate_log_wording", _candidate_log_wording)
+    chk("S30", "no_permission_is_skipped", _no_permission_is_skipped)
+
+    # ---------------- S26 Cookie 四项缺陷（v1.6.14，依据用户导出报告） ----------------
+    # 这四项都不是「猜的架构问题」，而是 CookieMonitor 报告里逐条坐实的现场：
+    #   D1  同一次失败里既有 ok=-100 又有 HTTP 432 → 被报成 cookie_expired
+    #   D1b 首轮全败无条件重试，限流时请求翻倍
+    #   D1c 判失效 12 分钟后同一份 Cookie 又抓成功
+    #   D2  媒体扫描与轮询 11 个分钟重叠 → 自己把自己打成 432
+    #   D3  336 次「登录态实测」全部因缺 uid 跳过
+    #   D4  profile 里 0 条 Cookie（os._exit 硬杀）
+    _WC_SRC = open(os.path.join(SRC, "weibo_client.py"), encoding="utf-8").read()
+    _SCH_SRC = open(os.path.join(SRC, "scheduler.py"), encoding="utf-8").read()
+    _APP_SRC = open(os.path.join(SRC, "_app_v117.py"), encoding="utf-8").read()
+
+    def _risk_before_not_login():
+        """D1：失败分类里 risk 必须排在 not_login 之前。"""
+        m = re.search(r'if "risk" in flags:\s*\n\s*status = "risk_control"', _WC_SRC)
+        n = re.search(r'elif "not_login" in flags:\s*\n\s*status = "cookie_expired"',
+                      _WC_SRC)
+        return (bool(m) and bool(n) and m.start() < n.start(),
+                "risk@%s not_login@%s" % (m.start() if m else None,
+                                          n.start() if n else None))
+
+    def _risk_skips_retry():
+        """D1b：命中风控时不得再预热 + 整套重试。"""
+        gate = 'if flags and "risk" not in flags:' in _WC_SRC
+        note = "命中风控，跳过预热重试" in _WC_SRC
+        return (gate and note, "闸门=%r 留痕=%r" % (gate, note))
+
+    def _expired_needs_same_origin():
+        """D1c：抓取报未登录后必须同源复核，不能直接定失效。"""
+        recheck = 'check_login(cookie, uid=self_uid or login.get("uid") or "")' in _WC_SRC
+        okmsg = "同源接口确认登录态有效" in _WC_SRC
+        nomark = "暂不判失效" in _WC_SRC
+        return (recheck and okmsg and nomark,
+                "复核=%r 降级=%r 不写库=%r" % (recheck, okmsg, nomark))
+
+    def _uid_modern_home():
+        """D3：现代首页（无 $CONFIG['uid']，只有 "uid":"..."）必须能解析。
+
+        报告里 336/336 次实测跳过就是这个正则失配造成的。
+        """
+        import weibo_client as wc
+        modern = ('<script>window.__INITIAL_STATE__={"config":'
+                  '{"uid":"5189652182","nick":"肆月Aperture"}}</script>')
+        old = "<script>var $CONFIG={};$CONFIG['uid']='6996654711';</script>"
+        got = []
+        for html_doc in (modern, old):
+            hit = ""
+            for pat in wc._SELF_UID_PATTERNS:
+                m = re.search(pat, html_doc)
+                if m:
+                    hit = m.group(1)
+                    break
+            got.append(hit)
+        return (got[0] == "5189652182" and got[1] == "6996654711",
+                "现代=%r 老式=%r" % (got[0], got[1]))
+
+    def _uid_backfill_path():
+        """D3：缺 uid 时调度器会补解析并落盘，探针本身不私自发请求。"""
+        sched = "get_self_uid" in _SCH_SRC and "set_wb_uid" in _SCH_SRC
+        pure = "缺少 uid，无法做同源实测" in _WC_SRC
+        return (sched and pure, "调度补解析=%r 探针守契约=%r" % (sched, pure))
+
+    def _throttle_global():
+        """D2：_session 必须挂限速 adapter，且图床放行。"""
+        import weibo_client as wc
+        mounted = "_ThrottledAdapter()" in _WC_SRC and 's.mount("https://", _ad)' in _WC_SRC
+        skip = "sinaimg.cn" in str(wc._THROTTLE_SKIP)
+        old_iv, old_next = wc._THROTTLE["interval"], wc._THROTTLE["next_at"]
+        try:
+            wc._THROTTLE["interval"] = 0.08
+            wc._THROTTLE["next_at"] = 0.0
+            t0 = time.time()
+            for _ in range(2):
+                wc._throttle_acquire("https://weibo.com/ajax/statuses/mymblog")
+            spent = time.time() - t0
+            t1 = time.time()
+            wc._throttle_acquire("https://wx1.sinaimg.cn/large/a.jpg")
+            img_spent = time.time() - t1
+        finally:
+            wc._THROTTLE["interval"] = old_iv
+            wc._THROTTLE["next_at"] = old_next
+        return (mounted and skip and spent >= 0.07 and img_spent < 0.05,
+                "挂载=%r 放行图床=%r 排队=%.3fs 图床=%.3fs"
+                % (mounted, skip, spent, img_spent))
+
+    def _keepalive_sub_trace():
+        """保活必须把 SUB 到期前后写进日志 —— 否则「7 天到底续没续」永远说不清。"""
+        has_fn = "def _sub_expires" in _SCH_SRC
+        logged = "保活留痕" in _SCH_SRC
+        return (has_fn and logged, "工具=%r 留痕=%r" % (has_fn, logged))
+
+    def _wv_drain_before_exit():
+        """D4：os._exit 之前要给 WebView2 留落盘窗口，并采样 profile 里的 Cookie 数。"""
+        m = re.search(r"time\.sleep\(([\d.]+)\)\s*\n\s*_wv_cookie_probe\(\"硬退出前\"\)",
+                      _APP_SRC)
+        exit_at = _APP_SRC.rfind("os._exit(0)")
+        probes = _APP_SRC.count("_wv_cookie_probe(")
+        ok = bool(m) and float(m.group(1)) >= 0.2 and m.start() < exit_at and probes >= 4
+        return (ok, "等待=%s 探针数=%d 顺序=%s"
+                % (m.group(1) if m else None, probes,
+                   (m.start() < exit_at) if m else None))
+
+    def _uid_first_then_wall():
+        """D3 第二根因（v1.6.15）：get_self_uid 必须**先解析 uid、再判登录墙**。
+
+        旧顺序先用 _looks_not_login() 扫正文，而它的特征词含 passport / login.php，
+        新版首页外壳里就有这些字样 → 一份正常登录态首页被判登录墙 → uid 永远为空。
+        所以「正则循环」在函数体里必须出现在「登录墙判定」之前。
+        """
+        i0 = _WC_SRC.find("def get_self_uid")
+        i1 = _WC_SRC.find("def _fetch_once", i0)
+        body = _WC_SRC[i0:i1] if i0 >= 0 and i1 > i0 else ""
+        i_pat = body.find("for i, pat in enumerate(_SELF_UID_PATTERNS)")
+        i_wall = body.find("_homepage_is_wall(r)")
+        # 只认真正的调用（文档字符串里会提到函数名，不能算数）
+        i_txtwall = body.find("_looks_not_login(r.status_code")
+        ok = (i_pat >= 0 and i_wall >= 0 and i_pat < i_wall
+              and (i_txtwall < 0 or i_pat < i_txtwall))
+        return (ok, "正则@%s 落地墙@%s 文本墙@%s" % (i_pat, i_wall, i_txtwall))
+
+    def _homepage_wall_by_url():
+        """登录墙判定必须走最终落地 URL，而不是正文子串。"""
+        has = "def _homepage_is_wall" in _WC_SRC
+        url_first = bool(re.search(
+            r"def _homepage_is_wall.*?getattr\(r,\s*\"url\"", _WC_SRC, re.S))
+        # 切出 warm_session 的函数体（到下一个顶层 def 为止），避免误判到后面的函数
+        i0 = _WC_SRC.find("def warm_session")
+        i1 = _WC_SRC.find("\ndef ", i0 + 10)
+        warm_body = _WC_SRC[i0:i1] if i0 >= 0 else ""
+        in_warm = "_homepage_is_wall(r)" in warm_body
+        not_in_warm = "_looks_not_login(" not in warm_body
+        return (has and url_first and in_warm and not_in_warm,
+                "函数=%r URL优先=%r 预热生效=%r 预热不用文本墙=%r"
+                % (has, url_first, in_warm, not_in_warm))
+
+    def _uid_parse_diag():
+        """uid 解析必须写进 diag.log —— 报告里要能直接看到成功/失败原因。"""
+        return ("_diag_uid" in _WC_SRC and '"UID_PARSE"' in _WC_SRC
+                and "ok uid=" in _WC_SRC and "fail http=" in _WC_SRC,
+                "埋点存在")
+
+    def _monitor_sees_diag_tag():
+        """监控工具必须用「标签段 + 正文」分类，否则 diag.log 里的版本/埋点全丢。"""
+        cm = open(os.path.join(ROOT, "cookie_monitor", "collectors.py"),
+                  encoding="utf-8").read()
+        tag = '_classify(("%s %s" % (lvl, txt)).strip())' in cm
+        ver = "def parse_app_version" in cm and '"app_version"' in cm
+        return (tag and ver, "标签参与分类=%r 版本提取=%r" % (tag, ver))
+
+    chk("S26", "risk_before_not_login", _risk_before_not_login)
+    chk("S26", "risk_skips_retry", _risk_skips_retry)
+    chk("S26", "expired_needs_same_origin", _expired_needs_same_origin)
+    chk("S26", "uid_modern_home", _uid_modern_home)
+    chk("S26", "uid_backfill_path", _uid_backfill_path)
+    chk("S26", "throttle_global", _throttle_global)
+    chk("S26", "keepalive_sub_trace", _keepalive_sub_trace)
+    chk("S26", "wv_drain_before_exit", _wv_drain_before_exit)
+    chk("S26", "uid_first_then_wall", _uid_first_then_wall)
+    chk("S26", "homepage_wall_by_url", _homepage_wall_by_url)
+    chk("S26", "uid_parse_diag", _uid_parse_diag)
+    chk("S26", "monitor_sees_diag_tag", _monitor_sees_diag_tag)
+
 
 
 
@@ -1367,21 +1741,32 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--one", nargs=2, metavar=("DATA_DIR", "OUT"))
+    # 【v1.6.17】支持换一个干净的临时目录。
+    # 旧版每次启动都 rmtree 默认的 E:\tmp\wb_bench，累积几百个文件后会被
+    # 「批量删除需确认」的安全策略拦下，基准根本跑不起来。给个新目录即可绕过，
+    # 且不删除任何既有文件。
+    ap.add_argument("--base", metavar="DIR", default=BASE,
+                    help="基准临时目录（默认 %s，不存在则新建）" % BASE)
     args = ap.parse_args()
 
     if args.one:
         run_one(args.one[0], args.one[1])
         os._exit(0)
 
-    if os.path.isdir(BASE):
-        shutil.rmtree(BASE, ignore_errors=True)
-    os.makedirs(BASE, exist_ok=True)
+    base = args.base
+    if os.path.isdir(base):
+        # 只在目录为空时复用；非空则改用带时间戳的新目录，避免误删他人文件
+        if os.listdir(base):
+            base = "%s_%s" % (base, time.strftime("%H%M%S"))
+            print("复用目录非空，改用新目录：%s" % base)
+    os.makedirs(base, exist_ok=True)
+    print("基准临时目录：%s" % base)
 
     all_rows = []
     t_start = time.time()
     for i in range(1, args.rounds + 1):
-        ddir = os.path.join(BASE, "r%d" % i)
-        out = os.path.join(BASE, "r%d.json" % i)
+        ddir = os.path.join(base, "r%d" % i)
+        out = os.path.join(base, "r%d.json" % i)
         t0 = time.time()
         p = subprocess.run([sys.executable, os.path.abspath(__file__), "--one", ddir, out],
                            capture_output=True, text=True)

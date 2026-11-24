@@ -58,7 +58,9 @@ setTimeout(function () {
     renderForward();
     var j = document.getElementById("fwdCountJitter");
     var m = document.getElementById("fwdImagesOnly");
-    // 量几何：开关圆心与标题行盒中心的竖直偏差（肉眼判对齐不可靠）
+    // 量几何：开关圆心分别对比「标题行中心」与「整行中心」。
+    // 【v1.6.16】用户要求开关与整行垂直居中，故新增 rowDelta（这才是判据）；
+    // titleDelta 保留作对照 —— 它能证明改动前后确实从「贴标题行」变成了「整行居中」。
     function geo(chk) {
       if (!chk) return null;
       var row = chk.closest(".fwd-opt-row");
@@ -66,9 +68,13 @@ setTimeout(function () {
       var tt = row.querySelector("b");
       if (!sw || !tt) return null;
       var a = sw.getBoundingClientRect(), b = tt.getBoundingClientRect();
+      var r = row.getBoundingClientRect();
       return { swCenter: +(a.top + a.height / 2).toFixed(1),
                titleCenter: +(b.top + b.height / 2).toFixed(1),
-               delta: +((a.top + a.height / 2) - (b.top + b.height / 2)).toFixed(1),
+               titleDelta: +((a.top + a.height / 2) - (b.top + b.height / 2)).toFixed(1),
+               rowCenter: +(r.top + r.height / 2).toFixed(1),
+               rowDelta: +((a.top + a.height / 2) - (r.top + r.height / 2)).toFixed(1),
+               rowH: +r.height.toFixed(1),
                swH: +a.height.toFixed(1), titleH: +b.height.toFixed(1) };
     }
     // 【v1.6.13】两卡等高核验：直接量 .fwd-grid2 内两张卡的外框高度
@@ -147,6 +153,15 @@ def main():
                  d["jitterDisabled"], d["offRow"]))
         for k in ("geoJitter", "geoImages"):
             print("  几何 %s：%s" % (k, d.get(k)))
+        # 【v1.6.16】判据：开关圆心必须落在整行垂直中线（±1px），且不再贴标题行
+        deltas = []
+        for k in ("geoJitter", "geoImages"):
+            g = d.get(k) or {}
+            if g.get("rowDelta") is not None:
+                deltas.append(abs(g["rowDelta"]))
+        centered = bool(deltas) and max(deltas) <= 1.0
+        print("  开关相对整行居中：%r（最大偏差 %.1f px）"
+              % (centered, max(deltas) if deltas else -1))
         print("  含图开关在转发方式卡内：%r" % d.get("inModeCard"))
         print("  两卡外框高度：%s" % d.get("heights"))
         print("  两卡内容自然高度：%s" % d.get("natural"))
@@ -154,7 +169,7 @@ def main():
         equal = len(hs) == 2 and abs(hs[0] - hs[1]) < 0.5
         print("  两卡等高：%r（差 %s px）"
               % (equal, (round(abs(hs[0] - hs[1]), 1) if len(hs) == 2 else "n/a")))
-        ok = (d["html"] and d["jitter"] is True and d["imagesOnly"] is False)
+        ok = (d["html"] and d["jitter"] is True and d["imagesOnly"] is False and centered)
         print("截图：%s（存在=%r）" % (shot, os.path.isfile(shot)))
         print("\n%s" % ("PASS" if ok else "FAIL"))
         return 0 if ok else 1

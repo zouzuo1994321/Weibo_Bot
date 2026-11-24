@@ -1,0 +1,6 @@
+2026-11-24 16:42:11.745 | UID_PARSE          | ok uid=5189652182 rule=#3 http=200 bytes=160
+2026-11-24 16:42:11.746 | UID_PARSE          | ok uid=6996654711 rule=#1 http=200 bytes=60
+2026-11-24 16:42:11.747 | UID_PARSE          | fail http=200 bytes=25 has_uid=False final=? wall=False
+2026-11-24 16:42:11.748 | UID_PARSE          | ok uid=5189652182 rule=#3 http=200 bytes=160
+2026-11-24 16:42:12.562 | UID_PARSE          | ok uid=5189652182 rule=#3 http=200 bytes=215
+2026-11-24 16:42:12.562 | UID_PARSE          | fail http=200 bytes=17 has_uid=False final=https://passport.weibo.com/sso/signin wall=True

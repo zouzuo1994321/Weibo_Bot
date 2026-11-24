@@ -284,6 +284,34 @@ class AccountManager:
                 return True
         return False
 
+    def set_wb_uid(self, acc_id: str, uid: str) -> bool:
+        """【v1.6.14 · D3】单独回填账户自身 UID。
+
+        为什么需要独立方法：同源实测 `/ajax/profile/info` **强制要求 uid**，而它正是
+        唯一有资格判定「真失效」的接口。此前 wb_uid 只在 `set_check_result` 里顺手写，
+        一旦「检测」这一路没拿到 uid（首页解析失败），保活线程就永远拿不到 uid
+        —— 报告里 336 次实测全部跳过就是这么来的。任何能确定 uid 的地方
+        （保活探针、登录后、检测）都应立刻落盘，把这条通道解锁。
+
+        返回 True 表示确实写入（值有变化）。
+        """
+        uid = str(uid or "").strip()
+        if not uid.isdigit() or len(uid) < 5:
+            return False
+        for a in self.accounts:
+            if a["id"] == acc_id:
+                if a.get("wb_uid") == uid:
+                    return False
+                a["wb_uid"] = uid
+                self.save()
+                try:
+                    from logger import info, CAT_CORE
+                    info(f"账户 {acc_id} 回填自身 UID={uid}（同源实测从此可用）", CAT_CORE)
+                except Exception:
+                    pass
+                return True
+        return False
+
     def get_cookie(self, acc_id: str):
         """返回扁平 Cookie 串（由带域条目导出；无条目时回退老字段）。"""
         for a in self.accounts:

@@ -1,0 +1,12 @@
+[2026-11-24 16:42:11][WARN][HTTP] CA 证书包就绪 · 已改用本地备份证书包：E:\【01】自研软件\【26-11】微博bot小助手（正式版）\tests\_tmp_d1d4\cacert.pem
+[2026-11-24 16:42:11][INFO][CORE] 账户 5a77a34f14bd 回填自身 UID=5189652182（同源实测从此可用）
+[2026-11-24 16:42:11][INFO][ACCT] 登录态实测标记变更：D1D4测试账户 · (空) → valid · 来源=会话保活实测 · 依据=bench-同源有效 · 最后确认有效=2026-11-24 16:42:11
+[2026-11-24 16:42:11][INFO][SCHED] 登录态实测 D1D4测试账户 · 同源=valid → 移动端=valid · 写入=有效 · bench-同源有效
+[2026-11-24 16:42:11][INFO][CORE] 账户 1bcab0bdb25b 回填自身 UID=5189652182（同源实测从此可用）
+[2026-11-24 16:42:11][INFO][ACCT] 登录态实测标记变更：保活补uid账户 · (空) → valid · 来源=会话保活实测 · 依据=bench-同源有效 · 最后确认有效=2026-11-24 16:42:11
+[2026-11-24 16:42:11][INFO][SCHED] 登录态实测 保活补uid账户 · 同源=valid → 移动端=valid · 写入=有效 · bench-同源有效
+[2026-11-24 16:42:11][INFO][SCHED] 会话保活完成 · 成功 2/2
+[2026-11-24 16:42:11][WARN][HTTP] 拉取微博失败 uid=6996654711 page=1 · 判定=risk_control · 已尝试 3 种接口 · 原因：mymblog HTTP 200 · 未登录（ok=-100）; getProfileFeed HTTP 200 · 未登录/登录墙; m.container HTTP 432 · 风控拦截
+[2026-11-24 16:42:11][WARN][HTTP] 拉取微博失败 uid=6996654711 page=1 · 判定=cookie_expired · 已尝试 3 种接口 · 原因：mymblog HTTP 200 · 未登录（ok=-100）; getProfileFeed HTTP 200 · 未登录/登录墙; m.container HTTP 200, ok=None, body=''
+[2026-11-24 16:42:11][WARN][HTTP] 拉取微博失败 uid=6996654711 page=1 · 判定=cookie_expired · 已尝试 3 种接口 · 原因：mymblog HTTP 200 · 未登录（ok=-100）; getProfileFeed HTTP 200 · 未登录/登录墙; m.container HTTP 200, ok=None, body=''
+[2026-11-24 16:42:11][WARN][HTTP] 抓取判未登录但同源实测有效，降级为可用 · 依据=
